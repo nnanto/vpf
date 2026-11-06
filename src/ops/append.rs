@@ -1,5 +1,7 @@
 //! Creating empty files, appending rows (buffered or direct) and flushing buffers.
 
+use std::borrow::Cow;
+
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowSchemaConverter, encode_arrow_schema};
@@ -111,7 +113,11 @@ impl Store {
                 let mut start = 0;
                 while start < n {
                     let len = MAX_ROW_GROUP_ROWS.min(n - start);
-                    let part: Vec<ColumnData> = cols.iter().map(|c| c.slice(start, len)).collect();
+                    let part = if len == n {
+                        Cow::Borrowed(cols.as_slice())
+                    } else {
+                        Cow::Owned(cols.iter().map(|c| c.slice(start, len)).collect::<Vec<_>>())
+                    };
                     let rg = synth::encode_row_group(&view.schema, codec, &part)?;
                     let rg_id = store_row_group(t, &view.schema, &rg)?;
                     t.append_segment(file_id, SegmentKind::RowGroup, rg_id, sid)?;

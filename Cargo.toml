@@ -15,5 +15,10 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 
 [dev-dependencies]
+criterion = "0.7"
 rand = "0.10.3"
 tempfile = "3.27.0"
+
+[[bench]]
+name = "parquet_io"
+harness = false

@@ -5,13 +5,20 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::compute::{CastOptions, cast_with_options};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondType};
+use arrow::datatypes::{
+    DataType, Date32Type, Date64Type, Decimal32Type, Decimal64Type, Decimal128Type,
+    DurationSecondType, DurationMillisecondType, DurationMicrosecondType, DurationNanosecondType,
+    Field, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    Schema, TimeUnit, Time32SecondType, Time32MillisecondType, Time64MicrosecondType,
+    Time64NanosecondType, TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType,
+    TimestampNanosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
-use parquet::arrow::{ArrowWriter, parquet_to_arrow_schema};
+use parquet::arrow::{ArrowSchemaConverter, ArrowWriter, parquet_to_arrow_schema};
 use parquet::basic::{Compression, ConvertedType, LogicalType, Type as PhysicalType};
-use parquet::data_type::{FixedLenByteArray, Int96};
+use parquet::data_type::{ByteArray, FixedLenByteArray, Int96};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
@@ -160,10 +167,99 @@ pub fn array_to_column(spec: &ColumnSpec, target: &DataType, arr: &ArrayRef) -> 
             Some(p.iter().map(|v| v.is_some() as i16).collect()),
         )
     } else {
-        let written = roundtrip_physical(&arr).map_err(ctx)?;
+        let written = match direct_physical(&arr).map_err(ctx)? {
+            Some(data) => data,
+            None => roundtrip_physical(&arr).map_err(ctx)?,
+        };
         coerce_physical(written, spec).map_err(ctx)?
     };
     data.with_nullability(spec.nullable).map_err(ctx)
+}
+
+fn direct_physical(arr: &ArrayRef) -> Result<Option<ColumnData>> {
+    macro_rules! primitive {
+        ($ty:ty, $variant:ident, $convert:expr) => {
+            Values::$variant(arr.as_primitive::<$ty>().iter().flatten().map($convert).collect())
+        };
+    }
+    macro_rules! byte_array {
+        ($array:expr) => {{
+            let array = $array;
+            let bytes = Bytes::from_owner(array.values().clone());
+            let offsets = array.value_offsets();
+            Values::Bytes(
+                (0..array.len())
+                    .filter(|&i| array.is_valid(i))
+                    .map(|i| bytes.slice(offsets[i] as usize..offsets[i + 1] as usize).into())
+                    .collect(),
+            )
+        }};
+    }
+    let values = match arr.data_type() {
+        DataType::Null => return Ok(Some(ColumnData::flat(Values::I32(Vec::new()), Some(vec![0; arr.len()])))),
+        DataType::Boolean => Values::Bool(arr.as_boolean().iter().flatten().collect()),
+        DataType::Int8 => primitive!(Int8Type, I32, |v| v as i32),
+        DataType::Int16 => primitive!(Int16Type, I32, |v| v as i32),
+        DataType::Int32 => primitive!(Int32Type, I32, |v| v),
+        DataType::Int64 => primitive!(Int64Type, I64, |v| v),
+        DataType::UInt8 => primitive!(UInt8Type, I32, |v| v as i32),
+        DataType::UInt16 => primitive!(UInt16Type, I32, |v| v as i32),
+        // Parquet stores unsigned integers using the same bits in signed physical values.
+        DataType::UInt32 => primitive!(UInt32Type, I32, |v| v as i32),
+        DataType::UInt64 => primitive!(UInt64Type, I64, |v| v as i64),
+        DataType::Float16 => primitive!(Float16Type, Fixed, |v| v.to_le_bytes().to_vec().into()),
+        DataType::Float32 => primitive!(Float32Type, F32, |v| v),
+        DataType::Float64 => primitive!(Float64Type, F64, |v| v),
+        DataType::Date32 => primitive!(Date32Type, I32, |v| v),
+        DataType::Date64 => primitive!(Date64Type, I64, |v| v),
+        DataType::Time32(TimeUnit::Second) => primitive!(Time32SecondType, I32, |v| v),
+        DataType::Time32(TimeUnit::Millisecond) => primitive!(Time32MillisecondType, I32, |v| v),
+        DataType::Time64(TimeUnit::Microsecond) => primitive!(Time64MicrosecondType, I64, |v| v),
+        DataType::Time64(TimeUnit::Nanosecond) => primitive!(Time64NanosecondType, I64, |v| v),
+        DataType::Timestamp(TimeUnit::Second, _) => primitive!(TimestampSecondType, I64, |v| v),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => primitive!(TimestampMillisecondType, I64, |v| v),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => primitive!(TimestampMicrosecondType, I64, |v| v),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => primitive!(TimestampNanosecondType, I64, |v| v),
+        DataType::Duration(TimeUnit::Second) => primitive!(DurationSecondType, I64, |v| v),
+        DataType::Duration(TimeUnit::Millisecond) => primitive!(DurationMillisecondType, I64, |v| v),
+        DataType::Duration(TimeUnit::Microsecond) => primitive!(DurationMicrosecondType, I64, |v| v),
+        DataType::Duration(TimeUnit::Nanosecond) => primitive!(DurationNanosecondType, I64, |v| v),
+        DataType::Decimal32(_, _) => primitive!(Decimal32Type, I32, |v| v),
+        DataType::Decimal64(precision, _) if *precision <= 9 => primitive!(Decimal64Type, I32, |v| v as i32),
+        DataType::Decimal64(_, _) => primitive!(Decimal64Type, I64, |v| v),
+        DataType::Decimal128(precision, _) if *precision <= 9 => primitive!(Decimal128Type, I32, |v| v as i32),
+        DataType::Decimal128(precision, _) if *precision <= 18 => primitive!(Decimal128Type, I64, |v| v as i64),
+        DataType::Decimal128(_, _) => {
+            let schema = Schema::new(vec![Field::new("c", arr.data_type().clone(), true)]);
+            let descriptor = ArrowSchemaConverter::new().convert(&schema)?;
+            let len = descriptor.column(0).type_length() as usize;
+            primitive!(Decimal128Type, Fixed, |v: i128| v.to_be_bytes()[16 - len..].to_vec().into())
+        }
+        DataType::Utf8 => byte_array!(arr.as_string::<i32>()),
+        DataType::LargeUtf8 => byte_array!(arr.as_string::<i64>()),
+        DataType::Utf8View => Values::Bytes(
+            arr.as_string_view().iter().flatten().map(|v| v.as_bytes().to_vec().into()).collect(),
+        ),
+        DataType::Binary => byte_array!(arr.as_binary::<i32>()),
+        DataType::LargeBinary => byte_array!(arr.as_binary::<i64>()),
+        DataType::BinaryView => Values::Bytes(
+            arr.as_binary_view().iter().flatten().map(|v| v.to_vec().into()).collect(),
+        ),
+        DataType::FixedSizeBinary(_) => {
+            let array = arr.as_fixed_size_binary();
+            let bytes = Bytes::from_owner(array.values().clone());
+            let width = array.value_size();
+            Values::Fixed(
+                (0..array.len())
+                    .filter(|&i| array.is_valid(i))
+                    .map(|i| ByteArray::from(bytes.slice(i * width..(i + 1) * width)).into())
+                    .collect(),
+            )
+        }
+        _ => return Ok(None),
+    };
+    let defs = (0..arr.len()).map(|i| i16::from(arr.is_valid(i))).collect();
+    Ok(Some(ColumnData::flat(values, Some(defs))))
 }
 
 /// Writes an array with the Arrow writer and reads back its physical values.
@@ -325,5 +421,127 @@ pub fn conform_leaf(c: ColumnData, leaf: &Leaf, nested: bool) -> Result<ColumnDa
         0 => Ok(c),
         1 => Ok(c.raise_defs()),
         _ => Err(Error::Corrupt(format!("stored levels do not fit column '{}'", leaf.spec.name))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::*;
+
+    #[test]
+    fn direct_flat_conversion_matches_parquet_writer() {
+        let mut arrays: Vec<ArrayRef> = vec![
+            Arc::new(NullArray::new(5)),
+            Arc::new(BooleanArray::from(vec![None, Some(false), Some(true), Some(false), None])),
+            Arc::new(Int8Array::from(vec![None, Some(i8::MIN), Some(0), Some(i8::MAX), None])),
+            Arc::new(Int16Array::from(vec![None, Some(i16::MIN), Some(0), Some(i16::MAX), None])),
+            Arc::new(Int32Array::from(vec![None, Some(i32::MIN), Some(0), Some(i32::MAX), None])),
+            Arc::new(Int64Array::from(vec![None, Some(i64::MIN), Some(0), Some(i64::MAX), None])),
+            Arc::new(UInt8Array::from(vec![None, Some(0), Some(127), Some(u8::MAX), None])),
+            Arc::new(UInt16Array::from(vec![None, Some(0), Some(32767), Some(u16::MAX), None])),
+            Arc::new(UInt32Array::from(vec![None, Some(0), Some(i32::MAX as u32 + 1), Some(u32::MAX), None])),
+            Arc::new(UInt64Array::from(vec![None, Some(0), Some(i64::MAX as u64 + 1), Some(u64::MAX), None])),
+            Arc::new(Float32Array::from(vec![None, Some(-0.0), Some(f32::MIN), Some(f32::INFINITY), None])),
+            Arc::new(Float64Array::from(vec![None, Some(-0.0), Some(f64::MIN), Some(f64::INFINITY), None])),
+            Arc::new(StringArray::from(vec![None, Some(""), Some("short"), Some("a value longer than a view"), None])),
+            Arc::new(LargeStringArray::from(vec![None, Some(""), Some("short"), Some("a value longer than a view"), None])),
+            Arc::new(StringViewArray::from(vec![None, Some(""), Some("short"), Some("a value longer than a view"), None])),
+            Arc::new(BinaryArray::from(vec![None, Some(&b""[..]), Some(&b"\x00\xff"[..]), Some(&b"long binary value"[..]), None])),
+            Arc::new(LargeBinaryArray::from(vec![None, Some(&b""[..]), Some(&b"\x00\xff"[..]), Some(&b"long binary value"[..]), None])),
+            Arc::new(BinaryViewArray::from(vec![None, Some(&b""[..]), Some(&b"\x00\xff"[..]), Some(&b"long binary value"[..]), None])),
+            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                vec![None, Some([0, 255]), Some([128, 0]), Some([0, 0]), None].into_iter(), 2,
+            ).unwrap()),
+            Arc::new(Decimal32Array::from(vec![None, Some(-12345), Some(0), Some(12345), None])
+                .with_precision_and_scale(8, 2).unwrap()),
+            Arc::new(Decimal64Array::from(vec![None, Some(-12345), Some(0), Some(12345), None])
+                .with_precision_and_scale(8, 2).unwrap()),
+            Arc::new(Decimal64Array::from(vec![None, Some(-12345678901), Some(0), Some(12345678901), None])
+                .with_precision_and_scale(18, 2).unwrap()),
+        ];
+        macro_rules! temporal {
+            ($($ty:ty),+ $(,)?) => {
+                $(arrays.push(Arc::new(PrimitiveArray::<$ty>::from(vec![None, Some(-1), Some(0), Some(1234), None])));)+
+            };
+        }
+        temporal!(
+            Date32Type, Date64Type, Time32SecondType, Time32MillisecondType,
+            Time64MicrosecondType, Time64NanosecondType, TimestampSecondType,
+            TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType,
+            DurationSecondType, DurationMillisecondType, DurationMicrosecondType,
+            DurationNanosecondType,
+        );
+        arrays.push(Arc::new(TimestampNanosecondArray::from(vec![None, Some(-1), Some(0), Some(1234), None])
+            .with_timezone("America/New_York")));
+        let source: ArrayRef = Arc::new(Float32Array::from(vec![None, Some(-1.5), Some(-0.0), Some(1.5), None]));
+        arrays.push(cast_with_options(&source, &DataType::Float16, &cast_opts()).unwrap());
+        for precision in [1, 8, 9, 10, 18, 19, 20, 28, 38] {
+            let value = 10i128.pow(precision as u32) - 1;
+            arrays.push(Arc::new(Decimal128Array::from(vec![None, Some(-value), Some(0), Some(value), None])
+                .with_precision_and_scale(precision, 0).unwrap()));
+        }
+        for arr in arrays {
+            for arr in [arr.clone(), arr.slice(1, 3), arr.slice(0, 0), new_null_array(arr.data_type(), 3)] {
+                let got = direct_physical(&arr).unwrap().expect("direct conversion");
+                let expected = roundtrip_physical(&arr).unwrap();
+                assert_eq!(got, expected, "{}", arr.data_type());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_conversion_preserves_float_bits() {
+        let arr: ArrayRef = Arc::new(Float64Array::from(vec![
+            None, Some(-0.0), Some(f64::from_bits(0x7ff8_0000_0000_0042)),
+        ]));
+        let Values::F64(values) = direct_physical(&arr).unwrap().unwrap().values else { panic!() };
+        assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), vec![(-0.0f64).to_bits(), 0x7ff8_0000_0000_0042]);
+    }
+
+    #[test]
+    fn byte_conversion_owns_sliced_arrow_buffers() {
+        let data = {
+            let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("unused"), None, Some("kept"), Some("also unused")]));
+            direct_physical(&arr.slice(1, 2)).unwrap().unwrap()
+        };
+        assert_eq!(data.defs, Some(vec![0, 1]));
+        let Values::Bytes(values) = data.values else { panic!() };
+        assert_eq!(values[0].data(), b"kept");
+    }
+
+    #[test]
+    fn dictionary_conversion_keeps_roundtrip_fallback() {
+        let mut builder = StringDictionaryBuilder::<Int8Type>::new();
+        builder.append("first").unwrap();
+        builder.append_null();
+        builder.append("first").unwrap();
+        builder.append("second").unwrap();
+        let arr: ArrayRef = Arc::new(builder.finish());
+        assert!(direct_physical(&arr).unwrap().is_none());
+        let schema = Schema::new(vec![Field::new("c", arr.data_type().clone(), true)]);
+        let descriptor = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        let spec = ColumnSpec::from_parquet_type(0, &descriptor.root_schema().get_fields()[0]).unwrap();
+        assert_eq!(
+            array_to_column(&spec, arr.data_type(), &arr).unwrap(),
+            roundtrip_physical(&arr).unwrap(),
+        );
+    }
+
+    #[test]
+    fn direct_decimals_preserve_legacy_physical_coercion() {
+        let arr: ArrayRef = Arc::new(Decimal128Array::from(vec![None, Some(-12345), Some(0), Some(12345)])
+            .with_precision_and_scale(8, 2).unwrap());
+        for (physical, len) in [
+            (PhysicalType::INT32, 0), (PhysicalType::INT64, 0),
+            (PhysicalType::BYTE_ARRAY, 0), (PhysicalType::FIXED_LEN_BYTE_ARRAY, 4),
+            (PhysicalType::FIXED_LEN_BYTE_ARRAY, 16),
+        ] {
+            let mut spec = crate::schema::spec_for_type_name(0, "c", "decimal(8,2)", true).unwrap();
+            spec.physical = physical;
+            spec.type_length = len;
+            let expected = coerce_physical(roundtrip_physical(&arr).unwrap(), &spec).unwrap();
+            assert_eq!(array_to_column(&spec, arr.data_type(), &arr).unwrap(), expected);
+        }
     }
 }

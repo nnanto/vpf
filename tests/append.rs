@@ -238,6 +238,31 @@ fn open_snapshot_is_isolated_from_later_appends() {
 }
 
 #[test]
+fn direct_append_splits_large_batches_at_row_group_limit() {
+    let d = tempfile::tempdir().unwrap();
+    let store = Store::open(d.path()).unwrap();
+    let n = vpf::ops::append::MAX_ROW_GROUP_ROWS + 17;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..n as i64)),
+            Arc::new(Int32Array::from_iter((0..n).map(|i| (i % 7 != 0).then_some(i as i32)))),
+        ],
+    ).unwrap();
+    store.create_from_arrow("f", &batch.schema(), Compression::SNAPPY).unwrap();
+    let summary = store.append("f", &batch, AppendMode::Direct).unwrap();
+    assert_eq!(summary.num_rows, n as i64);
+    let snapshot = store.open_snapshot("f", None).unwrap();
+    assert_eq!(snapshot.metadata().num_row_groups(), 2);
+    assert_eq!(snapshot.metadata().row_group(0).num_rows(), (n - 17) as i64);
+    assert_eq!(snapshot.metadata().row_group(1).num_rows(), 17);
+    assert_eq!(read_virtual(&snapshot), batch);
+}
+
+#[test]
 fn pyarrow_fixture_appends_roundtrip() {
     if python().is_none() {
         eprintln!("skipping: VPF_PYTHON not set");

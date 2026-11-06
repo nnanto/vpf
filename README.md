@@ -191,3 +191,71 @@ What the suites cover:
 * CLI workflows.
 * A randomized fuzz test that mixes appends, deletes, updates, schema changes and flushes,
   on a schema with flat and nested columns.
+
+## Benchmarks
+
+```
+cargo bench --bench parquet_io
+cargo bench --bench parquet_io -- read/          # only reader comparisons
+cargo bench --bench parquet_io -- write/         # only write comparisons
+cargo bench --bench parquet_io -- append_stages/ # direct-append CPU breakdown
+cargo bench --bench parquet_io -- update/        # small update vs full rewrite
+cargo bench --bench parquet_io -- --test         # correctness/smoke run, without timing
+```
+
+The Criterion harness uses 80,000 deterministic rows with 11 flat columns, nulls,
+dictionary encoding, and SNAPPY/ZSTD compression. It follows the public reader/writer
+approach of parquet-rs's
+[`arrow_reader`](https://github.com/apache/arrow-rs/blob/main/parquet/benches/arrow_reader.rs)
+and [`parquet_round_trip`](https://github.com/apache/arrow-rs/blob/main/parquet/benches/parquet_round_trip.rs)
+benchmarks; it is not a verbatim port or a ClickBench query benchmark.
+
+* **Read:** the same imported pages scanned through parquet-rs from in-memory `Bytes`,
+  a regular `File`, and a VPF `VirtualFile`, with all columns or just `id` and `name`.
+  Reader construction, footer parsing, and decoding are timed; snapshot construction is
+  measured separately as `open_snapshot`. Files are already open, and repeated scans
+  use the warm OS cache, not cold-disk I/O.
+* **Write:** parquet-rs `ArrowWriter` writes a fresh file and calls `sync_data`; VPF
+  directly appends to a fresh, empty table using its normal blob sync and SQLite
+  transaction. Both use the same data, codec, dictionary/statistics policy, page limits,
+  and a single row group, and emit ColumnIndex/OffsetIndex page indexes. Their encoding
+  pipelines and metadata work differ. SQLite retains the store's normal
+  WAL/`synchronous=NORMAL` durability policy.
+* **Import:** VPF stores already encoded pages. This is measured separately and is
+  **not** an encoding/write-speed comparison. As on current `main`, import also decodes
+  the chunks and computes its own page statistics.
+* **Append stages:** separately measures Arrow-to-physical conversion, copying the
+  converted rows into a row group, and encoding the final pages. These CPU-only
+  measurements exclude SQLite and blob I/O, include result destruction, and are
+  diagnostic rather than an exact additive decomposition of the end-to-end append.
+  Whole-batch copies are skipped by direct append when it fits in one row group;
+  `copy_row_group` measures the slicing cost still used when a batch must be split.
+* **Update:** changes `name` for one row or 100 clustered rows in the same 80,000-row
+  file. VPF evaluates the predicate and rewrites one page of one column, preserving
+  the original snapshot. The parquet-rs baseline streams and decodes the original
+  file, evaluates the same predicate, applies the assignment with Arrow, and writes
+  and syncs a complete replacement file. Both start with a fresh destination/base
+  snapshot per iteration; importing the base into VPF is outside the timed update.
+  Full output equality, affected-row counts, VPF's one-page rewrite and chunk reuse,
+  and historical snapshot readability are checked before timing. Throughput here
+  counts **updated rows**, not scanned rows. These are warm-cache, clustered updates,
+  not a claim about arbitrary predicates or scattered updates.
+
+Fixture generation, file/store/table creation, and temporary-directory cleanup are
+outside the timed write operations. Each iteration gets a fresh destination, so store
+growth and old snapshots do not accumulate. Full output equality is checked before
+timing, including required page-index loading and the presence of both index types for
+every column; timed scans use the reader's default page-index policy and check row counts.
+Buffered append, deletes, nested data, cold-cache
+reads, and concurrent workloads are not covered. Criterion reports timings and row
+throughput, and saves baselines under `target/criterion`.
+
+Flat appends convert common Arrow primitives, decimal32/64/128, strings and binary
+arrays directly into physical values, avoiding temporary Parquet encoding/decoding.
+Offset-based string/binary and fixed-size binary values share their Arrow buffers.
+Other flat representations retain the compatibility conversion, and nested arrays
+retain the stored-layout validation round trip. Direct appends borrow the converted
+columns when the batch fits in a single row group; larger batches are still split at
+the existing row-group limit.
+
+Recorded measurements and reproduction commands are in [BENCHMARKS.md](BENCHMARKS.md).
