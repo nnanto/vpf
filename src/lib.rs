@@ -5,6 +5,10 @@
 //! file assembled on the fly (virtual offsets + regenerated footer).
 
 pub mod error;
+pub mod meta;
+pub mod schema;
+pub mod stats;
+pub mod store;
 pub mod thrift;
 
 pub use error::{Error, Result};
