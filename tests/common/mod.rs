@@ -1,0 +1,91 @@
+#![allow(dead_code)]
+use std::sync::Arc;
+
+use arrow::array::*;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel, GzipLevel, BrotliLevel};
+use parquet::file::properties::{WriterProperties, WriterVersion};
+
+/// A flat batch with a wide spread of physical/logical types and nulls.
+pub fn sample_batch(start: i64, n: usize) -> RecordBatch {
+    let ids: Vec<i64> = (start..start + n as i64).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("i32", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+        Field::new("f32", DataType::Float32, true),
+        Field::new("flag", DataType::Boolean, true),
+        Field::new("day", DataType::Date32, true),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new("amount", DataType::Decimal128(12, 2), true),
+        Field::new("bin", DataType::Binary, true),
+        Field::new("u16", DataType::UInt16, true),
+    ]));
+    let opt = |i: i64, m: i64| i % m != 0;
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int32Array::from_iter(ids.iter().map(|&i| opt(i, 7).then_some((i * 3) as i32)))),
+            Arc::new(StringArray::from_iter(ids.iter().map(|&i| opt(i, 5).then(|| format!("name-{}", i % 97))))),
+            Arc::new(Float64Array::from_iter(ids.iter().map(|&i| opt(i, 11).then_some(i as f64 * 1.5)))),
+            Arc::new(Float32Array::from_iter(ids.iter().map(|&i| opt(i, 13).then_some(i as f32 / 4.0)))),
+            Arc::new(BooleanArray::from_iter(ids.iter().map(|&i| opt(i, 3).then_some(i % 2 == 0)))),
+            Arc::new(Date32Array::from_iter(ids.iter().map(|&i| opt(i, 17).then_some(18000 + (i % 1000) as i32)))),
+            Arc::new(TimestampMicrosecondArray::from_iter(ids.iter().map(|&i| opt(i, 19).then_some(1_600_000_000_000_000 + i * 1000)))),
+            Arc::new(Decimal128Array::from_iter(ids.iter().map(|&i| opt(i, 23).then_some(i as i128 * 101))).with_precision_and_scale(12, 2).unwrap()),
+            Arc::new(BinaryArray::from_iter(ids.iter().map(|&i| opt(i, 29).then(|| vec![(i % 256) as u8; (i % 5) as usize])))),
+            Arc::new(UInt16Array::from_iter(ids.iter().map(|&i| opt(i, 31).then_some((i % 65000) as u16 + 500)))),
+        ],
+    )
+    .unwrap()
+}
+
+pub fn codecs() -> Vec<Compression> {
+    vec![
+        Compression::UNCOMPRESSED,
+        Compression::SNAPPY,
+        Compression::GZIP(GzipLevel::default()),
+        Compression::ZSTD(ZstdLevel::default()),
+        Compression::LZ4_RAW,
+        Compression::BROTLI(BrotliLevel::default()),
+    ]
+}
+
+pub fn props(codec: Compression, v2: bool, dict: bool, page_rows: usize, rg_rows: usize) -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(codec)
+        .set_writer_version(if v2 { WriterVersion::PARQUET_2_0 } else { WriterVersion::PARQUET_1_0 })
+        .set_dictionary_enabled(dict)
+        .set_data_page_row_count_limit(page_rows)
+        .set_write_batch_size(page_rows.min(1024))
+        .set_max_row_group_row_count(Some(rg_rows))
+        .build()
+}
+
+pub fn write_parquet(batches: &[RecordBatch], props: WriterProperties) -> Bytes {
+    let mut buf = Vec::new();
+    let mut w = ArrowWriter::try_new(&mut buf, batches[0].schema(), Some(props)).unwrap();
+    for b in batches {
+        w.write(b).unwrap();
+    }
+    w.close().unwrap();
+    Bytes::from(buf)
+}
+
+pub fn read_parquet(bytes: Bytes) -> Vec<RecordBatch> {
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+pub fn concat(batches: &[RecordBatch]) -> RecordBatch {
+    arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap()
+}
