@@ -2,7 +2,8 @@
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
-use parquet::arrow::ArrowSchemaConverter;
+use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowSchemaConverter, encode_arrow_schema};
+use parquet::file::metadata::KeyValue;
 use parquet::basic::Compression;
 
 use crate::convert::batch_to_columns;
@@ -10,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::meta::{self, SegmentKind};
 use crate::ops::snapshot::{SegmentData, load_view};
 use crate::ops::synth::{self, SynthRowGroup};
-use crate::schema::{ColumnSpec, SchemaVersion};
+use crate::schema::{ColumnSpec, Leaf, SchemaVersion};
 use crate::store::{NewChunk, Store, Txn};
 use crate::values::{ColumnData, encode_batch};
 
@@ -40,6 +41,16 @@ pub struct AppendSummary {
 impl Store {
     /// Creates an empty file with the given columns (column ids are assigned by the store).
     pub fn create(&self, name: &str, columns: &[ColumnSpec], codec: Compression) -> Result<i64> {
+        self.create_with_metadata(name, columns, codec, None)
+    }
+
+    fn create_with_metadata(
+        &self,
+        name: &str,
+        columns: &[ColumnSpec],
+        codec: Compression,
+        key_value: Option<Vec<KeyValue>>,
+    ) -> Result<i64> {
         self.write(|t| {
             let file_id = t.create_file(name, codec, Some(concat!("vpf version ", env!("CARGO_PKG_VERSION"))), 1)?;
             let first = t.alloc_column_ids(file_id, columns.len() as i64)?;
@@ -49,19 +60,23 @@ impl Store {
                 .map(|(i, c)| ColumnSpec { column_id: first + i as i64, ..c.clone() })
                 .collect();
             for s in &specs {
+                if s.is_nested() && s.default_value.is_some() {
+                    return Err(Error::Unsupported(format!("default value for nested column '{}'", s.name)));
+                }
                 if let Some(d) = &s.default_value {
                     let v = crate::values::decode_value(d)?;
                     ColumnData::repeat(s.physical, s.nullable, Some(&v), 1)?;
                 }
             }
-            let svid = meta::insert_schema(t.conn(), file_id, None, "schema", &specs, None)?;
+            let svid = meta::insert_schema(t.conn(), file_id, None, "schema", &specs, key_value.as_deref())?;
             let sid = t.new_snapshot(file_id, svid, "create", None)?;
             t.finish_snapshot(file_id, sid)?;
             Ok(sid)
         })
     }
 
-    /// Creates an empty file from a flat Arrow schema.
+    /// Creates an empty file from an Arrow schema. The Arrow schema is embedded (as Arrow's
+    /// writer does) so readers see the original Arrow types and field names.
     pub fn create_from_arrow(&self, name: &str, schema: &Schema, codec: Compression) -> Result<i64> {
         let descr = ArrowSchemaConverter::new().convert(schema)?;
         let specs = descr
@@ -70,7 +85,8 @@ impl Store {
             .iter()
             .map(|f| ColumnSpec::from_parquet_type(0, f))
             .collect::<Result<Vec<_>>>()?;
-        self.create(name, &specs, codec)
+        let kv = vec![KeyValue::new(ARROW_SCHEMA_META_KEY.to_string(), encode_arrow_schema(schema))];
+        self.create_with_metadata(name, &specs, codec, Some(kv))
     }
 
     /// Appends rows, creating a new snapshot in which they are immediately visible.
@@ -102,8 +118,8 @@ impl Store {
                     start += len;
                 }
             } else {
-                let keyed: Vec<(i64, ColumnData)> =
-                    view.schema.columns.iter().map(|s| s.column_id).zip(cols).collect();
+                let keyed: Vec<((i64, i64), ColumnData)> =
+                    view.schema.leaves()?.iter().map(|l| (l.column_id, l.leaf)).zip(cols).collect();
                 let payload = encode_batch(n, &keyed)?;
                 let bid = t.put_batch(svid, n as i64, &payload)?;
                 t.append_segment(file_id, SegmentKind::Batch, bid, sid)?;
@@ -152,18 +168,30 @@ impl Store {
 
 /// Persists encoded chunks as pages, chunks and a row group object.
 pub(crate) fn store_row_group(t: &mut Txn, schema: &SchemaVersion, rg: &SynthRowGroup) -> Result<i64> {
+    let leaves = schema.leaves()?;
+    if leaves.len() != rg.chunks.len() {
+        return Err(Error::Corrupt("leaf count mismatch".into()));
+    }
     let mut chunk_ids = Vec::with_capacity(rg.chunks.len());
-    for (spec, chunk) in schema.columns.iter().zip(&rg.chunks) {
-        chunk_ids.push((spec.column_id, store_chunk(t, spec, chunk)?));
+    for (leaf, chunk) in leaves.iter().zip(&rg.chunks) {
+        chunk_ids.push(((leaf.column_id, leaf.leaf), store_chunk(t, leaf, chunk)?));
     }
     t.put_row_group(rg.num_rows, &chunk_ids)
 }
 
-pub(crate) fn store_chunk(t: &mut Txn, spec: &ColumnSpec, chunk: &crate::codec::EncodedChunk) -> Result<i64> {
-    let page_ids = chunk.pages.iter().map(|(b, h)| t.put_page(b, h)).collect::<Result<Vec<_>>>()?;
+pub(crate) fn store_chunk(t: &mut Txn, leaf: &Leaf, chunk: &crate::codec::EncodedChunk) -> Result<i64> {
+    if chunk.page_rows.len() != chunk.pages.len() {
+        return Err(Error::Corrupt("page row counts missing".into()));
+    }
+    let page_ids = chunk
+        .pages
+        .iter()
+        .zip(&chunk.page_rows)
+        .map(|((b, h), &rows)| t.put_page_rows(b, h, rows))
+        .collect::<Result<Vec<_>>>()?;
     t.put_chunk(
         &NewChunk {
-            physical: spec.physical,
+            physical: leaf.physical(),
             codec: chunk.codec,
             encodings: chunk.encodings.clone(),
             stats: chunk.stats.clone(),

@@ -123,7 +123,13 @@ fn pyarrow_fixtures_import_and_cross_reader_equality() {
         run_python(&[&py_script("check_equal.py"), src.to_str().unwrap(), out.to_str().unwrap()]);
     }
     for name in ["nested", "struct"] {
-        let err = store.import_file(name, fx.join(format!("{name}.parquet"))).unwrap_err();
-        assert!(err.to_string().contains("nested"), "{err}");
+        let src = fx.join(format!("{name}.parquet"));
+        store.import_file(name, &src).unwrap();
+        let out = d.path().join(format!("{name}.out.parquet"));
+        store.export(name, None, &out).unwrap();
+        let (a, b) = (std::fs::read(&src).unwrap(), std::fs::read(&out).unwrap());
+        let data_end = |f: &[u8]| f.len() - 8 - u32::from_le_bytes(f[f.len() - 8..f.len() - 4].try_into().unwrap()) as usize;
+        assert_eq!(a[..data_end(&a)], b[..data_end(&b)], "{name}: pages are reused verbatim");
+        run_python(&[&py_script("check_equal.py"), src.to_str().unwrap(), out.to_str().unwrap()]);
     }
 }

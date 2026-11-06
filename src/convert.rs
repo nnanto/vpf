@@ -7,6 +7,8 @@ use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::compute::{CastOptions, cast_with_options};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondType};
 use bytes::Bytes;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::{ArrowWriter, parquet_to_arrow_schema};
 use parquet::basic::{Compression, ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::data_type::{FixedLenByteArray, Int96};
@@ -14,10 +16,10 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 
-use crate::codec::read_column;
+use crate::codec::{read_column, read_leaf};
 use crate::error::{Error, Result};
-use crate::schema::{ColumnSpec, SchemaVersion};
-use crate::values::{ColumnData, Values, decode_value};
+use crate::schema::{ColumnSpec, Leaf, SchemaVersion, build_descriptor};
+use crate::values::{ColumnData, LeafKey, Values, decode_value};
 
 /// The Arrow schema readers see for a schema version.
 pub fn arrow_schema(schema: &SchemaVersion) -> Result<Schema> {
@@ -30,9 +32,10 @@ pub fn default_values(spec: &ColumnSpec) -> Result<Option<Values>> {
     spec.default_value.as_deref().map(decode_value).transpose()
 }
 
-/// Converts a record batch into one [`ColumnData`] per schema column (schema order).
+/// Converts a record batch into one [`ColumnData`] per leaf column (leaf order).
 /// Columns are matched by name; schema columns absent from the batch receive their default
-/// (or NULL). Unknown batch columns, lossy casts and NULLs in required columns are errors.
+/// (or NULL / empty for nested fields). Unknown batch columns, lossy casts and NULLs in
+/// required columns are errors.
 pub fn batch_to_columns(schema: &SchemaVersion, batch: &RecordBatch) -> Result<Vec<ColumnData>> {
     let target = arrow_schema(schema)?;
     if target.fields().len() != schema.columns.len() {
@@ -48,20 +51,92 @@ pub fn batch_to_columns(schema: &SchemaVersion, batch: &RecordBatch) -> Result<V
         }
     }
     let n = batch.num_rows();
-    schema
-        .columns
-        .iter()
-        .zip(target.fields())
-        .map(|(spec, field)| {
-            let col = match batch.column_by_name(&spec.name) {
-                Some(arr) => array_to_column(spec, field.data_type(), arr),
-                None => ColumnData::repeat(spec.physical, spec.nullable, default_values(spec)?.as_ref(), n)
-                    .map_err(|_| Error::Invalid(format!("missing value for required column '{}'", spec.name))),
-            }?;
-            debug_assert_eq!(col.num_rows(), n);
-            Ok(col)
-        })
-        .collect()
+    let leaves = schema.leaves()?;
+    let mut out = Vec::with_capacity(leaves.len());
+    for (fi, (spec, field)) in schema.columns.iter().zip(target.fields()).enumerate() {
+        let field_leaves: Vec<&Leaf> = leaves.iter().filter(|l| l.field == fi).collect();
+        let missing = || Error::Invalid(format!("missing value for required column '{}'", spec.name));
+        let cols = match (batch.column_by_name(&spec.name), spec.is_nested()) {
+            (Some(arr), false) => vec![array_to_column(spec, field.data_type(), arr)?],
+            (Some(arr), true) => nested_to_leaves(spec, field, arr, &field_leaves)?,
+            (None, false) => vec![
+                ColumnData::repeat(spec.physical, spec.nullable, default_values(spec)?.as_ref(), n)
+                    .map_err(|_| missing())?,
+            ],
+            (None, true) => field_leaves
+                .iter()
+                .map(|l| missing_nested(spec, l, n))
+                .collect::<Result<_>>()
+                .map_err(|_| missing())?,
+        };
+        for c in &cols {
+            if c.num_rows() != n {
+                return Err(Error::Corrupt(format!("column '{}' converted to {} rows", spec.name, c.num_rows())));
+            }
+        }
+        out.extend(cols);
+    }
+    Ok(out)
+}
+
+/// Fill for an absent nested field: NULL (optional) or empty (repeated) in every row.
+fn missing_nested(spec: &ColumnSpec, leaf: &Leaf, n: usize) -> Result<ColumnData> {
+    if !spec.top_level_nullable() {
+        return Err(Error::Invalid(format!("missing value for required column '{}'", spec.name)));
+    }
+    ColumnData::nulls(leaf.physical(), leaf.max_def, leaf.max_rep, n)
+}
+
+/// Shreds one nested Arrow array into the leaf columns of `spec`, using the Arrow writer with
+/// the stored Parquet type so levels match the stored layout exactly. The written data is
+/// read back through the Arrow reader and compared, rejecting layouts the writer cannot
+/// produce faithfully.
+fn nested_to_leaves(spec: &ColumnSpec, field: &Field, arr: &ArrayRef, leaves: &[&Leaf]) -> Result<Vec<ColumnData>> {
+    let ctx = |e: Error| Error::Invalid(format!("column '{}': {e}", spec.name));
+    let arr = cast_with_options(arr, field.data_type(), &cast_opts()).map_err(|e| ctx(e.into()))?;
+    let schema = Arc::new(Schema::new(vec![field.clone()]));
+    let rb = RecordBatch::try_new(schema.clone(), vec![arr.clone()]).map_err(|e| ctx(e.into()))?;
+    let descr = build_descriptor("m", std::slice::from_ref(spec))?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .build();
+    let opts = ArrowWriterOptions::new()
+        .with_properties(props)
+        .with_parquet_schema(parquet::schema::types::SchemaDescriptor::new(descr.root_schema_ptr()));
+    let mut buf = Vec::new();
+    let mut w = ArrowWriter::try_new_with_options(&mut buf, schema, opts).map_err(|e| ctx(e.into()))?;
+    w.write(&rb).map_err(|e| ctx(e.into()))?;
+    w.close().map_err(|e| ctx(e.into()))?;
+    let bytes = Bytes::from(buf);
+
+    let back = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?.build()?.collect::<Result<Vec<_>, _>>()?;
+    let back: Vec<ArrayRef> = back.iter().map(|b| b.column(0).clone()).collect();
+    let back = arrow::compute::concat(&back.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
+    let back = cast_with_options(&back, field.data_type(), &cast_opts()).map_err(|e| ctx(e.into()))?;
+    if back.to_data() != arr.to_data() {
+        return Err(Error::Unsupported(format!(
+            "column '{}': its stored nested layout cannot be written from Arrow data faithfully",
+            spec.name
+        )));
+    }
+
+    let reader = SerializedFileReader::new(bytes)?;
+    if reader.metadata().file_metadata().schema_descr().num_columns() != leaves.len() {
+        return Err(Error::Corrupt("nested write produced an unexpected leaf count".into()));
+    }
+    let mut out: Vec<ColumnData> =
+        leaves.iter().map(|l| ColumnData::empty_leaf(l.physical(), l.max_def, l.max_rep)).collect();
+    for i in 0..reader.num_row_groups() {
+        let rg = reader.get_row_group(i)?;
+        let rows = rg.metadata().num_rows() as usize;
+        for (j, l) in leaves.iter().enumerate() {
+            let c = read_leaf(rg.get_column_reader(j)?, l.physical(), l.max_def, l.max_rep, Some(rows))?;
+            out[j].append(&c)?;
+        }
+    }
+    Ok(out)
 }
 
 fn cast_opts() -> CastOptions<'static> {
@@ -80,10 +155,10 @@ pub fn array_to_column(spec: &ColumnSpec, target: &DataType, arr: &ArrayRef) -> 
         let ns = cast_with_options(&arr, &DataType::Timestamp(TimeUnit::Nanosecond, tz), &cast_opts())
             .map_err(|e| ctx(e.into()))?;
         let p = ns.as_primitive::<TimestampNanosecondType>();
-        ColumnData {
-            values: Values::I96(p.iter().flatten().map(nanos_to_int96).collect()),
-            defs: Some(p.iter().map(|v| v.is_some() as i16).collect()),
-        }
+        ColumnData::flat(
+            Values::I96(p.iter().flatten().map(nanos_to_int96).collect()),
+            Some(p.iter().map(|v| v.is_some() as i16).collect()),
+        )
     } else {
         let written = roundtrip_physical(&arr).map_err(ctx)?;
         coerce_physical(written, spec).map_err(ctx)?
@@ -176,7 +251,7 @@ fn decimal_convert(data: &ColumnData, spec: &ColumnSpec) -> Result<ColumnData> {
         ),
         t => return Err(Error::Invalid(format!("decimal stored as {t}"))),
     };
-    Ok(ColumnData { values, defs: data.defs.clone() })
+    Ok(ColumnData { values, ..data.clone() })
 }
 
 fn be_to_i128(b: &[u8]) -> Result<i128> {
@@ -215,25 +290,40 @@ pub fn nanos_to_int96(ns: i64) -> Int96 {
     v
 }
 
-/// Conforms stored values (keyed by column id, written under an older or equal schema
-/// version) to `schema`: missing columns get defaults, widened columns are converted and
-/// nullability is adapted. Dropped columns are ignored.
-pub fn conform(schema: &SchemaVersion, num_rows: usize, mut cols: Vec<(i64, ColumnData)>) -> Result<Vec<ColumnData>> {
+/// Conforms stored leaf values (written under an older or equal schema version) to
+/// `schema`, returning one column per leaf: missing columns get defaults (NULL/empty for
+/// nested fields), widened columns are converted and nullability is adapted. Dropped
+/// columns are ignored.
+pub fn conform(schema: &SchemaVersion, num_rows: usize, mut cols: Vec<(LeafKey, ColumnData)>) -> Result<Vec<ColumnData>> {
     schema
-        .columns
+        .leaves()?
         .iter()
-        .map(|spec| {
-            let data = match cols.iter().position(|(id, _)| *id == spec.column_id) {
+        .map(|leaf| {
+            let spec = &schema.columns[leaf.field];
+            let data = match cols.iter().position(|(k, _)| *k == (leaf.column_id, leaf.leaf)) {
                 Some(i) => {
                     let (_, c) = cols.swap_remove(i);
                     if c.num_rows() != num_rows {
                         return Err(Error::Corrupt("batch column length mismatch".into()));
                     }
-                    c.widen(spec.physical)?.with_nullability(spec.nullable)?
+                    conform_leaf(c, leaf, spec.is_nested())?
                 }
+                None if spec.is_nested() => ColumnData::nulls(leaf.physical(), leaf.max_def, leaf.max_rep, num_rows)?,
                 None => ColumnData::repeat(spec.physical, spec.nullable, default_values(spec)?.as_ref(), num_rows)?,
             };
             Ok(data)
         })
         .collect()
+}
+
+/// Adapts one stored leaf to the leaf's current type (widening, nullability).
+pub fn conform_leaf(c: ColumnData, leaf: &Leaf, nested: bool) -> Result<ColumnData> {
+    if !nested {
+        return c.widen(leaf.physical())?.with_nullability(leaf.spec.nullable);
+    }
+    match leaf.max_def - c.max_def {
+        0 => Ok(c),
+        1 => Ok(c.raise_defs()),
+        _ => Err(Error::Corrupt(format!("stored levels do not fit column '{}'", leaf.spec.name))),
+    }
 }

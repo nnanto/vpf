@@ -134,7 +134,12 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
             out.push(Tok::Num(c[st..i].iter().collect()));
         } else if ch.is_alphabetic() || ch == '_' {
             let st = i;
-            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_') {
+            // `a.b.c` addresses a struct field.
+            while i < c.len()
+                && (c[i].is_alphanumeric()
+                    || c[i] == '_'
+                    || (c[i] == '.' && c.get(i + 1).is_some_and(|d| d.is_alphabetic() || *d == '_')))
+            {
                 i += 1;
             }
             out.push(Tok::Ident(c[st..i].iter().collect()));
@@ -418,12 +423,36 @@ impl Expr {
     }
 }
 
+/// Resolves a column reference to its top-level column name: the name itself if such a
+/// column exists, otherwise the part before the first `.` (a struct field path).
+pub fn root_column(name: &str, exists: impl Fn(&str) -> bool) -> &str {
+    if exists(name) { name } else { name.split('.').next().unwrap_or(name) }
+}
+
+/// Fetches a column or struct field (`s.a.b`); a field is NULL wherever an enclosing
+/// struct is NULL.
+fn resolve(b: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    if let Some(a) = b.column_by_name(name) {
+        return Ok(a.clone());
+    }
+    let not_found = || Error::NotFound(format!("column '{name}'"));
+    let mut parts = name.split('.');
+    let mut a = b.column_by_name(parts.next().ok_or_else(not_found)?).ok_or_else(not_found)?.clone();
+    for p in parts {
+        let st = a.as_any().downcast_ref::<arrow::array::StructArray>().ok_or_else(not_found)?;
+        let child = st.column_by_name(p).ok_or_else(not_found)?;
+        let nulls = arrow::buffer::NullBuffer::union(st.nulls(), child.nulls());
+        a = arrow::array::make_array(child.to_data().into_builder().nulls(nulls).build()?);
+    }
+    Ok(a)
+}
+
 /// Fetches a referenced column, decoding dictionary arrays to their values.
 fn column_or_err(b: &RecordBatch, o: &Operand) -> Result<ArrayRef> {
     let Operand::Column(name) = o else {
         return Err(Error::Invalid("predicate: expected a column".into()));
     };
-    let a = b.column_by_name(name).ok_or_else(|| Error::NotFound(format!("column '{name}'")))?.clone();
+    let a = resolve(b, name)?;
     Ok(match a.data_type() {
         DataType::Dictionary(_, v) => cast_with_options(&a, v, &CastOptions::default())?,
         _ => a,

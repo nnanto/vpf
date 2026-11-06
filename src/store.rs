@@ -133,18 +133,27 @@ impl<'a> Txn<'a> {
         self.blobs
     }
 
-    /// Stores one physical page (header + body bytes).
+    /// Stores one physical page (header + body bytes) of a non-repeated column, where every
+    /// level is a row.
     pub fn put_page(&mut self, bytes: &[u8], h: &PageHeaderInfo) -> Result<i64> {
-        if bytes.len() != h.total_len() {
-            return Err(Error::Corrupt("page byte length does not match header".into()));
-        }
-        let off = self.blobs.append(bytes)?;
-        self.wrote_blobs = true;
         let num_rows = match h.kind {
             PageKind::Data => h.num_values,
             PageKind::DataV2 => h.num_rows.unwrap_or(h.num_values),
             _ => 0,
         };
+        self.put_page_rows(bytes, h, num_rows)
+    }
+
+    /// Stores one physical page holding `num_rows` whole rows.
+    pub fn put_page_rows(&mut self, bytes: &[u8], h: &PageHeaderInfo, num_rows: i64) -> Result<i64> {
+        if bytes.len() != h.total_len() {
+            return Err(Error::Corrupt("page byte length does not match header".into()));
+        }
+        if !h.kind.is_data() && num_rows != 0 {
+            return Err(Error::Corrupt("non-data page with rows".into()));
+        }
+        let off = self.blobs.append(bytes)?;
+        self.wrote_blobs = true;
         self.tx.execute(
             "INSERT INTO pages (blob_offset, blob_len, kind, num_values, num_rows, uncompressed_len)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -191,12 +200,15 @@ impl<'a> Txn<'a> {
         Ok(id)
     }
 
-    pub fn put_row_group(&mut self, num_rows: i64, chunks: &[(i64, i64)]) -> Result<i64> {
+    /// Records a row group; `chunks` maps (column_id, leaf) to chunk ids.
+    pub fn put_row_group(&mut self, num_rows: i64, chunks: &[((i64, i64), i64)]) -> Result<i64> {
         self.tx.execute("INSERT INTO row_groups (num_rows) VALUES (?1)", [num_rows])?;
         let id = self.tx.last_insert_rowid();
-        let mut st = self.tx.prepare_cached("INSERT INTO rg_chunks (rg_id, column_id, chunk_id) VALUES (?1, ?2, ?3)")?;
-        for (col, chunk) in chunks {
-            st.execute(params![id, col, chunk])?;
+        let mut st = self
+            .tx
+            .prepare_cached("INSERT INTO rg_chunks (rg_id, column_id, leaf, chunk_id) VALUES (?1, ?2, ?3, ?4)")?;
+        for ((col, leaf), chunk) in chunks {
+            st.execute(params![id, col, leaf, chunk])?;
         }
         Ok(id)
     }

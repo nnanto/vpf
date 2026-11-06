@@ -5,6 +5,9 @@
 //! * widen (INT32 -> INT64, FLOAT -> DOUBLE) and required -> optional: the affected column's
 //!   chunks are re-encoded; all other chunks are reused.
 //!
+//! Nested columns support add (NULL / empty only), drop, rename, reorder and
+//! required -> optional (every leaf gains one definition level); widening is flat-only.
+//!
 //! Buffered batches are never rewritten; they are conformed to the snapshot's schema on read.
 
 use std::collections::HashMap;
@@ -16,7 +19,7 @@ use parquet::basic::{Compression, ConvertedType, LogicalType, Type as PhysicalTy
 use parquet::file::metadata::KeyValue;
 
 use crate::codec::{RawPage, decode_pages, encode_column};
-use crate::convert::{array_to_column, arrow_schema};
+use crate::convert::{array_to_column, arrow_schema, conform_leaf};
 use crate::error::{Error, Result};
 use crate::meta::{self, SegmentKind};
 use crate::ops::append::store_chunk;
@@ -76,6 +79,17 @@ impl Store {
                         return Err(Error::Invalid(format!("column '{}' already exists", spec.name)));
                     }
                     let mut spec = ColumnSpec { column_id: 0, default_value: None, ..spec.clone() };
+                    if spec.is_nested() {
+                        if default.as_ref().is_some_and(|l| *l != Literal::Null) {
+                            return Err(Error::Unsupported(format!("default value for nested column '{}'", spec.name)));
+                        }
+                        if !spec.top_level_nullable() {
+                            return Err(Error::Invalid(format!(
+                                "required nested column '{}' cannot be added to existing rows",
+                                spec.name
+                            )));
+                        }
+                    }
                     let field = parquet_to_arrow_schema(build_descriptor("s", std::slice::from_ref(&spec))?.as_ref(), None)?
                         .field(0)
                         .clone();
@@ -84,7 +98,7 @@ impl Store {
                         let data = array_to_column(&spec, field.data_type(), &arr)?;
                         spec.default_value = Some(encode_value(&data.values)?);
                     }
-                    if !spec.nullable && spec.default_value.is_none() {
+                    if !spec.top_level_nullable() && spec.default_value.is_none() {
                         return Err(Error::Invalid(format!("required column '{}' needs a default", spec.name)));
                     }
                     spec.column_id = t.alloc_column_ids(file_id, 1)?;
@@ -129,13 +143,16 @@ impl Store {
                 AlterOp::Widen { column, to } => {
                     let i = idx(&cols, column)?;
                     let c = &mut cols[i];
+                    if c.is_nested() {
+                        return Err(Error::Unsupported(format!("widening nested column '{column}'")));
+                    }
                     let new_ty = widen_spec(c, *to)?;
                     fields[i] = Arc::new(fields[i].as_ref().clone().with_data_type(new_ty));
                     (Rewrite::Recode(i), format!("widen column {column} to {to}"))
                 }
                 AlterOp::MakeOptional(n) => {
                     let i = idx(&cols, n)?;
-                    if cols[i].nullable {
+                    if cols[i].top_level_nullable() {
                         return Err(Error::Invalid(format!("column '{n}' is already optional")));
                     }
                     cols[i].nullable = true;
@@ -157,59 +174,63 @@ impl Store {
             let mut summary =
                 AlterSummary { snapshot_id: sid, schema_version_id: svid, row_groups_rewritten: 0, chunks_written: 0 };
             let codec = write_codec(&view.file);
-            let mut shared: HashMap<i64, i64> = HashMap::new();
+            let leaves = schema.leaves()?;
+            let old_leaves = old.leaves()?;
+            let mut shared: HashMap<(i64, i64), i64> = HashMap::new();
             for seg in &view.segments {
                 let SegmentData::RowGroup { seg: seg_row, rg, chunks } = seg else { continue };
-                let (target, new_chunk) = match rewrite {
+                let field = match rewrite {
                     Rewrite::None => continue,
-                    Rewrite::Add(i) => {
-                        let spec = &schema.columns[i];
-                        let id = match shared.get(&rg.num_rows) {
+                    Rewrite::Add(i) | Rewrite::Recode(i) => i,
+                };
+                let spec = &schema.columns[field];
+                let mut new_chunks: HashMap<(i64, i64), i64> = HashMap::new();
+                for leaf in leaves.iter().filter(|l| l.field == field) {
+                    let key = (leaf.column_id, leaf.leaf);
+                    let id = match rewrite {
+                        Rewrite::Add(_) => match shared.get(&(rg.num_rows, leaf.leaf)) {
                             Some(id) => *id,
                             None => {
-                                let default = spec.default_value.as_deref().map(decode_value).transpose()?;
-                                let data = ColumnData::repeat(
-                                    spec.physical,
-                                    spec.nullable,
-                                    default.as_ref(),
-                                    rg.num_rows as usize,
-                                )?;
-                                let enc = encode_column(spec, codec, &data, true)?;
-                                let id = store_chunk(t, spec, &enc)?;
+                                let n = rg.num_rows as usize;
+                                let data = if spec.is_nested() {
+                                    ColumnData::nulls(leaf.physical(), leaf.max_def, leaf.max_rep, n)?
+                                } else {
+                                    let default = spec.default_value.as_deref().map(decode_value).transpose()?;
+                                    ColumnData::repeat(spec.physical, spec.nullable, default.as_ref(), n)?
+                                };
+                                let enc = encode_column(leaf, codec, &data, true)?;
+                                let id = store_chunk(t, leaf, &enc)?;
                                 summary.chunks_written += 1;
-                                shared.insert(rg.num_rows, id);
+                                shared.insert((rg.num_rows, leaf.leaf), id);
                                 id
                             }
-                        };
-                        (spec.column_id, id)
-                    }
-                    Rewrite::Recode(i) => {
-                        let spec = &schema.columns[i];
-                        let old_i = old.columns.iter().position(|c| c.column_id == spec.column_id).unwrap();
-                        let old_spec = &old.columns[old_i];
-                        let chunk = &chunks[old_i];
-                        let raw = chunk.pages.iter().map(|p| RawPage::load(t.blobs(), p)).collect::<Result<Vec<_>>>()?;
-                        let data = decode_pages(old_spec, chunk.codec, &raw)?
-                            .widen(spec.physical)?
-                            .with_nullability(spec.nullable)?;
-                        let c = if chunk.codec == Compression::LZO { codec } else { chunk.codec };
-                        let enc = encode_column(spec, c, &data, true)?;
-                        summary.chunks_written += 1;
-                        (spec.column_id, store_chunk(t, spec, &enc)?)
-                    }
-                };
-                let ids: Vec<(i64, i64)> = schema
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        if c.column_id == target {
-                            Ok((c.column_id, new_chunk))
-                        } else {
-                            rg.chunks
-                                .get(&c.column_id)
-                                .map(|id| (c.column_id, *id))
-                                .ok_or_else(|| Error::Corrupt(format!("row group {} lacks column {}", rg.rg_id, c.name)))
+                        },
+                        _ => {
+                            let old_i = old_leaves
+                                .iter()
+                                .position(|l| (l.column_id, l.leaf) == key)
+                                .ok_or_else(|| Error::Corrupt(format!("missing leaf {key:?}")))?;
+                            let chunk = &chunks[old_i];
+                            let raw =
+                                chunk.pages.iter().map(|p| RawPage::load(t.blobs(), p)).collect::<Result<Vec<_>>>()?;
+                            let data = conform_leaf(decode_pages(&old_leaves[old_i], chunk.codec, &raw)?, leaf, spec.is_nested())?;
+                            let c = if chunk.codec == Compression::LZO { codec } else { chunk.codec };
+                            let enc = encode_column(leaf, c, &data, true)?;
+                            summary.chunks_written += 1;
+                            store_chunk(t, leaf, &enc)?
                         }
+                    };
+                    new_chunks.insert(key, id);
+                }
+                let ids: Vec<((i64, i64), i64)> = leaves
+                    .iter()
+                    .map(|l| {
+                        let key = (l.column_id, l.leaf);
+                        new_chunks
+                            .get(&key)
+                            .or_else(|| rg.chunks.get(&key))
+                            .map(|id| (key, *id))
+                            .ok_or_else(|| Error::Corrupt(format!("row group {} lacks column {}", rg.rg_id, l.spec.name)))
                     })
                     .collect::<Result<_>>()?;
                 let new_rg = t.put_row_group(rg.num_rows, &ids)?;
@@ -245,7 +266,7 @@ fn widen_spec(c: &mut ColumnSpec, to: PhysicalType) -> Result<DataType> {
         _ => return Err(bad()),
     };
     if let Some(d) = &c.default_value {
-        let v = ColumnData { values: decode_value(d)?, defs: None }.widen(to)?;
+        let v = ColumnData::flat(decode_value(d)?, None).widen(to)?;
         c.default_value = Some(encode_value(&v.values)?);
     }
     c.physical = to;

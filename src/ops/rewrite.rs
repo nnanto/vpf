@@ -13,7 +13,7 @@ use crate::meta::ChunkRow;
 use crate::ops::append::store_chunk;
 use crate::ops::snapshot::SnapshotView;
 use crate::predicate::Expr;
-use crate::schema::ColumnSpec;
+use crate::schema::Leaf;
 use crate::stats::StoredStats;
 use crate::store::{NewChunk, Store, Txn};
 use crate::values::ColumnData;
@@ -37,7 +37,10 @@ impl Store {
         let mut idx = expr
             .columns()
             .iter()
-            .map(|c| view.schema.column_index(c))
+            .map(|c| {
+                let root = crate::predicate::root_column(c, |n| view.schema.column_by_name(n).is_some());
+                view.schema.column_index(root)
+            })
             .collect::<Result<Vec<_>>>()?;
         if idx.is_empty() && !view.schema.columns.is_empty() {
             idx.push(0);
@@ -93,7 +96,7 @@ pub fn page_row_ranges(chunk: &ChunkRow) -> Vec<Option<Range<usize>>> {
 #[allow(clippy::too_many_arguments)]
 pub fn rewrite_chunk(
     t: &mut Txn,
-    spec: &ColumnSpec,
+    leaf: &Leaf,
     chunk: &ChunkRow,
     fallback_codec: Compression,
     touched: &dyn Fn(Range<usize>) -> bool,
@@ -101,8 +104,8 @@ pub fn rewrite_chunk(
     stats: Option<StoredStats>,
     counts: &mut PageCounts,
 ) -> Result<i64> {
-    if spec.physical != chunk.physical {
-        return Err(Error::Corrupt(format!("chunk {} does not match column '{}'", chunk.chunk_id, spec.name)));
+    if leaf.physical() != chunk.physical {
+        return Err(Error::Corrupt(format!("chunk {} does not match column '{}'", chunk.chunk_id, leaf.spec.name)));
     }
     let ranges = page_row_ranges(chunk);
     let data_pages = ranges.iter().flatten().count();
@@ -113,12 +116,12 @@ pub fn rewrite_chunk(
     if chunk.codec == Compression::LZO {
         let raw = chunk.pages.iter().map(|p| RawPage::load(t.blobs(), p)).collect::<Result<Vec<_>>>()?;
         let total = ranges.iter().flatten().last().map(|r| r.end).unwrap_or(0);
-        let data = transform(decode_pages(spec, chunk.codec, &raw)?, 0..total)?;
-        let mut enc = encode_column(spec, fallback_codec, &data, true)?;
+        let data = transform(decode_pages(leaf, chunk.codec, &raw)?, 0..total)?;
+        let mut enc = encode_column(leaf, fallback_codec, &data, true)?;
         enc.stats = stats;
         counts.rewritten += data_pages;
         counts.written += enc.pages.len();
-        return store_chunk(t, spec, &enc);
+        return store_chunk(t, leaf, &enc);
     }
     let dict = chunk
         .pages
@@ -145,21 +148,24 @@ pub fn rewrite_chunk(
         };
         let mut pages = dict.clone();
         pages.push(RawPage::load(t.blobs(), p)?);
-        let data = decode_pages(spec, chunk.codec, &pages)?;
+        let data = decode_pages(leaf, chunk.codec, &pages)?;
+        if data.num_rows() != r.len() {
+            return Err(Error::Corrupt(format!("page of chunk {} holds {} rows, expected {}", chunk.chunk_id, data.num_rows(), r.len())));
+        }
         let new = transform(data, r)?;
         if new.num_rows() == 0 {
             counts.dropped += 1;
             continue;
         }
         counts.rewritten += 1;
-        let enc = encode_column(spec, chunk.codec, &new, false)?;
+        let enc = encode_column(leaf, chunk.codec, &new, false)?;
         for e in &enc.encodings {
             if !encodings.contains(e) {
                 encodings.push(*e);
             }
         }
-        for (b, h) in &enc.pages {
-            page_ids.push(t.put_page(b, h)?);
+        for ((b, h), &rows) in enc.pages.iter().zip(&enc.page_rows) {
+            page_ids.push(t.put_page_rows(b, h, rows)?);
             counts.written += 1;
             data_out += h.kind.is_data() as usize;
         }

@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS schema_columns (
     scale INTEGER NOT NULL,
     field_id INTEGER,
     default_value BLOB,
+    nested_type TEXT,
     PRIMARY KEY (schema_version_id, column_id)
 );
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -91,8 +92,9 @@ CREATE TABLE IF NOT EXISTS row_groups (
 CREATE TABLE IF NOT EXISTS rg_chunks (
     rg_id INTEGER NOT NULL,
     column_id INTEGER NOT NULL,
+    leaf INTEGER NOT NULL,
     chunk_id INTEGER NOT NULL,
-    PRIMARY KEY (rg_id, column_id)
+    PRIMARY KEY (rg_id, column_id, leaf)
 );
 CREATE TABLE IF NOT EXISTS batches (
     batch_id INTEGER PRIMARY KEY,
@@ -190,7 +192,8 @@ pub struct ChunkRow {
 pub struct RowGroupRow {
     pub rg_id: i64,
     pub num_rows: i64,
-    pub chunks: HashMap<i64, i64>,
+    /// (column_id, leaf) -> chunk_id
+    pub chunks: HashMap<(i64, i64), i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,7 +300,7 @@ pub fn load_schema(conn: &Connection, schema_version_id: i64) -> Result<SchemaVe
         .transpose()?;
     let mut st = conn.prepare(
         "SELECT column_id, name, physical_type, type_length, nullable, logical_type, converted_type,
-                precision, scale, field_id, default_value
+                precision, scale, field_id, default_value, nested_type
          FROM schema_columns WHERE schema_version_id = ?1 ORDER BY ordinal",
     )?;
     let mut columns = Vec::new();
@@ -306,6 +309,7 @@ pub fn load_schema(conn: &Connection, schema_version_id: i64) -> Result<SchemaVe
         let physical: String = r.get(2)?;
         let logical: Option<String> = r.get(5)?;
         let converted: String = r.get(6)?;
+        let nested: Option<String> = r.get(11)?;
         columns.push(ColumnSpec {
             column_id: r.get(0)?,
             name: r.get(1)?,
@@ -320,6 +324,9 @@ pub fn load_schema(conn: &Connection, schema_version_id: i64) -> Result<SchemaVe
             scale: r.get(8)?,
             field_id: r.get(9)?,
             default_value: r.get(10)?,
+            nested: nested
+                .map(|s| -> Result<_> { crate::schema::type_from_json(&serde_json::from_str(&s)?) })
+                .transpose()?,
         });
     }
     Ok(SchemaVersion { schema_version_id, root_name, columns, key_value })
@@ -352,11 +359,12 @@ pub fn insert_schema(
     let id = conn.last_insert_rowid();
     let mut st = conn.prepare(
         "INSERT INTO schema_columns (schema_version_id, column_id, ordinal, name, physical_type, type_length,
-            nullable, logical_type, converted_type, precision, scale, field_id, default_value)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            nullable, logical_type, converted_type, precision, scale, field_id, default_value, nested_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     for (i, c) in columns.iter().enumerate() {
         let logical = c.logical.as_ref().map(logical_to_json).transpose()?.map(|v| v.to_string());
+        let nested = c.nested.as_deref().map(crate::schema::type_to_json).transpose()?.map(|v| v.to_string());
         st.execute(params![
             id,
             c.column_id,
@@ -371,6 +379,7 @@ pub fn insert_schema(
             c.scale,
             c.field_id,
             c.default_value,
+            nested,
         ])?;
     }
     Ok(id)
@@ -401,10 +410,10 @@ pub fn load_row_group(conn: &Connection, rg_id: i64) -> Result<RowGroupRow> {
         .query_row("SELECT num_rows FROM row_groups WHERE rg_id = ?1", [rg_id], |r| r.get(0))
         .optional()?
         .ok_or_else(|| Error::Corrupt(format!("missing row group {rg_id}")))?;
-    let mut st = conn.prepare_cached("SELECT column_id, chunk_id FROM rg_chunks WHERE rg_id = ?1")?;
+    let mut st = conn.prepare_cached("SELECT column_id, leaf, chunk_id FROM rg_chunks WHERE rg_id = ?1")?;
     let chunks = st
-        .query_map([rg_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<HashMap<i64, i64>>>()?;
+        .query_map([rg_id], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?
+        .collect::<rusqlite::Result<HashMap<(i64, i64), i64>>>()?;
     Ok(RowGroupRow { rg_id, num_rows, chunks })
 }
 

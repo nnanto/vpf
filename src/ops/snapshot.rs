@@ -23,7 +23,7 @@ pub enum SegmentData {
     RowGroup {
         seg: Segment,
         rg: RowGroupRow,
-        /// One chunk per schema column, in schema order.
+        /// One chunk per leaf column, in leaf order.
         chunks: Vec<ChunkRow>,
     },
     Batch {
@@ -55,17 +55,17 @@ pub fn load_view(conn: &Connection, name: &str, snapshot_id: Option<i64>) -> Res
     };
     let snapshot = meta::load_snapshot(conn, file.file_id, sid)?;
     let schema = meta::load_schema(conn, snapshot.schema_version_id)?;
+    let leaves = schema.leaves()?;
     let mut segments = Vec::new();
     for seg in meta::visible_segments(conn, file.file_id, sid)? {
         segments.push(match seg.kind {
             SegmentKind::RowGroup => {
                 let rg = meta::load_row_group(conn, seg.obj_id)?;
-                let chunks = schema
-                    .columns
+                let chunks = leaves
                     .iter()
-                    .map(|c| {
-                        let id = rg.chunks.get(&c.column_id).ok_or_else(|| {
-                            Error::Corrupt(format!("row group {} has no chunk for column {}", rg.rg_id, c.name))
+                    .map(|l| {
+                        let id = rg.chunks.get(&(l.column_id, l.leaf)).ok_or_else(|| {
+                            Error::Corrupt(format!("row group {} has no chunk for column {}", rg.rg_id, l.spec.name))
                         })?;
                         meta::load_chunk(conn, *id)
                     })
@@ -122,6 +122,7 @@ impl Store {
             SegmentData::Batch { batch, .. } => Some(batch.num_rows),
             _ => None,
         });
+        let leaves = view.schema.leaves()?;
         let mut rgs = Vec::new();
         let mut i = 0;
         let mut runs = runs.into_iter().peekable();
@@ -141,8 +142,8 @@ impl Store {
                     chunks: rg
                         .chunks
                         .iter()
-                        .zip(&view.schema.columns)
-                        .map(|(c, spec)| c.layout(spec.physical))
+                        .zip(&leaves)
+                        .map(|(c, leaf)| c.layout(leaf.physical()))
                         .collect::<Result<_>>()?,
                 });
                 sources.push(run.clone());

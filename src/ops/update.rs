@@ -35,6 +35,16 @@ impl Store {
             for (col, lit) in &assignments {
                 let i = view.schema.column_index(col)?;
                 let spec = &view.schema.columns[i];
+                if spec.is_nested() {
+                    if *lit != Literal::Null {
+                        return Err(Error::Unsupported(format!("nested column '{col}' can only be set to NULL")));
+                    }
+                    if !spec.nullable {
+                        return Err(Error::Invalid(format!("cannot set NULL in required column '{col}'")));
+                    }
+                    values.push((i, None));
+                    continue;
+                }
                 let arr = literal_array(lit, arrow.field(i).data_type())?;
                 let data = array_to_column(spec, arrow.field(i).data_type(), &arr)?;
                 if *lit != Literal::Null && data.defs.as_ref().is_some_and(|d| d[0] == 0) {
@@ -56,6 +66,7 @@ impl Store {
                 Some(&format!("{rows_updated} rows: SET {set} WHERE {predicate}")),
             )?;
             let codec = write_codec(&view.file);
+            let leaves = view.schema.leaves()?;
             for (seg, mask) in view.segments.iter().zip(&masks) {
                 if !mask.iter().any(|x| *x) {
                     continue;
@@ -64,15 +75,16 @@ impl Store {
                 match seg {
                     SegmentData::RowGroup { rg, chunks, seg: seg_row } => {
                         let mut ids = Vec::with_capacity(chunks.len());
-                        for (ci, (spec, chunk)) in view.schema.columns.iter().zip(chunks).enumerate() {
-                            let Some((_, value)) = values.iter().find(|(i, _)| *i == ci) else {
+                        for (leaf, chunk) in leaves.iter().zip(chunks) {
+                            let key = (leaf.column_id, leaf.leaf);
+                            let Some((_, value)) = values.iter().find(|(i, _)| *i == leaf.field) else {
                                 s.chunks_reused += 1;
-                                ids.push((spec.column_id, chunk.chunk_id));
+                                ids.push((key, chunk.chunk_id));
                                 continue;
                             };
                             let id = rewrite_chunk(
                                 t,
-                                spec,
+                                leaf,
                                 chunk,
                                 codec,
                                 &|r| mask[r].iter().any(|x| *x),
@@ -84,7 +96,7 @@ impl Store {
                                 None,
                                 &mut s.pages,
                             )?;
-                            ids.push((spec.column_id, id));
+                            ids.push((key, id));
                         }
                         let new_rg = t.put_row_group(rg.num_rows, &ids)?;
                         t.replace_segment(file_id, seg_row, SegmentKind::RowGroup, new_rg, sid)?;
@@ -92,10 +104,12 @@ impl Store {
                     SegmentData::Batch { batch, seg: seg_row } => {
                         let mut cols = batch_columns(&view.schema, batch)?;
                         let rows: Vec<usize> = (0..mask.len()).filter(|&i| mask[i]).collect();
-                        for (ci, value) in &values {
-                            cols[*ci] = cols[*ci].set_rows(&rows, value.as_ref())?;
+                        for (leaf, col) in leaves.iter().zip(cols.iter_mut()) {
+                            if let Some((_, value)) = values.iter().find(|(i, _)| *i == leaf.field) {
+                                *col = col.set_rows(&rows, value.as_ref())?;
+                            }
                         }
-                        let keyed: Vec<_> = view.schema.columns.iter().map(|c| c.column_id).zip(cols).collect();
+                        let keyed: Vec<_> = leaves.iter().map(|l| (l.column_id, l.leaf)).zip(cols).collect();
                         let payload = encode_batch(mask.len(), &keyed)?;
                         let b = t.put_batch(view.schema.schema_version_id, batch.num_rows, &payload)?;
                         t.replace_segment(file_id, seg_row, SegmentKind::Batch, b, sid)?;

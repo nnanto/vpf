@@ -4,9 +4,11 @@ use parquet::basic::Compression;
 use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::reader::ChunkReader;
 
+use crate::codec::{RawPage, chunk_page_rows, decode_pages, encode_column};
 use crate::error::{Error, Result};
+use crate::ops::append::store_chunk;
 use crate::meta::{self, SegmentKind};
-use crate::schema::ColumnSpec;
+use crate::schema::{ColumnSpec, build_descriptor};
 use crate::stats::StoredStats;
 use crate::store::{NewChunk, Store};
 use crate::thrift::{PageKind, split_pages};
@@ -32,14 +34,6 @@ impl Store {
         let fmd = md.file_metadata();
         let descr = fmd.schema_descr();
         let root = descr.root_schema();
-        for c in descr.columns() {
-            if c.max_rep_level() != 0 || c.path().parts().len() != 1 {
-                return Err(Error::Unsupported(format!(
-                    "nested column '{}' (only flat schemas are supported)",
-                    c.path()
-                )));
-            }
-        }
         let default_codec = md
             .row_groups()
             .first()
@@ -57,7 +51,14 @@ impl Store {
                 .enumerate()
                 .map(|(i, f)| ColumnSpec::from_parquet_type(first_id + i as i64, f))
                 .collect::<Result<Vec<_>>>()?;
+            if build_descriptor(root.name(), &specs)?.root_schema() != root {
+                return Err(Error::Unsupported("schema cannot be represented exactly".into()));
+            }
             let svid = meta::insert_schema(t.conn(), file_id, None, root.name(), &specs, fmd.key_value_metadata().map(|v| v.as_slice()))?;
+            let leaves = meta::load_schema(t.conn(), svid)?.leaves()?;
+            if leaves.len() != descr.num_columns() {
+                return Err(Error::Corrupt("leaf count mismatch".into()));
+            }
             let sid = t.new_snapshot(file_id, svid, "import", None)?;
             let mut pages_total = 0;
             let mut rgs = 0;
@@ -65,40 +66,72 @@ impl Store {
                 if rg.num_rows() == 0 {
                     continue;
                 }
-                let mut chunk_ids = Vec::with_capacity(specs.len());
-                for (spec, col) in specs.iter().zip(rg.columns()) {
+                let mut chunk_ids = Vec::with_capacity(leaves.len());
+                for (leaf, col) in leaves.iter().zip(rg.columns()) {
                     if col.file_path().is_some() {
                         return Err(Error::Unsupported("column chunks in external files".into()));
                     }
                     let (start, len) = col.byte_range();
                     let bytes = reader.get_bytes(start, len as usize)?;
-                    let mut page_ids = Vec::new();
-                    let mut rows = 0i64;
-                    for p in split_pages(&bytes)? {
-                        if p.header.kind == PageKind::Index {
-                            continue;
-                        }
-                        if p.header.kind.is_data() {
-                            rows += p.header.num_rows.unwrap_or(p.header.num_values);
-                        }
-                        let body = &bytes[p.offset..p.offset + p.header.total_len()];
-                        page_ids.push(t.put_page(body, &p.header)?);
-                    }
-                    if rows != rg.num_rows() {
-                        return Err(Error::Corrupt(format!(
-                            "column '{}' pages cover {rows} rows, row group has {}",
-                            spec.name,
-                            rg.num_rows()
-                        )));
-                    }
-                    pages_total += page_ids.len();
-                    let chunk = NewChunk {
-                        physical: col.column_type(),
-                        codec: col.compression(),
-                        encodings: col.encodings().collect(),
-                        stats: col.statistics().map(StoredStats::from_parquet),
+                    let pages: Vec<RawPage> = split_pages(&bytes)?
+                        .into_iter()
+                        .filter(|p| p.header.kind != PageKind::Index)
+                        .map(|p| RawPage::from_header(bytes.slice(p.offset..p.offset + p.header.total_len()), &p.header))
+                        .collect();
+                    let headers: Vec<_> = split_pages(&bytes)?
+                        .into_iter()
+                        .filter(|p| p.header.kind != PageKind::Index)
+                        .map(|p| p.header)
+                        .collect();
+                    let page_rows = if leaf.max_rep == 0 {
+                        Some(headers.iter().map(|h| if h.kind.is_data() { h.num_rows.unwrap_or(h.num_values) } else { 0 }).collect())
+                    } else {
+                        chunk_page_rows(leaf, col.compression(), &pages)?
                     };
-                    chunk_ids.push((spec.column_id, t.put_chunk(&chunk, &page_ids)?));
+                    let chunk_id = match page_rows {
+                        Some(page_rows) => {
+                            let rows: i64 = page_rows.iter().sum();
+                            if rows != rg.num_rows() {
+                                return Err(Error::Corrupt(format!(
+                                    "column '{}' pages cover {rows} rows, row group has {}",
+                                    leaf.spec.name,
+                                    rg.num_rows()
+                                )));
+                            }
+                            let mut page_ids = Vec::with_capacity(pages.len());
+                            for ((p, h), r) in pages.iter().zip(&headers).zip(page_rows) {
+                                page_ids.push(t.put_page_rows(&p.bytes, h, r)?);
+                            }
+                            pages_total += page_ids.len();
+                            let chunk = NewChunk {
+                                physical: col.column_type(),
+                                codec: col.compression(),
+                                encodings: col.encodings().collect(),
+                                stats: col.statistics().map(StoredStats::from_parquet),
+                            };
+                            t.put_chunk(&chunk, &page_ids)?
+                        }
+                        None => {
+                            // Records span pages: re-encode so every page starts a record.
+                            let data = decode_pages(leaf, col.compression(), &pages)?;
+                            if data.num_rows() as i64 != rg.num_rows() {
+                                return Err(Error::Corrupt(format!(
+                                    "column '{}' holds {} rows, row group has {}",
+                                    leaf.spec.name,
+                                    data.num_rows(),
+                                    rg.num_rows()
+                                )));
+                            }
+                            let codec = match col.compression() {
+                                Compression::LZO => Compression::SNAPPY,
+                                c => c,
+                            };
+                            let enc = encode_column(leaf, codec, &data, true)?;
+                            pages_total += enc.pages.len();
+                            store_chunk(t, leaf, &enc)?
+                        }
+                    };
+                    chunk_ids.push(((leaf.column_id, leaf.leaf), chunk_id));
                 }
                 let rg_id = t.put_row_group(rg.num_rows(), &chunk_ids)?;
                 t.append_segment(file_id, SegmentKind::RowGroup, rg_id, sid)?;

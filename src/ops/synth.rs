@@ -20,7 +20,7 @@ const CACHE_ENTRIES: usize = 64;
 #[derive(Debug)]
 pub struct SynthRowGroup {
     pub num_rows: i64,
-    /// One encoded chunk per schema column, in schema order.
+    /// One encoded chunk per leaf column, in leaf order.
     pub chunks: Vec<EncodedChunk>,
 }
 
@@ -71,7 +71,7 @@ pub fn write_codec(file: &FileRow) -> Compression {
     }
 }
 
-/// Decodes and conforms a batch to `schema` (one column per schema column).
+/// Decodes and conforms a batch to `schema` (one column per leaf column).
 pub fn batch_columns(schema: &SchemaVersion, batch: &BatchRow) -> Result<Vec<ColumnData>> {
     let (n, cols) = decode_batch(&batch.payload)?;
     if n as i64 != batch.num_rows {
@@ -80,14 +80,17 @@ pub fn batch_columns(schema: &SchemaVersion, batch: &BatchRow) -> Result<Vec<Col
     conform(schema, n, cols)
 }
 
-/// Encodes per-column data as one row group.
+/// Encodes per-leaf data as one row group.
 pub fn encode_row_group(schema: &SchemaVersion, codec: Compression, cols: &[ColumnData]) -> Result<SynthRowGroup> {
     let num_rows = cols.first().map(|c| c.num_rows()).unwrap_or(0) as i64;
-    let chunks = schema
-        .columns
+    let leaves = schema.leaves()?;
+    if leaves.len() != cols.len() {
+        return Err(crate::Error::Corrupt("leaf count mismatch".into()));
+    }
+    let chunks = leaves
         .iter()
         .zip(cols)
-        .map(|(spec, data)| encode_column(spec, codec, data, true))
+        .map(|(leaf, data)| encode_column(leaf, codec, data, true))
         .collect::<Result<_>>()?;
     Ok(SynthRowGroup { num_rows, chunks })
 }

@@ -217,6 +217,8 @@ fn create_from_scratch_and_conversion_rules() {
     let got = rows_of(&store, "fa", None);
     assert_eq!(got.num_rows(), 7);
     assert_eq!(got.column(0).as_primitive::<arrow::datatypes::Int64Type>().values().to_vec(), vec![0, 1, 2, 0, 1, 2, 3]);
+    // The embedded Arrow schema makes reads return exactly the original types.
+    assert_eq!(got, concat(&[sample_batch(0, 3), sample_batch(0, 4)]));
 }
 
 #[test]

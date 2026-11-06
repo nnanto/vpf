@@ -58,10 +58,10 @@ impl Store {
                 match seg {
                     SegmentData::RowGroup { chunks, .. } => {
                         let mut ids = Vec::with_capacity(chunks.len());
-                        for (spec, chunk) in view.schema.columns.iter().zip(chunks) {
+                        for (leaf, chunk) in view.schema.leaves()?.iter().zip(chunks) {
                             let id = rewrite_chunk(
                                 t,
-                                spec,
+                                leaf,
                                 chunk,
                                 codec,
                                 &|r| mask[r].iter().any(|x| *x),
@@ -69,7 +69,7 @@ impl Store {
                                 chunk.stats.as_ref().map(|st| st.after_row_removal()),
                                 &mut s.pages,
                             )?;
-                            ids.push((spec.column_id, id));
+                            ids.push(((leaf.column_id, leaf.leaf), id));
                         }
                         let rg = t.put_row_group(remaining, &ids)?;
                         t.replace_segment(file_id, seg_row, SegmentKind::RowGroup, rg, sid)?;

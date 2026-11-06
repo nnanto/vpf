@@ -66,15 +66,74 @@ fn schema_roundtrips_through_sqlite() {
     assert_eq!(loaded.descriptor().unwrap().root_schema(), descr.root_schema());
 }
 
+const NESTED: &str = "message spark_schema {
+    optional group s { required int32 a; optional binary b (STRING); optional group inner { optional double d; } }
+    optional group l (LIST) { repeated group list { optional int64 element; } }
+    required group m (MAP) { repeated group key_value { required binary key (STRING); optional group value (LIST) { repeated group list { optional fixed_len_byte_array(16) element (DECIMAL(30,2)); } } } }
+    repeated int32 r = 7;
+    optional group legacy (LIST) { repeated binary str (UTF8); }
+    required int64 flat (TIMESTAMP(MICROS,true));
+}";
+
 #[test]
-fn nested_and_repeated_schemas_are_rejected() {
-    let root = parse_message_type(
-        "message m { optional group g { optional int32 a; } repeated int32 r; }",
-    )
-    .unwrap();
-    for f in root.get_fields() {
-        assert!(ColumnSpec::from_parquet_type(1, f).is_err());
+fn nested_schemas_roundtrip_through_sqlite() {
+    let root = Arc::new(parse_message_type(NESTED).unwrap());
+    let descr = SchemaDescriptor::new(root.clone());
+    let specs: Vec<ColumnSpec> = root
+        .get_fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| ColumnSpec::from_parquet_type(i as i64 + 1, f).unwrap())
+        .collect();
+    assert_eq!(specs.iter().filter(|s| s.is_nested()).count(), 5);
+    assert!(specs[4].top_level_nullable() && specs[3].top_level_nullable() && !specs[2].top_level_nullable());
+    let rebuilt = build_descriptor("spark_schema", &specs).unwrap();
+    assert_eq!(rebuilt.root_schema(), descr.root_schema());
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let svid = store
+        .write(|t| {
+            let f = t.create_file("x", Compression::SNAPPY, None, 1)?;
+            meta::insert_schema(t.conn(), f, None, "spark_schema", &specs, None)
+        })
+        .unwrap();
+    let loaded = store.read(|c| meta::load_schema(c, svid)).unwrap();
+    assert_eq!(loaded.columns, specs);
+    assert_eq!(loaded.descriptor().unwrap().root_schema(), descr.root_schema());
+
+    let leaves = loaded.leaves().unwrap();
+    assert_eq!(leaves.len(), descr.num_columns());
+    for (i, l) in leaves.iter().enumerate() {
+        let c = descr.column(i);
+        assert_eq!((l.max_def, l.max_rep), (c.max_def_level(), c.max_rep_level()), "{}", l.spec.name);
+        assert_eq!(l.physical(), c.physical_type());
+        assert_eq!(l.field, descr.get_column_root_idx(i));
+        assert_eq!(l.spec.name, c.path().string());
+        // The single-leaf descriptor used by the codec has the same levels and type.
+        let d = l.descriptor().unwrap();
+        assert_eq!(d.num_columns(), 1);
+        let lc = d.column(0);
+        assert_eq!((lc.max_def_level(), lc.max_rep_level(), lc.physical_type()), (c.max_def_level(), c.max_rep_level(), c.physical_type()));
+        assert_eq!(lc.type_length(), c.type_length());
     }
+    let keys: Vec<(i64, i64)> = leaves.iter().map(|l| (l.column_id, l.leaf)).collect();
+    assert_eq!(keys, vec![(1, 0), (1, 1), (1, 2), (2, 0), (3, 0), (3, 1), (4, 0), (5, 0), (6, 0)]);
+
+    // Renaming / making optional rebuilds the type tree.
+    let mut s0 = specs[0].clone();
+    s0.name = "renamed".into();
+    s0.nullable = false;
+    let t = s0.to_parquet_type().unwrap();
+    assert_eq!(t.name(), "renamed");
+    assert_eq!(t.get_basic_info().repetition(), parquet::basic::Repetition::REQUIRED);
+    assert_eq!(t.get_fields().len(), 3);
+}
+
+#[test]
+fn unsupported_nested_types_are_rejected() {
+    let empty = Arc::new(parquet::schema::types::Type::group_type_builder("g").with_repetition(parquet::basic::Repetition::OPTIONAL).build().unwrap());
+    assert!(ColumnSpec::from_parquet_type(1, &empty).is_err());
 }
 
 #[test]
@@ -135,7 +194,7 @@ fn write_txn_is_atomic_and_blobs_are_stable() {
                 &NewChunk { physical: parquet::basic::Type::INT64, codec: Compression::UNCOMPRESSED, encodings: vec![], stats: None },
                 &[page_id],
             )?;
-            let rg = t.put_row_group(100, &[(1, chunk_id)])?;
+            let rg = t.put_row_group(100, &[((1, 0), chunk_id)])?;
             let s1 = t.new_snapshot(fid, 1, "test", None)?;
             t.append_segment(fid, SegmentKind::RowGroup, rg, s1)?;
             assert_eq!(t.finish_snapshot(fid, s1)?, 100);
@@ -156,7 +215,7 @@ fn write_txn_is_atomic_and_blobs_are_stable() {
         .write(|t| {
             let s2 = t.new_snapshot(fid, 1, "test2", None)?;
             let segs = meta::visible_segments(t.conn(), fid, s1)?;
-            let rg2 = t.put_row_group(100, &[(1, chunk_id)])?;
+            let rg2 = t.put_row_group(100, &[((1, 0), chunk_id)])?;
             t.replace_segment(fid, &segs[0], SegmentKind::RowGroup, rg2, s2)?;
             let b = t.put_batch(1, 5, b"payload")?;
             t.append_segment(fid, SegmentKind::Batch, b, s2)?;

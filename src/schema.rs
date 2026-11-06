@@ -1,4 +1,8 @@
-//! Flat schema model persisted in SQLite, with stable column ids.
+//! Schema model persisted in SQLite, with stable column ids.
+//!
+//! A schema version is a list of top-level fields ([`ColumnSpec`]). A flat field is a single
+//! primitive leaf; a nested field (group, LIST, MAP, or a top-level repeated field) keeps its
+//! full Parquet type tree and maps to one or more leaf columns ([`Leaf`]).
 
 use std::sync::Arc;
 
@@ -11,7 +15,8 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 
-/// A leaf column of a flat schema.
+/// A top-level field. For flat fields the primitive attributes describe the single leaf;
+/// for nested fields they are unused and `nested` holds the Parquet type tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnSpec {
     /// Stable identity, preserved across renames/reorders; never reused within a file.
@@ -28,11 +33,44 @@ pub struct ColumnSpec {
     /// Encoded single value (see `values::encode_default`) used to fill rows that predate
     /// the column. `None` means NULL.
     pub default_value: Option<Vec<u8>>,
+    /// Type tree of a nested field. Its own name/repetition are superseded by `name` and
+    /// `nullable` (unless it is REPEATED).
+    pub nested: Option<TypePtr>,
 }
 
 impl ColumnSpec {
+    pub fn is_nested(&self) -> bool {
+        self.nested.is_some()
+    }
+
+    /// Builds a nested field spec from a Parquet type.
+    pub fn nested(column_id: i64, t: TypePtr) -> Result<Self> {
+        validate_nested(&t)?;
+        let info = t.get_basic_info();
+        Ok(Self {
+            column_id,
+            name: info.name().to_string(),
+            physical: PhysicalType::BYTE_ARRAY,
+            type_length: -1,
+            nullable: info.repetition() == Repetition::OPTIONAL,
+            logical: None,
+            converted: ConvertedType::NONE,
+            precision: -1,
+            scale: -1,
+            field_id: info.has_id().then(|| info.id()),
+            default_value: None,
+            nested: Some(t),
+        })
+    }
+
     pub fn max_def(&self) -> i16 {
         self.nullable as i16
+    }
+
+    /// True if a row may lack this field: an optional field (NULL) or a top-level repeated
+    /// field (no elements).
+    pub fn top_level_nullable(&self) -> bool {
+        self.nullable || self.nested.as_ref().is_some_and(|t| t.get_basic_info().repetition() == Repetition::REPEATED)
     }
 
     pub fn repetition(&self) -> Repetition {
@@ -40,8 +78,19 @@ impl ColumnSpec {
     }
 
     pub fn to_parquet_type(&self) -> Result<TypePtr> {
+        if let Some(t) = &self.nested {
+            let rep = match t.get_basic_info().repetition() {
+                Repetition::REPEATED => Repetition::REPEATED,
+                _ => self.repetition(),
+            };
+            return rebuild_type(t, &self.name, rep, self.field_id);
+        }
+        self.primitive_type(self.repetition())
+    }
+
+    fn primitive_type(&self, repetition: Repetition) -> Result<TypePtr> {
         let mut b = Type::primitive_type_builder(&self.name, self.physical)
-            .with_repetition(self.repetition())
+            .with_repetition(repetition)
             .with_converted_type(self.converted)
             .with_logical_type(self.logical.clone())
             .with_id(self.field_id);
@@ -54,21 +103,20 @@ impl ColumnSpec {
         Ok(Arc::new(b.build()?))
     }
 
-    /// Builds a spec from a primitive leaf of a parquet schema; rejects nested/repeated fields.
-    pub fn from_parquet_type(column_id: i64, t: &Type) -> Result<Self> {
+    /// Builds a spec from a top-level field of a parquet schema (flat or nested).
+    pub fn from_parquet_type(column_id: i64, t: &TypePtr) -> Result<Self> {
+        if t.is_group() || t.get_basic_info().repetition() == Repetition::REPEATED {
+            return Self::nested(column_id, t.clone());
+        }
+        Self::from_primitive(column_id, t)
+    }
+
+    /// Builds a spec describing a primitive (leaf) type; REPEATED leaves count as required.
+    pub fn from_primitive(column_id: i64, t: &Type) -> Result<Self> {
         let Type::PrimitiveType { basic_info, physical_type, type_length, scale, precision } = t else {
-            return Err(Error::Unsupported(format!(
-                "nested column '{}' (only flat schemas are supported)",
-                t.name()
-            )));
+            return Err(Error::Invalid(format!("'{}' is not a primitive type", t.name())));
         };
-        let nullable = match basic_info.repetition() {
-            Repetition::REQUIRED => false,
-            Repetition::OPTIONAL => true,
-            Repetition::REPEATED => {
-                return Err(Error::Unsupported(format!("repeated column '{}'", t.name())));
-            }
-        };
+        let nullable = basic_info.repetition() == Repetition::OPTIONAL;
         let logical = basic_info.logical_type_ref().cloned();
         if let Some(l) = &logical {
             logical_to_json(l)?; // validates support
@@ -85,8 +133,167 @@ impl ColumnSpec {
             scale: *scale,
             field_id: basic_info.has_id().then(|| basic_info.id()),
             default_value: None,
+            nested: None,
         })
     }
+}
+
+/// One leaf column of a schema version.
+#[derive(Debug, Clone)]
+pub struct Leaf {
+    pub column_id: i64,
+    /// Index of the leaf within its field (0 for flat fields).
+    pub leaf: i64,
+    /// Index of the field in `SchemaVersion::columns`.
+    pub field: usize,
+    /// Primitive description; for nested leaves the name is the dotted path.
+    pub spec: ColumnSpec,
+    pub max_def: i16,
+    pub max_rep: i16,
+}
+
+impl Leaf {
+    /// A flat field's single leaf.
+    pub fn flat(spec: &ColumnSpec) -> Self {
+        Leaf { column_id: spec.column_id, leaf: 0, field: 0, spec: spec.clone(), max_def: spec.max_def(), max_rep: 0 }
+    }
+
+    pub fn physical(&self) -> PhysicalType {
+        self.spec.physical
+    }
+
+    /// True for a leaf whose levels are those of a flat column (at most one definition
+    /// level, no repetition), i.e. one level per row.
+    pub fn is_flat(&self) -> bool {
+        self.max_rep == 0 && self.max_def <= 1
+    }
+
+    /// A single-leaf schema with the same physical type and level structure as this leaf,
+    /// used to encode/decode its pages in isolation.
+    pub fn descriptor(&self) -> Result<SchemaDescPtr> {
+        if self.spec.nested.is_none() && self.max_rep == 0 && self.max_def == self.spec.max_def() {
+            return build_descriptor("m", std::slice::from_ref(&self.spec));
+        }
+        let mut t = self.spec.primitive_type(Repetition::REQUIRED)?;
+        for i in 0..self.max_def {
+            let rep = if i < self.max_rep { Repetition::REPEATED } else { Repetition::OPTIONAL };
+            t = Arc::new(Type::group_type_builder(&format!("l{i}")).with_repetition(rep).with_fields(vec![t]).build()?);
+        }
+        let root = Type::group_type_builder("m").with_fields(vec![t]).build()?;
+        Ok(Arc::new(SchemaDescriptor::new(Arc::new(root))))
+    }
+}
+
+/// Copies a type with a new name, repetition and field id.
+pub fn rebuild_type(t: &TypePtr, name: &str, repetition: Repetition, id: Option<i32>) -> Result<TypePtr> {
+    let info = t.get_basic_info();
+    let out = match t.as_ref() {
+        Type::GroupType { fields, .. } => Type::group_type_builder(name)
+            .with_repetition(repetition)
+            .with_converted_type(info.converted_type())
+            .with_logical_type(info.logical_type_ref().cloned())
+            .with_id(id)
+            .with_fields(fields.clone())
+            .build()?,
+        Type::PrimitiveType { physical_type, type_length, scale, precision, .. } => {
+            let mut b = Type::primitive_type_builder(name, *physical_type)
+                .with_repetition(repetition)
+                .with_converted_type(info.converted_type())
+                .with_logical_type(info.logical_type_ref().cloned())
+                .with_id(id)
+                .with_length(*type_length);
+            if *precision > 0 {
+                b = b.with_precision(*precision).with_scale(*scale);
+            }
+            b.build()?
+        }
+    };
+    Ok(Arc::new(out))
+}
+
+fn validate_nested(t: &Type) -> Result<()> {
+    if let Some(l) = t.get_basic_info().logical_type_ref() {
+        logical_to_json(l)?;
+    }
+    match t {
+        Type::GroupType { fields, .. } => {
+            if fields.is_empty() {
+                return Err(Error::Unsupported(format!("empty group '{}'", t.name())));
+            }
+            fields.iter().try_for_each(|f| validate_nested(f))
+        }
+        Type::PrimitiveType { .. } => Ok(()),
+    }
+}
+
+fn repetition_str(r: Repetition) -> &'static str {
+    match r {
+        Repetition::REQUIRED => "REQUIRED",
+        Repetition::OPTIONAL => "OPTIONAL",
+        Repetition::REPEATED => "REPEATED",
+    }
+}
+
+/// Serializes a Parquet type tree.
+pub fn type_to_json(t: &Type) -> Result<Value> {
+    let info = t.get_basic_info();
+    let mut v = json!({
+        "name": info.name(),
+        "repetition": repetition_str(info.repetition()),
+        "converted": info.converted_type().to_string(),
+    });
+    if let Some(l) = info.logical_type_ref() {
+        v["logical"] = logical_to_json(l)?;
+    }
+    if info.has_id() {
+        v["id"] = json!(info.id());
+    }
+    match t {
+        Type::GroupType { fields, .. } => {
+            v["fields"] = Value::Array(fields.iter().map(|f| type_to_json(f)).collect::<Result<_>>()?);
+        }
+        Type::PrimitiveType { physical_type, type_length, scale, precision, .. } => {
+            v["physical"] = json!(physical_type.to_string());
+            v["length"] = json!(type_length);
+            v["precision"] = json!(precision);
+            v["scale"] = json!(scale);
+        }
+    }
+    Ok(v)
+}
+
+pub fn type_from_json(v: &Value) -> Result<TypePtr> {
+    let bad = || Error::Corrupt(format!("bad type json {v}"));
+    let s = |k: &str| v.get(k).and_then(Value::as_str).ok_or_else(bad);
+    let int = |k: &str| v.get(k).and_then(Value::as_i64).map(|x| x as i32).ok_or_else(bad);
+    let name = s("name")?;
+    let repetition: Repetition = s("repetition")?.parse()?;
+    let converted: ConvertedType = s("converted")?.parse()?;
+    let logical = v.get("logical").map(logical_from_json).transpose()?;
+    let id = v.get("id").and_then(Value::as_i64).map(|x| x as i32);
+    let t = if let Some(fields) = v.get("fields") {
+        let fields = fields.as_array().ok_or_else(bad)?.iter().map(type_from_json).collect::<Result<Vec<_>>>()?;
+        Type::group_type_builder(name)
+            .with_repetition(repetition)
+            .with_converted_type(converted)
+            .with_logical_type(logical)
+            .with_id(id)
+            .with_fields(fields)
+            .build()?
+    } else {
+        let physical: PhysicalType = s("physical")?.parse()?;
+        let mut b = Type::primitive_type_builder(name, physical)
+            .with_repetition(repetition)
+            .with_converted_type(converted)
+            .with_logical_type(logical)
+            .with_id(id)
+            .with_length(int("length")?);
+        if int("precision")? > 0 {
+            b = b.with_precision(int("precision")?).with_scale(int("scale")?);
+        }
+        b.build()?
+    };
+    Ok(Arc::new(t))
 }
 
 /// An immutable schema version of a virtual file.
@@ -105,6 +312,35 @@ impl SchemaVersion {
 
     pub fn column_by_name(&self, name: &str) -> Option<&ColumnSpec> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// All leaf columns in schema order.
+    pub fn leaves(&self) -> Result<Vec<Leaf>> {
+        let d = self.descriptor()?;
+        let mut out = Vec::with_capacity(d.num_columns());
+        let mut per_field = vec![0i64; self.columns.len()];
+        for i in 0..d.num_columns() {
+            let c = d.column(i);
+            let f = d.get_column_root_idx(i);
+            let col = &self.columns[f];
+            let spec = if col.is_nested() {
+                let mut s = ColumnSpec::from_primitive(col.column_id, c.self_type())?;
+                s.name = c.path().string();
+                s
+            } else {
+                col.clone()
+            };
+            out.push(Leaf {
+                column_id: col.column_id,
+                leaf: per_field[f],
+                field: f,
+                spec,
+                max_def: c.max_def_level(),
+                max_rep: c.max_rep_level(),
+            });
+            per_field[f] += 1;
+        }
+        Ok(out)
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
@@ -154,6 +390,8 @@ pub fn logical_to_json(l: &LogicalType) -> Result<Value> {
             json!({"type": "TIMESTAMP", "utc": t.is_adjusted_to_u_t_c, "unit": unit_str(&t.unit)})
         }
         LogicalType::Integer(i) => json!({"type": "INTEGER", "bits": i.bit_width, "signed": i.is_signed}),
+        LogicalType::List => json!({"type": "LIST"}),
+        LogicalType::Map => json!({"type": "MAP"}),
         other => return Err(Error::Unsupported(format!("logical type {other:?}"))),
     })
 }
@@ -177,6 +415,8 @@ pub fn logical_from_json(v: &Value) -> Result<LogicalType> {
         "TIME" => LogicalType::time(boolean("utc")?, unit()?),
         "TIMESTAMP" => LogicalType::timestamp(boolean("utc")?, unit()?),
         "INTEGER" => LogicalType::integer(int("bits")? as i8, boolean("signed")?),
+        "LIST" => LogicalType::List,
+        "MAP" => LogicalType::Map,
         _ => return Err(bad()),
     })
 }
@@ -195,6 +435,7 @@ pub fn spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) 
         scale: -1,
         field_id: None,
         default_value: None,
+        nested: None,
     };
     let lower = ty.trim().to_ascii_lowercase();
     let (physical, logical) = match lower.as_str() {

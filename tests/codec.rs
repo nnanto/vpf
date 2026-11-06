@@ -7,7 +7,7 @@ use parquet::schema::parser::parse_message_type;
 use vpf::codec::{RawPage, decode_pages, encode_column};
 use vpf::layout::{FileProps, RowGroupLayout, VirtualFile};
 use vpf::ops::snapshot::{SegmentData, chunk_layout};
-use vpf::schema::ColumnSpec;
+use vpf::schema::{ColumnSpec, Leaf};
 use vpf::store::Store;
 use vpf::values::*;
 
@@ -26,31 +26,31 @@ fn per_page_decode_reencode_is_lossless_for_all_formats() {
                 let view = store.view(&name, None).unwrap();
                 let SegmentData::RowGroup { rg, chunks, .. } = &view.segments[0] else { panic!() };
                 let mut layouts: Vec<_> = chunks.iter().map(|c| chunk_layout(c).unwrap()).collect();
-                for (ci, (spec, chunk)) in view.schema.columns.iter().zip(chunks).enumerate() {
+                for (ci, (leaf, chunk)) in view.schema.leaves().unwrap().iter().zip(chunks).enumerate() {
                     let raw: Vec<RawPage> = chunk.pages.iter().map(|p| RawPage::load(store.blobs(), p).unwrap()).collect();
-                    let whole = decode_pages(spec, chunk.codec, &raw).unwrap();
+                    let whole = decode_pages(leaf, chunk.codec, &raw).unwrap();
                     assert_eq!(whole.num_rows(), 2500);
                     // Decoding page by page (with the dictionary page prepended) gives the same values.
                     let dict_page: Vec<RawPage> = raw.iter().filter(|p| !p.kind.is_data()).cloned().collect();
-                    let mut by_page = ColumnData::empty(spec.physical, spec.nullable);
+                    let mut by_page = ColumnData::empty_leaf(leaf.physical(), leaf.max_def, leaf.max_rep);
                     for p in raw.iter().filter(|p| p.kind.is_data()) {
                         let mut pages = dict_page.clone();
                         pages.push(p.clone());
-                        let part = decode_pages(spec, chunk.codec, &pages).unwrap();
+                        let part = decode_pages(leaf, chunk.codec, &pages).unwrap();
                         assert_eq!(part.num_rows() as i64, p.num_values);
                         by_page.append(&part).unwrap();
                     }
-                    assert_eq!(by_page, whole, "{} codec={codec} v2={v2} dict={dict}", spec.name);
+                    assert_eq!(by_page, whole, "{} codec={codec} v2={v2} dict={dict}", leaf.spec.name);
                     // Re-encoding gives identical values (with and without dictionary).
                     for re_dict in [false, true] {
-                        let enc = encode_column(spec, chunk.codec, &whole, re_dict).unwrap();
+                        let enc = encode_column(leaf, chunk.codec, &whole, re_dict).unwrap();
                         let raw2: Vec<RawPage> =
                             enc.pages.iter().map(|(b, h)| RawPage::from_header(b.clone(), h)).collect();
-                        assert_eq!(decode_pages(spec, chunk.codec, &raw2).unwrap(), whole);
+                        assert_eq!(decode_pages(leaf, chunk.codec, &raw2).unwrap(), whole);
                         assert_eq!(enc.num_values, 2500);
                     }
                     // Swap the re-encoded chunk into the virtual file: readers see the same data.
-                    layouts[ci] = encode_column(spec, chunk.codec, &whole, false).unwrap().layout(spec.physical).unwrap();
+                    layouts[ci] = encode_column(leaf, chunk.codec, &whole, false).unwrap().layout(leaf.physical()).unwrap();
                 }
                 let vf = VirtualFile::build(
                     FileProps {
@@ -69,9 +69,9 @@ fn per_page_decode_reencode_is_lossless_for_all_formats() {
     }
 }
 
-fn spec_of(msg: &str) -> ColumnSpec {
+fn spec_of(msg: &str) -> Leaf {
     let t = parse_message_type(msg).unwrap();
-    ColumnSpec::from_parquet_type(1, &t.get_fields()[0]).unwrap()
+    Leaf::flat(&ColumnSpec::from_parquet_type(1, &t.get_fields()[0]).unwrap())
 }
 
 fn i96(a: u32, b: u32, c: u32) -> Int96 {
@@ -95,29 +95,29 @@ fn exotic_physical_types_roundtrip() {
     ];
     for (msg, vals) in cases {
         let spec = spec_of(msg);
-        let data = ColumnData { values: vals, defs: Some(vec![1, 0, 0, 1]) };
+        let data = ColumnData::flat(vals, Some(vec![1, 0, 0, 1]));
         for codec in codecs() {
             let enc = encode_column(&spec, codec, &data, true).unwrap();
             let raw: Vec<RawPage> = enc.pages.iter().map(|(b, h)| RawPage::from_header(b.clone(), h)).collect();
             let back = decode_pages(&spec, codec, &raw).unwrap();
             // NaN != NaN, so compare via payload bytes.
             assert_eq!(
-                encode_batch(4, &[(1, back)]).unwrap(),
-                encode_batch(4, &[(1, data.clone())]).unwrap(),
+                encode_batch(4, &[((1, 0), back)]).unwrap(),
+                encode_batch(4, &[((1, 0), data.clone())]).unwrap(),
                 "{msg} {codec}"
             );
         }
     }
     // Wrong FLBA width is rejected rather than silently written.
     let spec = spec_of("message m { required fixed_len_byte_array(3) x; }");
-    let bad = ColumnData { values: Values::Fixed(vec![FixedLenByteArray::from(vec![1u8])]), defs: None };
+    let bad = ColumnData::flat(Values::Fixed(vec![FixedLenByteArray::from(vec![1u8])]), None);
     assert!(encode_column(&spec, Compression::SNAPPY, &bad, false).is_err());
 }
 
 #[test]
 fn large_columns_split_into_multiple_pages() {
     let spec = spec_of("message m { required int64 x; }");
-    let data = ColumnData { values: Values::I64((0..100_000).collect()), defs: None };
+    let data = ColumnData::flat(Values::I64((0..100_000).collect()), None);
     let enc = encode_column(&spec, Compression::SNAPPY, &data, false).unwrap();
     assert!(enc.pages.len() >= 5, "{}", enc.pages.len());
     let raw: Vec<RawPage> = enc.pages.iter().map(|(b, h)| RawPage::from_header(b.clone(), h)).collect();
@@ -129,10 +129,10 @@ fn large_columns_split_into_multiple_pages() {
 }
 
 fn opt_i32(v: &[Option<i32>]) -> ColumnData {
-    ColumnData {
-        values: Values::I32(v.iter().flatten().copied().collect()),
-        defs: Some(v.iter().map(|x| x.is_some() as i16).collect()),
-    }
+    ColumnData::flat(
+        Values::I32(v.iter().flatten().copied().collect()),
+        Some(v.iter().map(|x| x.is_some() as i16).collect()),
+    )
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn column_data_operations() {
     assert_eq!(w.values, Values::I64(vec![1, 3, 4]));
     assert!(c.widen(PhysicalType::FLOAT).is_err());
     assert!(c.with_nullability(false).is_err());
-    let req = ColumnData { values: Values::I32(vec![1, 2]), defs: None };
+    let req = ColumnData::flat(Values::I32(vec![1, 2]), None);
     assert_eq!(req.with_nullability(true).unwrap(), opt_i32(&[Some(1), Some(2)]));
     assert!(req.set_rows(&[0], None).is_err());
     assert_eq!(
@@ -165,19 +165,19 @@ fn column_data_operations() {
     );
     assert_eq!(ColumnData::repeat(PhysicalType::INT32, true, None, 2).unwrap(), opt_i32(&[None, None]));
     assert!(ColumnData::repeat(PhysicalType::INT32, false, None, 2).is_err());
-    let f = ColumnData { values: Values::F32(vec![1.5]), defs: None };
+    let f = ColumnData::flat(Values::F32(vec![1.5]), None);
     assert_eq!(f.widen(PhysicalType::DOUBLE).unwrap().values, Values::F64(vec![1.5]));
 }
 
 #[test]
 fn batch_payload_roundtrip_and_corruption() {
     let cols = vec![
-        (3, opt_i32(&[Some(1), None, Some(2)])),
-        (5, ColumnData { values: Values::Bytes(vec!["a".into(), "".into(), "ccc".into()]), defs: None }),
-        (6, ColumnData { values: Values::I96(vec![i96(1, 2, 3)]), defs: Some(vec![0, 1, 0]) }),
-        (7, ColumnData { values: Values::Fixed(vec![FixedLenByteArray::from(vec![1u8, 2])]), defs: Some(vec![0, 0, 1]) }),
-        (8, ColumnData { values: Values::Bool(vec![true, false, true]), defs: None }),
-        (9, ColumnData { values: Values::F64(vec![1.0, 2.0, 3.0]), defs: None }),
+        ((3, 0), opt_i32(&[Some(1), None, Some(2)])),
+        ((5, 0), ColumnData::flat(Values::Bytes(vec!["a".into(), "".into(), "ccc".into()]), None)),
+        ((6, 0), ColumnData::flat(Values::I96(vec![i96(1, 2, 3)]), Some(vec![0, 1, 0]))),
+        ((7, 0), ColumnData::flat(Values::Fixed(vec![FixedLenByteArray::from(vec![1u8, 2])]), Some(vec![0, 0, 1]))),
+        ((8, 0), ColumnData::flat(Values::Bool(vec![true, false, true]), None)),
+        ((9, 0), ColumnData::flat(Values::F64(vec![1.0, 2.0, 3.0]), None)),
     ];
     let buf = encode_batch(3, &cols).unwrap();
     let (n, back) = decode_batch(&buf).unwrap();
@@ -206,7 +206,7 @@ fn plain_pages_spliced_into_dictionary_chunk() {
         let view = store.view(&name, None).unwrap();
         let SegmentData::RowGroup { rg, chunks, .. } = &view.segments[0] else { panic!() };
         let mut layouts = Vec::new();
-        for (spec, chunk) in view.schema.columns.iter().zip(chunks) {
+        for (leaf, chunk) in view.schema.leaves().unwrap().iter().zip(chunks) {
             let mut layout = chunk_layout(chunk).unwrap();
             let raw: Vec<RawPage> = chunk.pages.iter().map(|p| RawPage::load(store.blobs(), p).unwrap()).collect();
             let has_dict = raw.iter().any(|p| !p.kind.is_data());
@@ -215,9 +215,9 @@ fn plain_pages_spliced_into_dictionary_chunk() {
             let idx = raw.iter().enumerate().filter(|(_, p)| p.kind.is_data()).nth(1).unwrap().0;
             let mut pages = dict.clone();
             pages.push(raw[idx].clone());
-            let vals = decode_pages(spec, chunk.codec, &pages).unwrap();
-            let enc = encode_column(spec, chunk.codec, &vals, false).unwrap();
-            let new_pages = enc.layout(spec.physical).unwrap().pages;
+            let vals = decode_pages(leaf, chunk.codec, &pages).unwrap();
+            let enc = encode_column(leaf, chunk.codec, &vals, false).unwrap();
+            let new_pages = enc.layout(leaf.physical()).unwrap().pages;
             assert!(new_pages.iter().all(|p| p.kind.is_data()));
             layout.pages.splice(idx..idx + 1, new_pages);
             if has_dict {
