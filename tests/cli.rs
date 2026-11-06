@@ -126,3 +126,47 @@ fn create_and_errors() {
     // Failed commands left no trace.
     assert_eq!(ok(st, &["snapshots", "e"]).lines().count(), 1 + 2);
 }
+
+#[test]
+fn nested_columns() {
+    let d = tempfile::tempdir().unwrap();
+    let st = d.path();
+    ok(st, &["create", "n", "id:int64:required", "tags:list<string>", "attrs:map<string,int64>", "pt:struct<x:double!,y:list<int32!>>:optional", "--codec", "zstd"]);
+    let schema = ok(st, &["schema", "n"]);
+    assert!(schema.contains("tags\tGROUP\tList(") && schema.contains("attrs\tGROUP\tMap(") && schema.contains("pt\tGROUP\tStruct("), "{schema}");
+    let rows = concat!(
+        "{\"id\":1,\"tags\":[\"a\",null,\"b\"],\"attrs\":{\"k\":1,\"j\":null},\"pt\":{\"x\":1.5,\"y\":[1,2]}}\n",
+        "{\"id\":2,\"tags\":[],\"pt\":{\"x\":2.5,\"y\":null}}\n",
+        "{\"id\":3}\n",
+    );
+    let o = vpf(st, &["append", "n", "--json", "-"], Some(rows));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = vpf(st, &["append", "n", "--json", "-", "--mode", "direct"], Some("{\"id\":4,\"tags\":[\"z\"],\"pt\":null}\n"));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let json = ok(st, &["cat", "n", "--format", "json"]);
+    let lines: Vec<&str> = json.lines().collect();
+    assert_eq!(lines.len(), 4);
+    assert!(lines[0].contains("\"tags\":[\"a\",null,\"b\"]") && lines[0].contains("\"x\":1.5"), "{json}");
+    assert!(lines[0].contains("\"y\":[1,2]"), "{json}");
+    assert!(ok(st, &["delete", "n", "--where", "pt.x > 2"]).contains("deleted 1 rows"));
+    assert!(ok(st, &["update", "n", "--set", "tags = NULL", "--where", "id = 1"]).contains("updated 1 rows"));
+    assert!(ok(st, &["delete", "n", "--where", "pt IS NULL AND tags IS NOT NULL"]).contains("deleted 1 rows"));
+    ok(st, &["alter", "n", "add-column", "more", "list<struct<a:int32,b:string>>"]);
+    let json = ok(st, &["cat", "n", "--format", "json"]);
+    assert_eq!(json.lines().count(), 2, "{json}");
+    let l: Vec<&str> = json.lines().collect();
+    assert!(l[0].contains("\"id\":1,") && !l[0].contains("\"tags\":[") && l[1].contains("\"id\":3"), "{json}");
+    let o = vpf(st, &["append", "n", "--json", "-"], Some("{\"id\":9,\"more\":[{\"a\":1,\"b\":\"q\"},{\"a\":null}]}\n"));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(ok(st, &["cat", "n", "--format", "json"]).contains("\"more\":[{\"a\":1,\"b\":\"q\"},{"));
+    let out = d.path().join("out.parquet");
+    ok(st, &["export", "n", out.to_str().unwrap()]);
+    assert_eq!(concat(&read_parquet(std::fs::read(&out).unwrap().into())).num_rows(), 3);
+
+    assert!(err(st, &["create", "x", "a:list<int64"]).contains("expected '>'"));
+    assert!(err(st, &["create", "x", "a:struct<>"]).contains("expected a name"));
+    assert!(err(st, &["create", "x", "a:list<wat>"]).contains("unknown type"));
+    assert!(err(st, &["create", "x", "a:map<string,int64>:sometimes"]).contains("bad column modifier"));
+    assert!(err(st, &["update", "n", "--set", "tags = 'x'", "--where", "TRUE"]).len() > 0);
+    assert!(err(st, &["alter", "n", "widen", "pt", "int64"]).len() > 0);
+}

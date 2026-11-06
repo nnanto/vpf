@@ -134,6 +134,10 @@ pub fn alter_model(b: &RecordBatch, op: &vpf::ops::alter::AlterOp) -> RecordBatc
     match op {
         vpf::ops::alter::AlterOp::AddColumn { spec, default } => {
             let ty = match (spec.physical, spec.logical.as_ref()) {
+                _ if spec.is_nested() => {
+                    let d = vpf::schema::build_descriptor("schema", std::slice::from_ref(spec)).unwrap();
+                    parquet::arrow::parquet_to_arrow_schema(&d, None).unwrap().field(0).data_type().clone()
+                }
                 (parquet::basic::Type::INT64, None) => DataType::Int64,
                 (parquet::basic::Type::INT32, None) => DataType::Int32,
                 (parquet::basic::Type::DOUBLE, None) => DataType::Float64,

@@ -438,6 +438,9 @@ pub fn spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) 
         nested: None,
     };
     let lower = ty.trim().to_ascii_lowercase();
+    if ["list<", "map<", "struct<"].iter().any(|p| lower.starts_with(p)) {
+        return nested_spec_for_type_name(column_id, name, ty, nullable);
+    }
     let (physical, logical) = match lower.as_str() {
         "bool" | "boolean" => (PhysicalType::BOOLEAN, None),
         "int32" | "int" => (PhysicalType::INT32, None),
@@ -475,6 +478,155 @@ pub fn spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) 
     }
     spec.logical = logical;
     Ok(spec)
+}
+
+/// Builds a nested column from `list<T>`, `map<K,V>` or `struct<a:T,b:T!>` (`!` marks a
+/// non-null child; map keys are always non-null). Uses Arrow's standard Parquet layouts.
+fn nested_spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) -> Result<ColumnSpec> {
+    let mut p = TypeParser { s: ty, pos: 0 };
+    let dt = p.ty()?;
+    p.skip_ws();
+    if p.pos != ty.len() {
+        return Err(Error::Invalid(format!("trailing input in type '{ty}' at {}", p.pos)));
+    }
+    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(name, dt, nullable)]);
+    let tree = parquet::arrow::ArrowSchemaConverter::new().convert(&schema)?;
+    ColumnSpec::from_parquet_type(column_id, &tree.root_schema().get_fields()[0])
+}
+
+struct TypeParser<'a> {
+    s: &'a str,
+    pos: usize,
+}
+
+impl TypeParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.s[self.pos..].starts_with(char::is_whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    fn err(&self, what: &str) -> Error {
+        Error::Invalid(format!("bad type '{}': expected {what} at {}", self.s, self.pos))
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        self.skip_ws();
+        if self.s[self.pos..].starts_with(c) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, c: char) -> Result<()> {
+        if self.eat(c) { Ok(()) } else { Err(self.err(&format!("'{c}'"))) }
+    }
+
+    fn ident(&mut self) -> Result<&str> {
+        self.skip_ws();
+        let start = self.pos;
+        while self.s[self.pos..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            self.pos += 1;
+        }
+        if start == self.pos { Err(self.err("a name")) } else { Ok(&self.s[start..self.pos]) }
+    }
+
+    /// A type followed by an optional `!` (non-null marker).
+    fn child(&mut self) -> Result<(arrow::datatypes::DataType, bool)> {
+        let t = self.ty()?;
+        Ok((t, !self.eat('!')))
+    }
+
+    fn ty(&mut self) -> Result<arrow::datatypes::DataType> {
+        use arrow::datatypes::{DataType, Field, Fields, TimeUnit as AU};
+        let id = self.ident()?.to_ascii_lowercase();
+        Ok(match id.as_str() {
+            "list" => {
+                self.expect('<')?;
+                let (t, n) = self.child()?;
+                self.expect('>')?;
+                DataType::List(Arc::new(Field::new("element", t, n)))
+            }
+            "map" => {
+                self.expect('<')?;
+                let k = self.ty()?;
+                self.eat('!');
+                self.expect(',')?;
+                let (v, n) = self.child()?;
+                self.expect('>')?;
+                let entries = Fields::from(vec![Field::new("key", k, false), Field::new("value", v, n)]);
+                DataType::Map(Arc::new(Field::new("key_value", DataType::Struct(entries), false)), false)
+            }
+            "struct" => {
+                self.expect('<')?;
+                let mut fields = Vec::new();
+                loop {
+                    let name = self.ident()?.to_string();
+                    self.expect(':')?;
+                    let (t, n) = self.child()?;
+                    fields.push(Field::new(name, t, n));
+                    if !self.eat(',') {
+                        break;
+                    }
+                }
+                self.expect('>')?;
+                DataType::Struct(Fields::from(fields))
+            }
+            "bool" | "boolean" => DataType::Boolean,
+            "int32" | "int" => DataType::Int32,
+            "int64" | "bigint" | "long" => DataType::Int64,
+            "float" | "float32" => DataType::Float32,
+            "double" | "float64" => DataType::Float64,
+            "string" | "utf8" => DataType::Utf8,
+            "binary" | "bytes" => DataType::Binary,
+            "date" => DataType::Date32,
+            "timestamp_ms" => DataType::Timestamp(AU::Millisecond, Some("UTC".into())),
+            "timestamp_us" | "timestamp" => DataType::Timestamp(AU::Microsecond, Some("UTC".into())),
+            "timestamp_ns" => DataType::Timestamp(AU::Nanosecond, Some("UTC".into())),
+            "decimal" => {
+                self.expect('(')?;
+                let p = self.ident()?.parse::<u8>().map_err(|_| self.err("precision"))?;
+                self.expect(',')?;
+                let sc = self.ident()?.parse::<i8>().map_err(|_| self.err("scale"))?;
+                self.expect(')')?;
+                if !(1..=38).contains(&p) || sc < 0 || sc as u8 > p {
+                    return Err(Error::Invalid(format!("bad decimal precision/scale in '{}'", self.s)));
+                }
+                DataType::Decimal128(p, sc)
+            }
+            other => return Err(Error::Invalid(format!("unknown type '{other}' in '{}'", self.s))),
+        })
+    }
+}
+
+/// Splits `name:type[:required|:optional]`, where `type` may contain ':' inside `<...>`.
+pub fn split_column_def(def: &str) -> Result<(&str, &str, bool)> {
+    let bad = || Error::Invalid(format!("column must be name:type[:required|:optional]: '{def}'"));
+    let (name, rest) = def.split_once(':').ok_or_else(bad)?;
+    let mut depth = 0i32;
+    let mut last_top = None;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth -= 1,
+            ':' if depth == 0 => last_top = Some(i),
+            _ => {}
+        }
+    }
+    let (ty, required) = match last_top {
+        None => (rest, false),
+        Some(i) => match &rest[i + 1..] {
+            "required" => (&rest[..i], true),
+            "optional" => (&rest[..i], false),
+            m => return Err(Error::Invalid(format!("bad column modifier '{m}' in '{def}'"))),
+        },
+    };
+    if name.is_empty() || ty.is_empty() {
+        return Err(bad());
+    }
+    Ok((name, ty, required))
 }
 
 /// Minimum bytes for a two's-complement decimal of the given precision.

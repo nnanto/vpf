@@ -36,7 +36,8 @@ enum Cmd {
     Init,
     /// Imports an existing Parquet file; its pages are stored as-is.
     Import { name: String, path: PathBuf },
-    /// Creates an empty file from column definitions like `id:int64:required` or `name:string`.
+    /// Creates an empty file from column definitions like `id:int64:required`, `name:string`,
+    /// `tags:list<string>`, `attrs:map<string,int64>` or `pt:struct<x:double!,y:double>`.
     Create {
         name: String,
         #[arg(required = true)]
@@ -238,17 +239,8 @@ fn run(cli: Cli) -> Result<()> {
             let specs = columns
                 .iter()
                 .map(|c| {
-                    let parts: Vec<&str> = c.split(':').collect();
-                    let required = match parts.get(2) {
-                        None => false,
-                        Some(&"required") => true,
-                        Some(&"optional") => false,
-                        Some(x) => bail!("bad column modifier '{x}' in '{c}'"),
-                    };
-                    if parts.len() < 2 || parts.len() > 3 {
-                        bail!("column must be name:type[:required]: '{c}'");
-                    }
-                    Ok(spec_for_type_name(0, parts[0], parts[1], !required)?)
+                    let (col, ty, required) = vpf::schema::split_column_def(c)?;
+                    Ok(spec_for_type_name(0, col, ty, !required)?)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let sid = store.create(&name, &specs, parse_codec(&codec)?)?;
@@ -292,7 +284,11 @@ fn run(cli: Cli) -> Result<()> {
                     out,
                     "{}\t{}\t{}\t{}{}",
                     c.name,
-                    c.physical,
+                    match &c.nested {
+                        Some(t) if t.is_group() => "GROUP".to_string(),
+                        Some(_) => "REPEATED".to_string(),
+                        None => c.physical.to_string(),
+                    },
                     f.data_type(),
                     if c.nullable { "optional" } else { "required" },
                     default

@@ -20,7 +20,11 @@ store/
 * **Pages** are stored exactly as found in the source file (compressed, with their Thrift
   header), so importing a file and reading it back returns the original page bytes.
 * A **chunk** is an ordered list of page ids plus column-chunk metadata (codec, encodings,
-  statistics). A **row group** maps column ids to chunk ids.
+  statistics). A **row group** maps each leaf (column id, leaf index) to a chunk id.
+* **Nested columns** (structs, lists, maps, any nesting) are one top-level column with one
+  chunk per Parquet leaf. Every stored page starts at a record boundary (repetition
+  level 0) and records its exact row count, so deletes and updates address pages by row
+  range just as they do for flat columns.
 * A **snapshot** is the list of visible **segments** (row groups or buffered batches), stored
   with `added_in` / `removed_in` snapshot ids. A snapshot never changes after it is
   committed.
@@ -57,9 +61,21 @@ The rule behind these choices: **nothing may compromise basic reads or writes.**
 that would risk producing an invalid file, or that some readers might mis-handle, is left
 out.
 
-* **Flat schemas only.** Nested, repeated and map types are rejected when a file is
-  imported or created. Supporting them would require repetition and definition-level aware
-  page splitting for every delete and update.
+* **Nested types** (struct, list, map, legacy 2-level lists, bare repeated fields) are fully
+  supported for import, read, append, delete, predicates on struct fields (`s.a > 3`),
+  `IS [NOT] NULL` on any column, and alter add/drop/rename/reorder/make-optional. The
+  limits are:
+  * `UPDATE` can only assign `NULL` to a nested column, and only when the column is
+    optional. There is no literal syntax for nested values.
+  * Lists and maps cannot be compared in predicates, apart from `IS [NOT] NULL`.
+  * `widen` is not supported on nested columns.
+  * An added nested column must be optional, with a NULL default.
+  * Imported chunks whose records span V1 data pages (allowed, but no common writer does
+    it) are decoded and re-encoded at import, so every stored page starts a record. Their
+    page bytes are therefore not verbatim.
+  * Appended Arrow data is written with the stored Parquet schema. The levels are then
+    checked to read back identically, and the append is rejected if they do not. Exotic
+    legacy layouts can never be silently mis-encoded.
 * **Statistics.** After a delete, a chunk keeps its min/max values but they are marked
   inexact, and its null count is dropped. Updated chunks drop their statistics entirely.
   Stale statistics would make readers skip pages incorrectly; missing statistics only cost
@@ -93,9 +109,11 @@ export VPF_STORE=./mystore            # or --store DIR
 
 vpf import sales data.parquet
 vpf create events id:int64:required name:string at:timestamp_us amount:decimal(12,2) --codec zstd
+vpf create docs id:int64:required tags:list<string> attrs:map<string,int64> 'pt:struct<x:double!,y:list<int32>>'
 vpf append sales --parquet more.parquet           # --mode auto|buffered|direct
 echo '{"id": 1, "name": "x"}' | vpf append events --json -
 vpf delete sales --where "region = 'EU' AND amount < 10"
+vpf delete docs --where "pt.x > 2 OR tags IS NULL"
 vpf update sales --set "status = 'void', amount = NULL" --where "id IN (3, 5, 8)"
 vpf alter sales add-column level int64 --required --default 0
 vpf alter sales rename-column amount total
@@ -114,6 +132,9 @@ Column types for `create` and `add-column`:
 * `string`, `binary`, `date`
 * `timestamp_ms`, `timestamp_us`, `timestamp_ns`
 * `decimal(p,s)`
+* `list<T>`, `map<K,V>`, `struct<name:T,...>`, nested freely. A `!` after a child type
+  makes that child non-null (map keys are always non-null). A column def is
+  `name:type[:required|:optional]`.
 
 ## Library
 
@@ -141,7 +162,11 @@ VPF_FUZZ_SEEDS=200 VPF_FUZZ_STEPS=1000 cargo test --release --test fuzz
 What the suites cover:
 * Byte-exact round trips of imported files, for every codec and for data page v1 and v2.
 * Dictionary and plain chunks.
+* Nested files from arrow-rs and PyArrow (structs, lists, maps, list<list>, required
+  structs, tiny pages, non-compliant list names), legacy 2-level lists, and records split
+  across pages. Each leaf is checked by decoding page by page and re-encoding.
 * Every operation, checked against an Arrow reference model.
 * Time travel to every historical snapshot.
 * CLI workflows.
-* A randomized fuzz test that mixes appends, deletes, updates, schema changes and flushes.
+* A randomized fuzz test that mixes appends, deletes, updates, schema changes and flushes,
+  on a schema with flat and nested columns.

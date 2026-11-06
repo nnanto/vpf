@@ -18,6 +18,42 @@ use vpf::predicate::{Expr, literal_array, parse_assignments, parse_literal};
 use vpf::schema::spec_for_type_name;
 use vpf::store::Store;
 
+/// `sample_batch` plus nested columns: a struct, a list, a map and a required struct.
+fn fuzz_batch(start: i64, n: usize) -> RecordBatch {
+    use arrow::datatypes::{Field, Fields, Schema};
+    use std::sync::Arc;
+    let base = sample_batch(start, n);
+    let st = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true), Field::new("b", DataType::Utf8, true)]));
+    let li = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    let entries = Fields::from(vec![Field::new("keys", DataType::Utf8, false), Field::new("values", DataType::Int32, true)]);
+    let mp = DataType::Map(Arc::new(Field::new("entries", DataType::Struct(entries), false)), false);
+    let rq = DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int64, false)]));
+    let nested = Arc::new(Schema::new(vec![
+        Field::new("st", st, true),
+        Field::new("li", li, true),
+        Field::new("mp", mp, true),
+        Field::new("rq", rq, false),
+    ]));
+    let mut text = String::new();
+    for i in start..start + n as i64 {
+        let st = if i % 6 == 0 { serde_json::Value::Null } else { serde_json::json!({"a": (i % 9 != 0).then_some(i % 100), "b": format!("s{}", i % 7)}) };
+        let li = if i % 5 == 0 { serde_json::Value::Null } else { serde_json::json!((0..i % 4).map(|j| (j != 2).then_some(i + j)).collect::<Vec<_>>()) };
+        let mp = if i % 4 == 0 { serde_json::Value::Null } else { serde_json::Value::Object((0..i % 3).map(|j| (format!("k{j}"), serde_json::json!(i % 50))).collect()) };
+        text.push_str(&serde_json::json!({"st": st, "li": li, "mp": mp, "rq": {"k": i * 2}}).to_string());
+        text.push('\n');
+    }
+    let mut cols = base.columns().to_vec();
+    let mut fields: Vec<_> = base.schema().fields().iter().cloned().collect();
+    if n > 0 {
+        let b = arrow::json::ReaderBuilder::new(nested.clone()).with_batch_size(n).build(text.as_bytes()).unwrap().next().unwrap().unwrap();
+        cols.extend(b.columns().iter().cloned());
+    } else {
+        cols.extend(nested.fields().iter().map(|f| new_empty_array(f.data_type())));
+    }
+    fields.extend(nested.fields().iter().cloned());
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+}
+
 fn rows(store: &Store, snap: Option<i64>) -> RecordBatch {
     read_virtual(&store.open_snapshot("f", snap).unwrap())
 }
@@ -79,8 +115,21 @@ impl Fuzz {
             self.non_id_columns().into_iter().filter(|c| c.2).map(|c| format!("\"{}\"", c.0)).collect();
         let strings: Vec<String> =
             self.non_id_columns().into_iter().filter(|c| c.1 == DataType::Utf8).map(|c| c.0).collect();
-        match self.rng.random_range(0..6) {
+        // (struct column, its first child if numeric)
+        let structs: Vec<(String, String)> = self
+            .non_id_columns()
+            .into_iter()
+            .filter_map(|c| match c.1 {
+                DataType::Struct(f) if f[0].data_type().is_integer() => Some((c.0, f[0].name().clone())),
+                _ => None,
+            })
+            .collect();
+        match self.rng.random_range(0..7) {
             0 => format!("id < {}", a / 8),
+            6 if !structs.is_empty() => {
+                let (s, f) = self.pick(&structs).clone();
+                format!("{s}.{f} < {} AND id > {a}", self.rng.random_range(0..100))
+            }
             1 => format!("id BETWEEN {a} AND {b}"),
             2 => {
                 let ids: Vec<String> = (0..5).map(|_| self.rng.random_range(0..hi).to_string()).collect();
@@ -93,6 +142,9 @@ impl Fuzz {
     }
 
     fn literal_for(&mut self, ty: &DataType, nullable: bool) -> Option<String> {
+        if Self::is_nested(ty) {
+            return nullable.then(|| "NULL".into());
+        }
         if nullable && self.rng.random_bool(0.2) {
             return Some("NULL".into());
         }
@@ -108,13 +160,17 @@ impl Fuzz {
         })
     }
 
+    fn is_nested(ty: &DataType) -> bool {
+        matches!(ty, DataType::Struct(_) | DataType::List(_) | DataType::Map(..))
+    }
+
     fn append(&mut self) {
         let n = if self.rng.random_bool(0.1) { self.rng.random_range(500..3000) } else { self.rng.random_range(1..60) };
-        let fresh = sample_batch(self.next_id, n);
+        let fresh = fuzz_batch(self.next_id, n);
         self.next_id += n as i64;
         let expected = self.alters.iter().fold(fresh, |b, op| alter_model(&b, op));
         // Randomly omit columns that were added after creation, relying on their defaults.
-        let original: Vec<String> = sample_batch(0, 1).schema().fields().iter().map(|f| f.name().clone()).collect();
+        let original: Vec<String> = fuzz_batch(0, 1).schema().fields().iter().map(|f| f.name().clone()).collect();
         let s = expected.schema();
         let keep: Vec<usize> = (0..s.fields().len())
             .filter(|&i| original.contains(s.field(i).name()) || s.field(i).name().ends_with("_r") || self.rng.random_bool(0.5))
@@ -128,6 +184,12 @@ impl Fuzz {
     fn alter(&mut self) -> Option<AlterOp> {
         let cols = self.non_id_columns();
         let op = match self.rng.random_range(0..6) {
+            0 if self.rng.random_bool(0.3) => {
+                self.next_col += 1;
+                let ty = *self.pick(&["list<int32>", "struct<x:int64,y:list<string>>", "map<string,double>"]);
+                let spec = spec_for_type_name(0, &format!("c{}", self.next_col), ty, true).unwrap();
+                AlterOp::AddColumn { spec, default: None }
+            }
             0 => {
                 self.next_col += 1;
                 let ty = *self.pick(&["int64", "string", "double", "int32", "boolean"]);
@@ -235,7 +297,7 @@ impl Fuzz {
 fn run(seed: u64, steps: usize, codec: Compression) {
     let d = tempfile::tempdir().unwrap();
     let store = Store::open(d.path()).unwrap();
-    let base = sample_batch(0, 1500);
+    let base = fuzz_batch(0, 1500);
     let mut rng = StdRng::seed_from_u64(seed);
     let page_rows = rng.random_range(50..400);
     let rg_rows = rng.random_range(300..1500);
@@ -254,7 +316,8 @@ fn run(seed: u64, steps: usize, codec: Compression) {
     let kinds = ["append", "delete", "update", "Add", "Drop", "Rename", "Widen", "MakeOptional", "Reorder", "flush", "skip"];
     let counts: Vec<String> =
         kinds.iter().map(|k| format!("{k}={}", log.iter().filter(|l| l.starts_with(k)).count())).collect();
-    eprintln!("seed {seed}: rows={} cols={} {}", f.model.num_rows(), f.model.num_columns(), counts.join(" "));
+    let nested_ops = log.iter().filter(|l| l.contains(".a <") || l.contains(".k <") || l.contains(".x <") || l.contains("nested: Some") || ["st", "li", "mp", "rq"].iter().any(|c| l.contains(&format!("\"{c}\" = NULL")))).count();
+    eprintln!("seed {seed}: rows={} cols={} nested_ops={nested_ops} {}", f.model.num_rows(), f.model.num_columns(), counts.join(" "));
     for (sid, expected) in &f.history {
         assert_eq!(&rows(&f.store, Some(*sid)), expected, "seed {seed}: time travel to snapshot {sid}");
     }
