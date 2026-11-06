@@ -2,6 +2,8 @@
 
 use std::cmp::Ordering;
 
+use arrow::array::{Array, AsArray};
+use arrow::datatypes::*;
 use parquet::basic::{BoundaryOrder, ColumnOrder, ConvertedType, LogicalType, SortOrder, Type as PhysicalType};
 use parquet::data_type::{ByteArray, FixedLenByteArray, Int96};
 use parquet::file::statistics::{Statistics, ValueStatistics};
@@ -202,6 +204,95 @@ impl PageStats {
         self.min.is_none()
     }
 
+    /// Computes flat-page statistics directly from Arrow without building physical
+    /// value vectors. Used only after checking the Arrow/stored Parquet type mapping.
+    pub(crate) fn compute_arrow(t: &StatType, arr: &dyn Array, width: usize) -> Result<Option<Self>> {
+        if t.order == StatOrder::Undefined {
+            return Ok(None);
+        }
+        macro_rules! primitive {
+            ($ty:ty, $convert:expr, $encode:expr) => {{
+                let convert = $convert;
+                let encode = $encode;
+                minmax(arr.as_primitive::<$ty>().iter().flatten().map(convert), |a, b| a.cmp(b))
+                    .map(|(lo, hi)| (encode(lo), encode(hi)))
+            }};
+        }
+        let mut nan_count = None;
+        macro_rules! float {
+            ($ty:ty, $encode:expr) => {{
+                let mut count = 0;
+                let bounds = minmax(
+                    arr.as_primitive::<$ty>().iter().flatten().filter(|v| {
+                        if v.is_nan() { count += 1; false } else { true }
+                    }),
+                    |a, b| a.total_cmp(b),
+                );
+                nan_count = Some(count);
+                if bounds.is_none() && count > 0 {
+                    return Ok(None);
+                }
+                let encode = $encode;
+                bounds.map(|(lo, hi)| (encode(lo), encode(hi)))
+            }};
+        }
+        macro_rules! bytes {
+            ($values:expr) => {
+                minmax($values, |a, b| t.cmp(a, b))
+                    .map(|(lo, hi)| (lo.to_vec(), hi.to_vec()))
+            };
+        }
+        let i32_bytes = |v: i32| v.to_le_bytes().to_vec();
+        let i64_bytes = |v: i64| v.to_le_bytes().to_vec();
+        let decimal_bytes = |v: i128| match t.physical {
+            PhysicalType::INT32 => (v as i32).to_le_bytes().to_vec(),
+            PhysicalType::INT64 => (v as i64).to_le_bytes().to_vec(),
+            _ => v.to_be_bytes()[16 - width..].to_vec(),
+        };
+        let bounds = match arr.data_type() {
+            DataType::Null => None,
+            DataType::Boolean => minmax(arr.as_boolean().iter().flatten(), |a, b| a.cmp(b))
+                .map(|(a, b)| (vec![a as u8], vec![b as u8])),
+            DataType::Int8 => primitive!(Int8Type, |v| v as i32, i32_bytes),
+            DataType::Int16 => primitive!(Int16Type, |v| v as i32, i32_bytes),
+            DataType::Int32 => primitive!(Int32Type, |v| v, i32_bytes),
+            DataType::Int64 => primitive!(Int64Type, |v| v, i64_bytes),
+            DataType::UInt8 => primitive!(UInt8Type, |v| v as u32, |v: u32| v.to_le_bytes().to_vec()),
+            DataType::UInt16 => primitive!(UInt16Type, |v| v as u32, |v: u32| v.to_le_bytes().to_vec()),
+            DataType::UInt32 => primitive!(UInt32Type, |v| v, |v: u32| v.to_le_bytes().to_vec()),
+            DataType::UInt64 => primitive!(UInt64Type, |v| v, |v: u64| v.to_le_bytes().to_vec()),
+            DataType::Float16 => float!(Float16Type, |v: <Float16Type as ArrowPrimitiveType>::Native| v.to_le_bytes().to_vec()),
+            DataType::Float32 => float!(Float32Type, |v: f32| v.to_le_bytes().to_vec()),
+            DataType::Float64 => float!(Float64Type, |v: f64| v.to_le_bytes().to_vec()),
+            DataType::Date32 => primitive!(Date32Type, |v| v, i32_bytes),
+            DataType::Date64 => primitive!(Date64Type, |v| v, i64_bytes),
+            DataType::Time32(TimeUnit::Second) => primitive!(Time32SecondType, |v| v, i32_bytes),
+            DataType::Time32(TimeUnit::Millisecond) => primitive!(Time32MillisecondType, |v| v, i32_bytes),
+            DataType::Time64(TimeUnit::Microsecond) => primitive!(Time64MicrosecondType, |v| v, i64_bytes),
+            DataType::Time64(TimeUnit::Nanosecond) => primitive!(Time64NanosecondType, |v| v, i64_bytes),
+            DataType::Timestamp(TimeUnit::Second, _) => primitive!(TimestampSecondType, |v| v, i64_bytes),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => primitive!(TimestampMillisecondType, |v| v, i64_bytes),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => primitive!(TimestampMicrosecondType, |v| v, i64_bytes),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => primitive!(TimestampNanosecondType, |v| v, i64_bytes),
+            DataType::Duration(TimeUnit::Second) => primitive!(DurationSecondType, |v| v, i64_bytes),
+            DataType::Duration(TimeUnit::Millisecond) => primitive!(DurationMillisecondType, |v| v, i64_bytes),
+            DataType::Duration(TimeUnit::Microsecond) => primitive!(DurationMicrosecondType, |v| v, i64_bytes),
+            DataType::Duration(TimeUnit::Nanosecond) => primitive!(DurationNanosecondType, |v| v, i64_bytes),
+            DataType::Decimal32(_, _) => primitive!(Decimal32Type, |v| v as i128, decimal_bytes),
+            DataType::Decimal64(_, _) => primitive!(Decimal64Type, |v| v as i128, decimal_bytes),
+            DataType::Decimal128(_, _) => primitive!(Decimal128Type, |v| v, decimal_bytes),
+            DataType::Utf8 => bytes!(arr.as_string::<i32>().iter().flatten().map(str::as_bytes)),
+            DataType::LargeUtf8 => bytes!(arr.as_string::<i64>().iter().flatten().map(str::as_bytes)),
+            DataType::Utf8View => bytes!(arr.as_string_view().iter().flatten().map(str::as_bytes)),
+            DataType::Binary => bytes!(arr.as_binary::<i32>().iter().flatten()),
+            DataType::LargeBinary => bytes!(arr.as_binary::<i64>().iter().flatten()),
+            DataType::BinaryView => bytes!(arr.as_binary_view().iter().flatten()),
+            DataType::FixedSizeBinary(_) => bytes!(arr.as_fixed_size_binary().iter().flatten()),
+            other => return Err(Error::Unsupported(format!("Arrow page statistics for {other}"))),
+        };
+        Ok(Self::from_bounds(t, bounds, arr.logical_null_count() as u64, nan_count))
+    }
+
     /// Computes the statistics of a page holding `data`; `None` if the column type has no
     /// defined order.
     pub fn compute(t: &StatType, data: &ColumnData) -> Option<PageStats> {
@@ -246,6 +337,10 @@ impl PageStats {
             }
             Values::I96(_) => return None,
         };
+        Self::from_bounds(t, enc, null_count, nan_count)
+    }
+
+    fn from_bounds(t: &StatType, enc: Option<(Vec<u8>, Vec<u8>)>, null_count: u64, nan_count: Option<u64>) -> Option<Self> {
         let mut s = PageStats {
             min_exact: true,
             max_exact: true,

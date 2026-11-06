@@ -1,5 +1,116 @@
 # Parquet I/O benchmark results
 
+## Latest: direct Arrow append
+
+Recorded on **2026-11-06**, with the Arrow append fast path applied on top of
+`2a10e1d4af102fd08c27dac359b88db6947b779c`. The complete 36-case run finished at
+`2026-11-06T16:31:55Z`. Environment, fixture and sampling match the earlier indexed
+run documented below: 80,000 rows, 11 flat columns, 30 samples, 1 s warm-up and a
+5 s measurement target. All intervals below are Criterion's 95% confidence intervals.
+
+```bash
+cargo test --release --quiet
+cargo bench --bench parquet_io -- --test
+cargo bench --bench parquet_io -- \
+  --sample-size 30 --measurement-time 5 --warm-up-time 1 --noplot \
+  --save-baseline arrow-append-2a10e1d
+```
+
+### Same-run fresh-write comparison
+
+Timings are milliseconds. The physical-append baseline reproduces the previous
+single-row-group implementation using public transaction/codec APIs in the
+benchmark, including schema lookup, conversion, page encoding/statistics, persistence
+and snapshot commit. Both VPF paths use the same schema, data, codec, row/page limits
+and SQLite/blob durability policy. Each iteration gets a fresh empty table, and both
+outputs are independently checked against the fixture. The parquet-rs file baseline
+also emits page indexes and syncs the file.
+
+| Codec | Operation | Estimate (ms) | 95% CI (ms) |
+|---|---|---:|---:|
+| Snappy | parquet-rs fresh file | 33.465 | 33.177-33.802 |
+| Snappy | VPF Arrow direct append | 37.600 | 37.204-38.053 |
+| Snappy | VPF physical append (previous path) | 56.102 | 55.877-56.380 |
+| Snappy | VPF import | 31.685 | 31.502-31.945 |
+| Zstd | parquet-rs fresh file | 38.238 | 37.800-38.748 |
+| Zstd | VPF Arrow direct append | 43.152 | 42.385-44.097 |
+| Zstd | VPF physical append (previous path) | 58.686 | 58.413-59.096 |
+| Zstd | VPF import | 31.300 | 31.198-31.403 |
+
+The fast path reduces append time by **33.0% for Snappy** and **26.5% for Zstd**
+versus the same-run physical baseline. VPF fresh writes are now approximately
+**12-13% slower** than parquet-rs here, rather than the earlier 1.6-1.8x gap.
+Percentages compare point estimates, not confidence bounds.
+
+Compatible direct appends encode a conformed Arrow row group once with the stored
+Parquet schema. They extract its pages from one in-memory file, and compute page
+statistics directly from Arrow slices without materializing physical value vectors
+or definition-level vectors. Larger batches use zero-copy Arrow row-group slices.
+Nested/legacy layouts, dictionary-typed target schemas, missing physical defaults
+and out-of-precision decimal values retain the compatibility path. Buffered
+append, flush and mutations retain the existing physical representation.
+
+### Small updates, rerun
+
+| Codec | Rows updated | Full rewrite (ms) | Rewrite 95% CI | VPF update (ms) | VPF 95% CI | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| Snappy | 1 | 46.547 | 46.213-46.971 | 4.3642 | 4.1726-4.5993 | 10.67x |
+| Snappy | 100 clustered | 49.228 | 48.029-50.962 | 4.3413 | 4.2834-4.4155 | 11.34x |
+| Zstd | 1 | 52.193 | 51.857-52.537 | 4.7770 | 4.6941-4.8838 | 10.93x |
+| Zstd | 100 clustered | 52.096 | 51.767-52.463 | 4.6167 | 4.5655-4.6796 | 11.28x |
+
+These use the same one-row/100-clustered-row update workload described below.
+
+### Reads, rerun
+
+| Codec | Projection | Input | Estimate (ms) | 95% CI (ms) |
+|---|---|---|---:|---:|
+| Snappy | All columns | parquet-rs Bytes | 5.2165 | 5.1876-5.2451 |
+| Snappy | All columns | parquet-rs File | 5.7523 | 5.7023-5.7942 |
+| Snappy | All columns | VPF snapshot | 6.4226 | 6.2674-6.5946 |
+| Snappy | id, name | parquet-rs Bytes | 1.1240 | 1.0686-1.2132 |
+| Snappy | id, name | parquet-rs File | 1.1549 | 1.1480-1.1619 |
+| Snappy | id, name | VPF snapshot | 1.2396 | 1.2367-1.2423 |
+| Zstd | All columns | parquet-rs Bytes | 7.9152 | 7.5569-8.4806 |
+| Zstd | All columns | parquet-rs File | 7.9184 | 7.8889-7.9552 |
+| Zstd | All columns | VPF snapshot | 8.4491 | 8.4203-8.4975 |
+| Zstd | id, name | parquet-rs Bytes | 1.4769 | 1.4664-1.4926 |
+| Zstd | id, name | parquet-rs File | 1.5401 | 1.5386-1.5419 |
+| Zstd | id, name | VPF snapshot | 1.6567 | 1.6514-1.6647 |
+
+| Codec | Snapshot construction (us) | 95% CI (us) |
+|---|---:|---:|
+| Snappy | 337.47 | 336.15-339.30 |
+| Zstd | 345.86 | 339.57-354.72 |
+
+### Physical-path stage diagnostics, rerun
+
+These stages are **not** performed by the compatible Arrow direct-append path.
+They remain useful for buffered/legacy operations and page-level mutations.
+
+| Codec | Stage | Estimate (ms) | 95% CI (ms) |
+|---|---|---:|---:|
+| Snappy | Arrow to physical values | 7.4721 | 7.0354-7.9824 |
+| Snappy | Copy whole row group | 9.4737 | 9.0351-9.9620 |
+| Snappy | Encode pages and compute page statistics | 39.581 | 39.101-40.258 |
+| Zstd | Arrow to physical values | 7.2010 | 6.8476-7.8659 |
+| Zstd | Copy whole row group | 8.9054 | 8.8504-8.9866 |
+| Zstd | Encode pages and compute page statistics | 43.897 | 43.805-43.992 |
+
+### Fast-path correctness
+
+The complete Rust suite passed **75 tests**, and all **36 benchmark smoke cases**
+passed. New checks compare direct Arrow statistics with the physical/Parquet oracle
+across primitive, temporal, decimal and binary types, including unsigned extremes,
+nulls, slices, NaNs, signed zero and long/truncated bounds. Fast-path eligibility,
+casts, column ordering, null filling, required fields and decimal/legacy fallback
+are checked. Existing tests cover multi-row-group splitting, page indexes,
+mutations, schema changes and time travel. Optional PyArrow/DuckDB checks remain
+unconfigured (`VPF_PYTHON` unset). Shared-environment and warm-cache limitations
+described below still apply.
+
+## Earlier indexed run, before direct Arrow append
+
 Recorded on **2026-11-06**, after integrating `origin/main` at
 `0a535393b2bf2c3b13fc68c2be246c3a54f5629a` and reapplying the direct-conversion,
 shared-Arrow-buffer, and single-row-group append optimizations.

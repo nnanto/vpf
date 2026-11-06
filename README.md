@@ -221,6 +221,10 @@ benchmarks; it is not a verbatim port or a ClickBench query benchmark.
   and a single row group, and emit ColumnIndex/OffsetIndex page indexes. Their encoding
   pipelines and metadata work differ. SQLite retains the store's normal
   WAL/`synchronous=NORMAL` durability policy.
+  `vpf_direct_append` uses the production Arrow fast path for this fixture.
+  `vpf_physical_append` is a benchmark-only reproduction of the previous physical
+  conversion/per-column encoding path using the same transaction APIs, settings,
+  data and fresh destinations; its complete output is also verified before timing.
 * **Import:** VPF stores already encoded pages. This is measured separately and is
   **not** an encoding/write-speed comparison. As on current `main`, import also decodes
   the chunks and computes its own page statistics.
@@ -228,8 +232,9 @@ benchmarks; it is not a verbatim port or a ClickBench query benchmark.
   converted rows into a row group, and encoding the final pages. These CPU-only
   measurements exclude SQLite and blob I/O, include result destruction, and are
   diagnostic rather than an exact additive decomposition of the end-to-end append.
-  Whole-batch copies are skipped by direct append when it fits in one row group;
-  `copy_row_group` measures the slicing cost still used when a batch must be split.
+  These are diagnostics for the physical compatibility path, not the Arrow fast
+  path. Compatible direct appends no longer materialize physical-column vectors or
+  copy them for row-group splitting.
 * **Update:** changes `name` for one row or 100 clustered rows in the same 80,000-row
   file. VPF evaluates the predicate and rewrites one page of one column, preserving
   the original snapshot. The parquet-rs baseline streams and decodes the original
@@ -250,12 +255,17 @@ Buffered append, deletes, nested data, cold-cache
 reads, and concurrent workloads are not covered. Criterion reports timings and row
 throughput, and saves baselines under `target/criterion`.
 
-Flat appends convert common Arrow primitives, decimal32/64/128, strings and binary
-arrays directly into physical values, avoiding temporary Parquet encoding/decoding.
-Offset-based string/binary and fixed-size binary values share their Arrow buffers.
-Other flat representations retain the compatibility conversion, and nested arrays
-retain the stored-layout validation round trip. Direct appends borrow the converted
-columns when the batch fits in a single row group; larger batches are still split at
-the existing row-group limit.
+Compatible flat direct appends match columns by name, cast to the stored Arrow
+types, fill missing nullable fields, and encode each row group once with ArrowWriter
+using the stored Parquet schema. The resulting column pages are extracted from one
+in-memory file, and page statistics are computed directly from Arrow slices.
+The stored Parquet type tree must exactly match Arrow's mapping: nested layouts,
+INT96, noncanonical decimal representations, dictionary-typed target schemas,
+missing physical defaults and out-of-precision decimal values retain the physical
+compatibility path. Actual validation/encoding errors are propagated, not retried
+as a fallback. Buffered appends, flushes and page-level mutations also retain the
+physical path. That path uses direct primitive conversion and shared Arrow
+string/binary buffers, and borrows whole row groups when possible. Both append paths
+retain the existing maximum of 1,048,576 rows per row group.
 
 Recorded measurements and reproduction commands are in [BENCHMARKS.md](BENCHMARKS.md).

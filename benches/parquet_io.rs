@@ -17,8 +17,10 @@ use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::file::reader::ChunkReader;
 use tempfile::TempDir;
+use vpf::meta::SegmentKind;
 use vpf::ops::append::AppendMode;
 use vpf::predicate::Expr;
+use vpf::store::NewChunk;
 use vpf::store::Store;
 
 const ROWS: usize = 80_000;
@@ -93,6 +95,54 @@ fn write_file(file: &mut File, batch: &RecordBatch, codec: Compression) {
     writer.write(black_box(batch)).unwrap();
     black_box(writer.close().unwrap());
     file.sync_data().unwrap();
+}
+
+// Reproduces the previous one-row-group append pipeline using the same public
+// transaction/codec APIs, so the fast path has a same-run end-to-end baseline.
+fn physical_append(store: &Store, batch: &RecordBatch) {
+    store
+        .write(|t| {
+            let view = vpf::ops::snapshot::load_view(t.conn(), "data", None)?;
+            let columns = vpf::convert::batch_to_columns(&view.schema, batch)?;
+            let sid = t.new_snapshot(
+                view.file.file_id,
+                view.schema.schema_version_id,
+                "append",
+                Some(&format!("{} rows", batch.num_rows())),
+            )?;
+            let group = vpf::ops::synth::encode_row_group(
+                &view.schema,
+                vpf::ops::synth::write_codec(&view.file),
+                &columns,
+            )?;
+            let mut chunks = Vec::new();
+            for (leaf, chunk) in view.schema.leaves()?.iter().zip(&group.chunks) {
+                let pages = chunk
+                    .pages
+                    .iter()
+                    .zip(&chunk.page_rows)
+                    .zip(&chunk.page_stats)
+                    .map(|(((bytes, header), rows), stats)| {
+                        t.put_page_rows(bytes, header, *rows, stats.as_ref())
+                    })
+                    .collect::<vpf::Result<Vec<_>>>()?;
+                let id = t.put_chunk(
+                    &NewChunk {
+                        physical: leaf.physical(),
+                        codec: chunk.codec,
+                        encodings: chunk.encodings.clone(),
+                        stats: chunk.stats.clone(),
+                    },
+                    &pages,
+                )?;
+                chunks.push(((leaf.column_id, leaf.leaf), id));
+            }
+            let id = t.put_row_group(group.num_rows, &chunks)?;
+            t.append_segment(view.file.file_id, SegmentKind::RowGroup, id, sid)?;
+            t.finish_snapshot(view.file.file_id, sid)?;
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn update_batch(batch: &RecordBatch, predicate: &Expr) -> (RecordBatch, usize) {
@@ -282,6 +332,13 @@ fn parquet_io(c: &mut Criterion) {
             false,
             &batch,
         );
+        let (_physical_dir, physical_store) = empty_store(&batch, codec);
+        physical_append(&physical_store, &batch);
+        verify(
+            physical_store.open_snapshot("data", None).unwrap(),
+            false,
+            &batch,
+        );
         let check_path = dir.path().join("check.parquet");
         write_file(&mut File::create(&check_path).unwrap(), &batch, codec);
         verify(File::open(&check_path).unwrap(), false, &batch);
@@ -354,6 +411,13 @@ fn parquet_io(c: &mut Criterion) {
                 |(_, store)| {
                     black_box(store.import("data", black_box(&bytes)).unwrap());
                 },
+                BatchSize::PerIteration,
+            )
+        });
+        group.bench_function("vpf_physical_append", |b| {
+            b.iter_batched_ref(
+                || empty_store(&batch, codec),
+                |(_, store)| physical_append(store, black_box(&batch)),
                 BatchSize::PerIteration,
             )
         });

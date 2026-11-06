@@ -48,15 +48,7 @@ pub fn batch_to_columns(schema: &SchemaVersion, batch: &RecordBatch) -> Result<V
     if target.fields().len() != schema.columns.len() {
         return Err(Error::Corrupt("arrow schema does not match column count".into()));
     }
-    let bs = batch.schema();
-    for (i, f) in bs.fields().iter().enumerate() {
-        if schema.column_by_name(f.name()).is_none() {
-            return Err(Error::Invalid(format!("unknown column '{}'", f.name())));
-        }
-        if bs.fields().iter().skip(i + 1).any(|g| g.name() == f.name()) {
-            return Err(Error::Invalid(format!("duplicate column '{}'", f.name())));
-        }
-    }
+    validate_batch_columns(schema, batch)?;
     let n = batch.num_rows();
     let leaves = schema.leaves()?;
     let mut out = Vec::with_capacity(leaves.len());
@@ -84,6 +76,86 @@ pub fn batch_to_columns(schema: &SchemaVersion, batch: &RecordBatch) -> Result<V
         out.extend(cols);
     }
     Ok(out)
+}
+
+fn validate_batch_columns(schema: &SchemaVersion, batch: &RecordBatch) -> Result<()> {
+    let bs = batch.schema();
+    for (i, f) in bs.fields().iter().enumerate() {
+        if schema.column_by_name(f.name()).is_none() {
+            return Err(Error::Invalid(format!("unknown column '{}'", f.name())));
+        }
+        if bs.fields().iter().skip(i + 1).any(|g| g.name() == f.name()) {
+            return Err(Error::Invalid(format!("duplicate column '{}'", f.name())));
+        }
+    }
+    Ok(())
+}
+
+/// Conforms flat batches that the Arrow writer can encode with exactly the stored type
+/// tree. Other layouts retain the physical-column compatibility path.
+pub(crate) fn batch_for_arrow_append(schema: &SchemaVersion, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+    if schema.columns.iter().any(|c| c.is_nested() || c.physical == PhysicalType::INT96) {
+        return Ok(None);
+    }
+    let target = Arc::new(arrow_schema(schema)?);
+    if target.fields().iter().any(|f| !matches!(f.data_type(),
+        DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 |
+        DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 |
+        DataType::UInt32 | DataType::UInt64 | DataType::Float16 | DataType::Float32 |
+        DataType::Float64 | DataType::Date32 | DataType::Date64 | DataType::Time32(_) |
+        DataType::Time64(_) | DataType::Timestamp(_, _) | DataType::Duration(_) |
+        DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) |
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Binary |
+        DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_)
+    )) {
+        return Ok(None);
+    }
+    let stored = schema.descriptor()?;
+    let generated = ArrowSchemaConverter::new().convert(&target)?;
+    if generated.root_schema().get_fields() != stored.root_schema().get_fields() {
+        return Ok(None);
+    }
+    // Physical defaults can have legacy representations; leave their filling to the
+    // compatibility path rather than inventing a second physical-to-Arrow converter.
+    if schema.columns.iter().any(|c| c.default_value.is_some() && batch.column_by_name(&c.name).is_none()) {
+        return Ok(None);
+    }
+    validate_batch_columns(schema, batch)?;
+    let arrays = schema.columns.iter().zip(target.fields()).map(|(spec, field)| {
+        let ctx = |e| Error::Invalid(format!("column '{}': {e}", spec.name));
+        let arr = match batch.column_by_name(&spec.name) {
+            Some(arr) => cast_with_options(arr, field.data_type(), &cast_opts()).map_err(ctx)?,
+            None if spec.nullable => arrow::array::new_null_array(field.data_type(), batch.num_rows()),
+            None => return Err(Error::Invalid(format!("missing value for required column '{}'", spec.name))),
+        };
+        if !spec.nullable && arr.logical_null_count() != 0 {
+            return Err(Error::Invalid(format!("NULL in required column '{}'", spec.name)));
+        }
+        Ok(arr)
+    }).collect::<Result<Vec<_>>>()?;
+    for array in &arrays {
+        let valid = match array.data_type() {
+            DataType::Decimal32(p, _) => {
+                let limit = 10i128.pow(*p as u32);
+                array.as_primitive::<Decimal32Type>().iter().flatten().all(|v| (v as i128) > -limit && (v as i128) < limit)
+            }
+            DataType::Decimal64(p, _) => {
+                let limit = 10i128.pow(*p as u32);
+                array.as_primitive::<Decimal64Type>().iter().flatten().all(|v| (v as i128) > -limit && (v as i128) < limit)
+            }
+            DataType::Decimal128(p, _) => {
+                let limit = 10i128.pow(*p as u32);
+                array.as_primitive::<Decimal128Type>().iter().flatten().all(|v| v > -limit && v < limit)
+            }
+            _ => true,
+        };
+        // Arrow arrays may carry values outside their declared decimal precision.
+        // Keep the existing physical-coercion semantics for such arrays.
+        if !valid {
+            return Ok(None);
+        }
+    }
+    Ok(Some(RecordBatch::try_new(target, arrays)?))
 }
 
 /// Fill for an absent nested field: NULL (optional) or empty (repeated) in every row.
@@ -486,6 +558,15 @@ mod tests {
                 let got = direct_physical(&arr).unwrap().expect("direct conversion");
                 let expected = roundtrip_physical(&arr).unwrap();
                 assert_eq!(got, expected, "{}", arr.data_type());
+                let schema = Schema::new(vec![Field::new("c", arr.data_type().clone(), true)]);
+                let descriptor = ArrowSchemaConverter::new().convert(&schema).unwrap();
+                let column = descriptor.column(0);
+                let stat_type = crate::stats::StatType::of_column(&column);
+                assert_eq!(
+                    crate::stats::PageStats::compute_arrow(&stat_type, arr.as_ref(), column.type_length().max(0) as usize).unwrap(),
+                    crate::stats::PageStats::compute(&stat_type, &got),
+                    "Arrow page statistics: {}", arr.data_type(),
+                );
             }
         }
     }
@@ -542,6 +623,105 @@ mod tests {
             spec.type_length = len;
             let expected = coerce_physical(roundtrip_physical(&arr).unwrap(), &spec).unwrap();
             assert_eq!(array_to_column(&spec, arr.data_type(), &arr).unwrap(), expected);
+        }
+    }
+
+    fn stored_schema(schema: &Schema) -> SchemaVersion {
+        let descriptor = ArrowSchemaConverter::new().convert(schema).unwrap();
+        SchemaVersion {
+            schema_version_id: 1,
+            root_name: descriptor.root_schema().name().into(),
+            columns: descriptor.root_schema().get_fields().iter().enumerate()
+                .map(|(i, field)| ColumnSpec::from_parquet_type(i as i64, field).unwrap()).collect(),
+            key_value: Some(vec![parquet::file::metadata::KeyValue::new(
+                parquet::arrow::ARROW_SCHEMA_META_KEY.into(),
+                parquet::arrow::encode_arrow_schema(schema),
+            )]),
+        }
+    }
+
+    #[test]
+    fn arrow_append_conforms_names_casts_nulls_and_uses_legacy_fallbacks() {
+        let target = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("optional", DataType::Int32, true),
+        ]);
+        let schema = stored_schema(&target);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![
+            Field::new("name", DataType::LargeUtf8, true),
+            Field::new("id", DataType::Int32, true),
+        ])), vec![
+            Arc::new(LargeStringArray::from(vec![Some("x"), None])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ]).unwrap();
+        let conformed = batch_for_arrow_append(&schema, &batch).unwrap().expect("canonical flat fast path");
+        assert_eq!(conformed.schema().fields(), target.fields());
+        assert_eq!(conformed.column(2).null_count(), 2);
+        assert_eq!(batch_to_columns(&schema, &conformed).unwrap(), batch_to_columns(&schema, &batch).unwrap());
+
+        for names in [vec!["name"], vec!["id", "unknown"], vec!["id", "id"]] {
+            let invalid = RecordBatch::try_new(
+                Arc::new(Schema::new(names.iter().map(|name| Field::new(*name, DataType::Utf8, true)).collect::<Vec<_>>())),
+                names.iter().map(|_| Arc::new(StringArray::from(vec!["1", "2"])) as ArrayRef).collect(),
+            ).unwrap();
+            assert!(batch_for_arrow_append(&schema, &invalid).is_err());
+        }
+
+        let mut default_schema = schema.clone();
+        default_schema.columns[2].default_value = Some(crate::values::encode_value(&Values::I32(vec![42])).unwrap());
+        assert!(batch_for_arrow_append(&default_schema, &batch).unwrap().is_none());
+        let mut legacy = schema.clone();
+        legacy.columns[0].physical = PhysicalType::INT96;
+        assert!(batch_for_arrow_append(&legacy, &batch).unwrap().is_none());
+        let nested = Schema::new(vec![Field::new("nested",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))), true)]);
+        assert!(batch_for_arrow_append(&stored_schema(&nested), &batch).unwrap().is_none());
+
+        for arrays in [
+            vec![Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef, Arc::new(StringArray::from(vec!["a", "b"]))],
+            vec![Arc::new(StringArray::from(vec!["bad", "2"])) as ArrayRef, Arc::new(StringArray::from(vec!["a", "b"]))],
+        ] {
+            let input_schema = Arc::new(Schema::new(vec![
+                Field::new("id", arrays[0].data_type().clone(), true),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            let invalid = RecordBatch::try_new(input_schema, arrays).unwrap();
+            assert!(batch_for_arrow_append(&schema, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn out_of_precision_decimals_use_physical_compatibility_path() {
+        let schema = Schema::new(vec![Field::new("decimal", DataType::Decimal128(8, 0), true)]);
+        let stored = stored_schema(&schema);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![
+            Arc::new(Decimal128Array::from(vec![Some(i32::MAX as i128 + 1), Some(1)])
+                .with_precision_and_scale(8, 0).unwrap()),
+        ]).unwrap();
+        assert!(batch_for_arrow_append(&stored, &batch).unwrap().is_none());
+        let mut legacy = stored.clone();
+        legacy.columns[0].physical = PhysicalType::INT64;
+        assert!(batch_for_arrow_append(&legacy, &batch).unwrap().is_none());
+    }
+
+    #[test]
+    fn arrow_statistics_match_physical_statistics_for_nan_and_long_bounds() {
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Float64Array::from(vec![None, Some(f64::NAN), Some(-0.0), Some(0.0), Some(f64::INFINITY)])),
+            Arc::new(Float32Array::from(vec![None, Some(f32::NAN), Some(-0.0), Some(0.0), Some(f32::NEG_INFINITY)])),
+            Arc::new(Float64Array::from(vec![Some(f64::NAN), None, Some(f64::NAN)])),
+            Arc::new(StringArray::from(vec![Some("é".repeat(80)), Some("z".repeat(100)), None])),
+            Arc::new(BinaryArray::from_iter(vec![Some(vec![255; 100]), Some(vec![128; 100]), None])),
+        ];
+        for arr in arrays {
+            let descriptor = ArrowSchemaConverter::new().convert(&Schema::new(vec![Field::new("c", arr.data_type().clone(), true)])).unwrap();
+            let column = descriptor.column(0);
+            let stat_type = crate::stats::StatType::of_column(&column);
+            assert_eq!(
+                crate::stats::PageStats::compute_arrow(&stat_type, arr.as_ref(), column.type_length().max(0) as usize).unwrap(),
+                crate::stats::PageStats::compute(&stat_type, &roundtrip_physical(&arr).unwrap()),
+            );
         }
     }
 }

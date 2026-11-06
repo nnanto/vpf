@@ -3,13 +3,22 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use arrow::array::RecordBatch;
+use bytes::Bytes;
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::Compression;
+use parquet::file::metadata::ParquetMetaDataReader;
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use parquet::schema::types::SchemaDescriptor;
 
-use crate::codec::{EncodedChunk, encode_column};
+use crate::codec::{DATA_PAGE_ROWS, DATA_PAGE_SIZE, EncodedChunk, encode_column};
 use crate::convert::conform;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::meta::{BatchRow, FileRow};
 use crate::schema::SchemaVersion;
+use crate::stats::{PageStats, StoredStats};
+use crate::thrift::split_pages;
 use crate::values::{ColumnData, decode_batch};
 
 /// Upper bound on rows coalesced into one synthesized row group.
@@ -93,6 +102,75 @@ pub fn encode_row_group(schema: &SchemaVersion, codec: Compression, cols: &[Colu
         .map(|(leaf, data)| encode_column(leaf, codec, data, true))
         .collect::<Result<_>>()?;
     Ok(SynthRowGroup { num_rows, chunks })
+}
+
+/// Encodes a compatible, conformed flat Arrow row group once, then extracts its
+/// column pages. Page statistics are computed from Arrow slices, not decoded pages.
+pub(crate) fn encode_arrow_row_group(schema: &SchemaVersion, codec: Compression, batch: &RecordBatch) -> Result<SynthRowGroup> {
+    let descriptor = schema.descriptor()?;
+    let props = WriterProperties::builder()
+        .set_writer_version(WriterVersion::PARQUET_1_0)
+        .set_compression(codec)
+        .set_dictionary_enabled(true)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_offset_index_disabled(true)
+        .set_data_page_size_limit(DATA_PAGE_SIZE)
+        .set_data_page_row_count_limit(DATA_PAGE_ROWS)
+        .set_max_row_group_row_count(None)
+        .build();
+    let options = ArrowWriterOptions::new()
+        .with_properties(props)
+        .with_parquet_schema(SchemaDescriptor::new(descriptor.root_schema_ptr()));
+    let mut buffer = Vec::new();
+    let mut writer = ArrowWriter::try_new_with_options(&mut buffer, batch.schema(), options)?;
+    writer.write(batch)?;
+    writer.close()?;
+    let bytes = Bytes::from(buffer);
+    let metadata = ParquetMetaDataReader::new().parse_and_finish(&bytes)?;
+    if metadata.num_row_groups() != 1
+        || metadata.row_group(0).num_rows() != batch.num_rows() as i64
+        || metadata.file_metadata().schema_descr().root_schema() != descriptor.root_schema()
+    {
+        return Err(Error::Corrupt("Arrow append encoder produced an unexpected layout".into()));
+    }
+    let leaves = schema.leaves()?;
+    if leaves.len() != batch.num_columns() {
+        return Err(Error::Corrupt("Arrow append requires one flat leaf per column".into()));
+    }
+    let chunks = leaves.iter().zip(metadata.row_group(0).columns()).zip(batch.columns()).map(|((leaf, column), array)| {
+        let (start, len) = column.byte_range();
+        let chunk = bytes.slice(start as usize..(start + len) as usize);
+        let mut pages = Vec::new();
+        let mut page_rows = Vec::new();
+        let mut page_stats = Vec::new();
+        let mut row = 0usize;
+        let stat_type = leaf.stat_type()?;
+        for page in split_pages(&chunk)? {
+            let rows = if page.header.kind.is_data() {
+                usize::try_from(page.header.num_values).map_err(|_| Error::Corrupt("negative append page row count".into()))?
+            } else { 0 };
+            let end = row.checked_add(rows).filter(|&end| end <= array.len())
+                .ok_or_else(|| Error::Corrupt("append pages exceed row group".into()))?;
+            let stats = if page.header.kind.is_data() {
+                PageStats::compute_arrow(&stat_type, array.slice(row, rows).as_ref(), leaf.spec.type_length.max(0) as usize)?
+            } else { None };
+            page_stats.push(stats);
+            page_rows.push(rows as i64);
+            pages.push((chunk.slice(page.offset..page.offset + page.header.total_len()), page.header));
+            row = end;
+        }
+        if row != batch.num_rows() || column.num_values() != row as i64 {
+            return Err(Error::Corrupt("append page rows do not match batch".into()));
+        }
+        Ok(EncodedChunk {
+            pages, page_rows, page_stats,
+            codec: column.compression(),
+            encodings: column.encodings().collect(),
+            stats: column.statistics().map(StoredStats::from_parquet),
+            num_values: column.num_values(),
+        })
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(SynthRowGroup { num_rows: batch.num_rows() as i64, chunks })
 }
 
 /// Synthesizes one row group from consecutive batches.

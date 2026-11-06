@@ -8,7 +8,7 @@ use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowSchemaConverter, encode_arrow_s
 use parquet::file::metadata::KeyValue;
 use parquet::basic::Compression;
 
-use crate::convert::batch_to_columns;
+use crate::convert::{batch_for_arrow_append, batch_to_columns};
 use crate::error::{Error, Result};
 use crate::meta::{self, SegmentKind};
 use crate::ops::snapshot::{SegmentData, load_view};
@@ -98,7 +98,6 @@ impl Store {
         }
         self.write(|t| {
             let view = load_view(t.conn(), name, None)?;
-            let cols = batch_to_columns(&view.schema, batch)?;
             let n = batch.num_rows();
             let direct = match mode {
                 AppendMode::Auto => n >= DIRECT_APPEND_ROWS,
@@ -109,21 +108,35 @@ impl Store {
             let svid = view.schema.schema_version_id;
             let sid = t.new_snapshot(file_id, svid, "append", Some(&format!("{n} rows")))?;
             if direct {
+                enum Input {
+                    Arrow(RecordBatch),
+                    Physical(Vec<ColumnData>),
+                }
                 let codec = synth::write_codec(&view.file);
+                let input = match batch_for_arrow_append(&view.schema, batch)? {
+                    Some(batch) => Input::Arrow(batch),
+                    None => Input::Physical(batch_to_columns(&view.schema, batch)?),
+                };
                 let mut start = 0;
                 while start < n {
                     let len = MAX_ROW_GROUP_ROWS.min(n - start);
-                    let part = if len == n {
-                        Cow::Borrowed(cols.as_slice())
-                    } else {
-                        Cow::Owned(cols.iter().map(|c| c.slice(start, len)).collect::<Vec<_>>())
+                    let rg = match &input {
+                        Input::Arrow(batch) => synth::encode_arrow_row_group(&view.schema, codec, &batch.slice(start, len))?,
+                        Input::Physical(cols) => {
+                            let part = if len == n {
+                                Cow::Borrowed(cols.as_slice())
+                            } else {
+                                Cow::Owned(cols.iter().map(|c| c.slice(start, len)).collect::<Vec<_>>())
+                            };
+                            synth::encode_row_group(&view.schema, codec, &part)?
+                        }
                     };
-                    let rg = synth::encode_row_group(&view.schema, codec, &part)?;
                     let rg_id = store_row_group(t, &view.schema, &rg)?;
                     t.append_segment(file_id, SegmentKind::RowGroup, rg_id, sid)?;
                     start += len;
                 }
             } else {
+                let cols = batch_to_columns(&view.schema, batch)?;
                 let keyed: Vec<((i64, i64), ColumnData)> =
                     view.schema.leaves()?.iter().map(|l| (l.column_id, l.leaf)).zip(cols).collect();
                 let payload = encode_batch(n, &keyed)?;
