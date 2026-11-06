@@ -59,7 +59,8 @@ fn single_cell_update_rewrites_one_page_of_one_column() {
             let old: Vec<i64> = a.pages.iter().map(|p| p.page_id).collect();
             assert_eq!(b.pages.iter().filter(|p| !old.contains(&p.page_id)).count(), 1);
             assert_eq!(b.pages.len(), a.pages.len());
-            assert!(b.stats.is_none(), "stats dropped on updated chunk");
+            let st = b.stats.as_ref().expect("stats recomputed on updated chunk");
+            assert!(st.min_exact && st.max_exact && st.null_count.is_some());
         } else {
             assert_eq!(a.chunk_id, b.chunk_id, "column {i} chunk reused");
         }
@@ -67,7 +68,10 @@ fn single_cell_update_rewrites_one_page_of_one_column() {
     assert_eq!(rows_of(&store, "f", None), model_update(&base, "name = 'changed'", "id = 1234"));
     assert_eq!(rows_of(&store, "f", Some(before.snapshot.snapshot_id)), base);
     let vf = store.open_snapshot("f", None).unwrap();
-    assert!(vf.metadata().row_group(0).column(name_idx).statistics().is_none());
+    let st = vf.metadata().row_group(0).column(name_idx).statistics().unwrap();
+    assert_eq!(st.min_bytes_opt(), Some(&b"changed"[..]));
+    assert_eq!(st.max_bytes_opt(), Some(&b"name-96"[..]));
+    assert!(st.min_is_exact() && st.max_is_exact());
     assert!(vf.metadata().row_group(0).column(0).statistics().unwrap().min_is_exact());
 }
 

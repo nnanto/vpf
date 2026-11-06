@@ -76,12 +76,33 @@ out.
   * Appended Arrow data is written with the stored Parquet schema. The levels are then
     checked to read back identically, and the append is rejected if they do not. Exotic
     legacy layouts can never be silently mis-encoded.
-* **Statistics.** After a delete, a chunk keeps its min/max values but they are marked
-  inexact, and its null count is dropped. Updated chunks drop their statistics entirely.
-  Stale statistics would make readers skip pages incorrectly; missing statistics only cost
-  pruning.
-* **Page indexes and bloom filters are not emitted.** Keeping them correct across
-  page-level rewrites is not worth the risk of wrong results.
+* **Statistics and page indexes.** Every data page stores its own statistics (min/max,
+  null count, NaN count), computed by vpf from the decoded values. Every virtual file
+  carries an **OffsetIndex** for each column chunk, and a **ColumnIndex** with a boundary
+  order when all of the chunk's pages have statistics. Both are written at the start of
+  the footer.
+  * Statistics are recomputed whenever pages change. After a delete or update, a chunk's
+    statistics are merged from its page statistics, so they stay exact, null count
+    included. Unchanged pages reuse their stored statistics.
+  * Import decodes each chunk once to compute page statistics. The source file's page
+    statistics and column indexes are never trusted. Source chunk statistics are kept
+    when present.
+  * Values follow the Parquet column order: signed or unsigned integers; IEEE 754 total
+    order for FLOAT, DOUBLE and FLOAT16, with NaNs only counted; signed decimals;
+    bytewise order for strings and binary.
+  * Byte-array bounds longer than 64 bytes are truncated (as parquet-rs does). The min
+    becomes a prefix. The max is incremented at its last byte, or at its last character
+    for UTF-8 values.
+  * Some chunks get no ColumnIndex, though their OffsetIndex is always emitted:
+    * INT96 and other types without a defined order;
+    * chunks with a NaN-only page, because readers disagree on how NaN bounds compare;
+    * pages that cannot be decoded for statistics at import (LZO);
+    * pages from stores created before page statistics existed. Those stores are
+      upgraded in place when opened.
+  * When a chunk lacks page statistics, deletes fall back to keeping min/max as inexact
+    bounds and dropping counts, and updates drop the statistics. Readers never see stale
+    bounds.
+* **Bloom filters are not emitted.**
 * **Rewritten pages are PLAIN encoded,** even inside dictionary-encoded chunks. Mixing
   dictionary and plain pages in one chunk is valid Parquet. Readers fall back exactly as
   they do when a writer's dictionary overflows.

@@ -13,8 +13,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::schema::{ColumnSpec, SchemaVersion, logical_from_json, logical_to_json};
-use crate::stats::StoredStats;
+use crate::stats::{PageStats, StoredStats};
 use crate::thrift::PageKind;
+
+/// Upgrades stores created by older versions to the current schema.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    let has_page_stats: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('pages') WHERE name = 'stats'")?
+        .exists([])?;
+    if !has_page_stats {
+        conn.execute_batch("ALTER TABLE pages ADD COLUMN stats TEXT")?;
+    }
+    Ok(())
+}
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -69,7 +80,8 @@ CREATE TABLE IF NOT EXISTS pages (
     kind INTEGER NOT NULL,
     num_values INTEGER NOT NULL,
     num_rows INTEGER NOT NULL,
-    uncompressed_len INTEGER NOT NULL
+    uncompressed_len INTEGER NOT NULL,
+    stats TEXT
 );
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id INTEGER PRIMARY KEY,
@@ -175,6 +187,8 @@ pub struct PageRow {
     pub num_rows: i64,
     /// header length + uncompressed body length
     pub uncompressed_len: i64,
+    /// Data page statistics (absent for dictionary pages, unordered types, older stores).
+    pub stats: Option<PageStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,7 +446,7 @@ pub fn load_chunk(conn: &Connection, chunk_id: i64) -> Result<ChunkRow> {
         .map(|e| e.parse::<Encoding>().map_err(|e| Error::Corrupt(e.to_string())))
         .collect::<Result<Vec<_>>>()?;
     let mut st = conn.prepare_cached(
-        "SELECT p.page_id, p.blob_offset, p.blob_len, p.kind, p.num_values, p.num_rows, p.uncompressed_len
+        "SELECT p.page_id, p.blob_offset, p.blob_len, p.kind, p.num_values, p.num_rows, p.uncompressed_len, p.stats
          FROM chunk_pages cp JOIN pages p ON p.page_id = cp.page_id
          WHERE cp.chunk_id = ?1 ORDER BY cp.seq",
     )?;
@@ -449,6 +463,7 @@ pub fn load_chunk(conn: &Connection, chunk_id: i64) -> Result<ChunkRow> {
             num_values: r.get(4)?,
             num_rows: r.get(5)?,
             uncompressed_len: r.get(6)?,
+            stats: r.get::<_, Option<String>>(7)?.map(|s| serde_json::from_str(&s)).transpose()?,
         });
     }
     Ok(ChunkRow {

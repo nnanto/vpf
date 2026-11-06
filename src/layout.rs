@@ -7,13 +7,17 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::metadata::{
-    ColumnChunkMetaData, FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataWriter, RowGroupMetaData,
+    ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData, KeyValue, OffsetIndexBuilder, ParquetMetaData,
+    ParquetMetaDataWriter, RowGroupMetaData, page_index::PageIndexBuilder,
 };
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::writer::TrackedWrite;
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::SchemaDescPtr;
 
 use crate::error::{Error, Result};
+use crate::stats::{PageStats, StatType, boundary_order};
 use crate::store::BlobStore;
 use crate::thrift::PageKind;
 
@@ -34,6 +38,10 @@ pub struct PageSrc {
     pub kind: PageKind,
     pub num_values: i64,
     pub uncompressed_len: i64,
+    /// Whole rows held by a data page; `None` if unknown (no offset index is emitted).
+    pub num_rows: Option<i64>,
+    /// Data page statistics; a column index is emitted iff every data page has them.
+    pub stats: Option<PageStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +105,9 @@ impl VirtualFile {
         let mut voff = 4u64;
         let mut rg_meta = Vec::with_capacity(row_groups.len());
         let mut total_rows = 0i64;
-        for rg in row_groups {
+        let mut index = PageIndexBuilder::new(row_groups.len(), ncols);
+        let mut has_index = false;
+        for (rgi, rg) in row_groups.into_iter().enumerate() {
             if rg.chunks.len() != ncols {
                 return Err(Error::Corrupt(format!(
                     "row group has {} chunks, schema has {ncols} columns",
@@ -113,6 +123,10 @@ impl VirtualFile {
                 let mut comp = 0i64;
                 let mut uncomp = 0i64;
                 let mut data_rows = 0i64;
+                let stat_type = StatType::of_column(props.schema.column(ci).as_ref());
+                let mut oi = Some(OffsetIndexBuilder::new());
+                let mut first_row = 0i64;
+                let mut page_stats: Option<Vec<PageStats>> = Some(Vec::new());
                 for page in chunk.pages {
                     match page.kind {
                         PageKind::Dictionary => {
@@ -124,6 +138,19 @@ impl VirtualFile {
                         PageKind::Data | PageKind::DataV2 => {
                             data_off.get_or_insert(voff as i64);
                             data_rows += page.num_values;
+                            match (page.num_rows, i32::try_from(page.len)) {
+                                (Some(rows), Ok(len)) if oi.is_some() => {
+                                    let b = oi.as_mut().unwrap();
+                                    b.append_offset_and_size(voff as i64, len);
+                                    b.append_row_count(rows);
+                                    first_row += rows;
+                                }
+                                _ => oi = None,
+                            }
+                            match (page.stats, page_stats.as_mut()) {
+                                (Some(st), Some(v)) => v.push(st),
+                                _ => page_stats = None,
+                            }
                         }
                         PageKind::Index => {}
                     }
@@ -140,6 +167,19 @@ impl VirtualFile {
                 let data_off = data_off.ok_or_else(|| Error::Corrupt("column chunk without data pages".into()))?;
                 if data_rows != chunk.num_values {
                     return Err(Error::Corrupt("chunk num_values does not match pages".into()));
+                }
+                if oi.is_some() && first_row != rg.num_rows {
+                    return Err(Error::Corrupt(format!(
+                        "chunk pages hold {first_row} rows, row group has {}",
+                        rg.num_rows
+                    )));
+                }
+                if let Some(oi) = oi {
+                    index.put_offset_index(oi.build(), rgi, ci);
+                    has_index = true;
+                    if let Some(ps) = page_stats {
+                        index.put_column_index(column_index(&stat_type, props.schema.column(ci).physical_type(), &ps)?, rgi, ci);
+                    }
                 }
                 let mut b = ColumnChunkMetaData::builder(props.schema.column(ci))
                     .set_compression(chunk.codec)
@@ -173,9 +213,11 @@ impl VirtualFile {
             props.schema.clone(),
             None,
         );
-        let metadata = ParquetMetaData::new(file_meta, rg_meta);
-        let mut footer = Vec::new();
-        ParquetMetaDataWriter::new(&mut footer, &metadata).finish()?;
+        let mut metadata = ParquetMetaData::new(file_meta, rg_meta);
+        if has_index {
+            metadata = metadata.into_builder().set_page_index(Some(Arc::new(index.build()))).build();
+        }
+        let footer = write_footer(&metadata, voff)?;
         let footer_len = footer.len() as u64;
         extents.push(Extent { voff, len: footer_len, src: ByteSource::Mem(Bytes::from(footer)) });
         voff += footer_len;
@@ -198,12 +240,13 @@ impl VirtualFile {
         self.inner.size
     }
 
-    /// Metadata describing this virtual file (as written in its footer).
+    /// Metadata describing this virtual file, including its page index. The page index
+    /// locations (`column_index_offset` etc.) are only set in the serialized footer.
     pub fn metadata(&self) -> &Arc<ParquetMetaData> {
         &self.inner.metadata
     }
 
-    /// Length of the footer section (metadata + 4-byte length + magic).
+    /// Length of the footer section (page indexes + metadata + 4-byte length + magic).
     pub fn footer_len(&self) -> u64 {
         self.inner.footer_len
     }
@@ -292,4 +335,62 @@ impl ChunkReader for VirtualFile {
     fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
         self.read_range(start, length).map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
     }
+}
+
+/// Builds the column index of one chunk from its data page statistics.
+fn column_index(
+    t: &StatType,
+    physical: parquet::basic::Type,
+    pages: &[PageStats],
+) -> Result<ColumnIndexMetaData> {
+    let has_nan = pages.iter().all(|p| p.nan_count.is_some());
+    let mut b = ColumnIndexBuilder::new(physical);
+    for p in pages {
+        b.append(
+            p.is_null_page(),
+            p.min.clone().unwrap_or_default(),
+            p.max.clone().unwrap_or_default(),
+            p.null_count as i64,
+            if has_nan { p.nan_count.map(|n| n as i64) } else { None },
+        );
+    }
+    b.set_boundary_order(boundary_order(t, &pages.iter().collect::<Vec<_>>()));
+    Ok(b.build()?)
+}
+
+/// A sink that drops the first `skip` bytes written to it and keeps the rest.
+struct SkipSink {
+    skip: u64,
+    out: Vec<u8>,
+}
+
+impl std::io::Write for SkipSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let drop = (self.skip.min(buf.len() as u64)) as usize;
+        self.skip -= drop as u64;
+        self.out.extend_from_slice(&buf[drop..]);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serializes the footer (page indexes, file metadata, length, magic) as if it started at
+/// file offset `start`, so that page index offsets in the metadata are absolute.
+fn write_footer(md: &ParquetMetaData, start: u64) -> Result<Vec<u8>> {
+    static ZEROS: [u8; 1 << 16] = [0; 1 << 16];
+    let mut sink = SkipSink { skip: start, out: Vec::new() };
+    {
+        let mut w = TrackedWrite::new(&mut sink);
+        let mut left = start;
+        while left > 0 {
+            let n = left.min(ZEROS.len() as u64) as usize;
+            std::io::Write::write_all(&mut w, &ZEROS[..n])?;
+            left -= n as u64;
+        }
+        ParquetMetaDataWriter::new_with_tracked(w, md).finish()?;
+    }
+    Ok(sink.out)
 }

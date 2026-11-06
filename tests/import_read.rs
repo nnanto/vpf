@@ -129,7 +129,8 @@ fn pyarrow_fixtures_import_and_cross_reader_equality() {
         store.export(name, None, &out).unwrap();
         let (a, b) = (std::fs::read(&src).unwrap(), std::fs::read(&out).unwrap());
         let data_end = |f: &[u8]| f.len() - 8 - u32::from_le_bytes(f[f.len() - 8..f.len() - 4].try_into().unwrap()) as usize;
-        assert_eq!(a[..data_end(&a)], b[..data_end(&b)], "{name}: pages are reused verbatim");
+        // Pages are at the same offsets; our footer additionally starts with page indexes.
+        assert_eq!(a[..data_end(&a)], b[..data_end(&a)], "{name}: pages are reused verbatim");
         run_python(&[&py_script("check_equal.py"), src.to_str().unwrap(), out.to_str().unwrap()]);
     }
 }

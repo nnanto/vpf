@@ -8,8 +8,8 @@ use crate::codec::{RawPage, chunk_page_rows, decode_pages, encode_column};
 use crate::error::{Error, Result};
 use crate::ops::append::store_chunk;
 use crate::meta::{self, SegmentKind};
-use crate::schema::{ColumnSpec, build_descriptor};
-use crate::stats::StoredStats;
+use crate::schema::{ColumnSpec, Leaf, build_descriptor};
+use crate::stats::{PageStats, StatOrder, StoredStats, merge_pages};
 use crate::store::{NewChunk, Store};
 use crate::thrift::{PageKind, split_pages};
 
@@ -98,16 +98,25 @@ impl Store {
                                     rg.num_rows()
                                 )));
                             }
+                            let stat_type = leaf.stat_type()?;
+                            let page_stats = import_page_stats(leaf, col.compression(), &pages, &page_rows)?;
                             let mut page_ids = Vec::with_capacity(pages.len());
-                            for ((p, h), r) in pages.iter().zip(&headers).zip(page_rows) {
-                                page_ids.push(t.put_page_rows(&p.bytes, h, r)?);
+                            for (((p, h), r), st) in pages.iter().zip(&headers).zip(&page_rows).zip(&page_stats) {
+                                page_ids.push(t.put_page_rows(&p.bytes, h, *r, st.as_ref())?);
                             }
+                            let merged = page_stats
+                                .iter()
+                                .zip(&page_rows)
+                                .filter(|(_, r)| **r > 0)
+                                .map(|(s, _)| s.as_ref())
+                                .collect::<Option<Vec<_>>>()
+                                .map(|ps| merge_pages(&stat_type, ps));
                             pages_total += page_ids.len();
                             let chunk = NewChunk {
                                 physical: col.column_type(),
                                 codec: col.compression(),
                                 encodings: col.encodings().collect(),
-                                stats: col.statistics().map(StoredStats::from_parquet),
+                                stats: col.statistics().map(StoredStats::from_parquet).or(merged),
                             };
                             t.put_chunk(&chunk, &page_ids)?
                         }
@@ -141,4 +150,25 @@ impl Store {
             Ok(ImportSummary { snapshot_id: sid, num_rows, row_groups: rgs, pages: pages_total })
         })
     }
+}
+
+/// Page statistics of an imported chunk, computed from its decoded values (source page
+/// statistics and column indexes are not trusted). Chunks that cannot be decoded here
+/// (e.g. LZO) get none; this never fails the import.
+fn import_page_stats(
+    leaf: &Leaf,
+    codec: Compression,
+    pages: &[RawPage],
+    page_rows: &[i64],
+) -> Result<Vec<Option<PageStats>>> {
+    let t = leaf.stat_type()?;
+    if t.order == StatOrder::Undefined {
+        return Ok(vec![None; pages.len()]);
+    }
+    Ok(match decode_pages(leaf, codec, pages) {
+        Ok(data) if data.num_rows() as i64 == page_rows.iter().sum::<i64>() => {
+            crate::codec::page_stats(&t, &data, page_rows)
+        }
+        _ => vec![None; pages.len()],
+    })
 }

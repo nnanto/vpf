@@ -187,7 +187,8 @@ pub(crate) fn store_chunk(t: &mut Txn, leaf: &Leaf, chunk: &crate::codec::Encode
         .pages
         .iter()
         .zip(&chunk.page_rows)
-        .map(|((b, h), &rows)| t.put_page_rows(b, h, rows))
+        .zip(&chunk.page_stats)
+        .map(|(((b, h), &rows), st)| t.put_page_rows(b, h, rows, st.as_ref()))
         .collect::<Result<Vec<_>>>()?;
     t.put_chunk(
         &NewChunk {

@@ -89,6 +89,8 @@ pub fn chunk_layout(chunk: &ChunkRow) -> Result<ChunkLayout> {
                 kind: p.kind,
                 num_values: p.num_values,
                 uncompressed_len: p.uncompressed_len,
+                num_rows: p.kind.is_data().then_some(p.num_rows),
+                stats: p.stats.clone(),
             })
             .collect(),
         codec: chunk.codec,

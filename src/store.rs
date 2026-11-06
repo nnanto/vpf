@@ -10,7 +10,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
 use crate::meta::{self, SegmentKind, codec_to_code};
-use crate::stats::StoredStats;
+use crate::stats::{PageStats, StoredStats};
 use crate::thrift::{PageHeaderInfo, PageKind};
 
 /// Append-only file of immutable page blobs. Bytes are never overwritten, so any blob
@@ -70,6 +70,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(meta::SCHEMA_SQL)?;
+        meta::migrate(&conn)?;
         let blobs = Arc::new(BlobStore::open(&root.join("data.bin"))?);
         Ok(Self { root, conn: Mutex::new(conn), blobs, synth_cache: Default::default() })
     }
@@ -141,11 +142,17 @@ impl<'a> Txn<'a> {
             PageKind::DataV2 => h.num_rows.unwrap_or(h.num_values),
             _ => 0,
         };
-        self.put_page_rows(bytes, h, num_rows)
+        self.put_page_rows(bytes, h, num_rows, None)
     }
 
-    /// Stores one physical page holding `num_rows` whole rows.
-    pub fn put_page_rows(&mut self, bytes: &[u8], h: &PageHeaderInfo, num_rows: i64) -> Result<i64> {
+    /// Stores one physical page holding `num_rows` whole rows, with its statistics.
+    pub fn put_page_rows(
+        &mut self,
+        bytes: &[u8],
+        h: &PageHeaderInfo,
+        num_rows: i64,
+        stats: Option<&PageStats>,
+    ) -> Result<i64> {
         if bytes.len() != h.total_len() {
             return Err(Error::Corrupt("page byte length does not match header".into()));
         }
@@ -155,15 +162,16 @@ impl<'a> Txn<'a> {
         let off = self.blobs.append(bytes)?;
         self.wrote_blobs = true;
         self.tx.execute(
-            "INSERT INTO pages (blob_offset, blob_len, kind, num_values, num_rows, uncompressed_len)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO pages (blob_offset, blob_len, kind, num_values, num_rows, uncompressed_len, stats)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 off as i64,
                 bytes.len() as i64,
                 h.kind.code(),
                 h.num_values,
                 num_rows,
-                (h.header_len + h.uncompressed_size) as i64
+                (h.header_len + h.uncompressed_size) as i64,
+                stats.map(serde_json::to_string).transpose()?
             ],
         )?;
         Ok(self.tx.last_insert_rowid())

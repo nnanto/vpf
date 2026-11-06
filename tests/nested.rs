@@ -709,6 +709,7 @@ fn records_split_across_v1_pages_are_reencoded() {
         num_values: defs.len() as i64,
         codec: Compression::UNCOMPRESSED,
         page_rows: vec![0; n_pages],
+        page_stats: vec![None; n_pages],
     };
     let vf = VirtualFile::build(
         FileProps { schema: descr, created_by: None, key_value: None, version: 1, blobs: None },

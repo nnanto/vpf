@@ -162,6 +162,11 @@ impl Leaf {
         self.spec.physical
     }
 
+    /// How statistics of this leaf are computed and ordered.
+    pub fn stat_type(&self) -> Result<crate::stats::StatType> {
+        Ok(crate::stats::StatType::of_column(self.descriptor()?.column(0).as_ref()))
+    }
+
     /// True for a leaf whose levels are those of a flat column (at most one definition
     /// level, no repetition), i.e. one level per row.
     pub fn is_flat(&self) -> bool {

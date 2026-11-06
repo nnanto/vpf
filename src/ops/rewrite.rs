@@ -14,7 +14,7 @@ use crate::ops::append::store_chunk;
 use crate::ops::snapshot::SnapshotView;
 use crate::predicate::Expr;
 use crate::schema::Leaf;
-use crate::stats::StoredStats;
+use crate::stats::{PageStats, StoredStats, merge_pages};
 use crate::store::{NewChunk, Store, Txn};
 use crate::values::ColumnData;
 
@@ -117,8 +117,7 @@ pub fn rewrite_chunk(
         let raw = chunk.pages.iter().map(|p| RawPage::load(t.blobs(), p)).collect::<Result<Vec<_>>>()?;
         let total = ranges.iter().flatten().last().map(|r| r.end).unwrap_or(0);
         let data = transform(decode_pages(leaf, chunk.codec, &raw)?, 0..total)?;
-        let mut enc = encode_column(leaf, fallback_codec, &data, true)?;
-        enc.stats = stats;
+        let enc = encode_column(leaf, fallback_codec, &data, true)?;
         counts.rewritten += data_pages;
         counts.written += enc.pages.len();
         return store_chunk(t, leaf, &enc);
@@ -132,12 +131,14 @@ pub fn rewrite_chunk(
     let mut encodings: Vec<Encoding> = chunk.encodings.clone();
     let mut page_ids = Vec::with_capacity(chunk.pages.len());
     let mut data_out = 0;
+    let mut out_stats: Vec<Option<PageStats>> = Vec::new();
     for (p, r) in chunk.pages.iter().zip(ranges) {
         let r = match r {
             Some(r) if touched(r.clone()) => r,
             Some(_) => {
                 counts.reused += 1;
                 data_out += 1;
+                out_stats.push(p.stats.clone());
                 page_ids.push(p.page_id);
                 continue;
             }
@@ -164,14 +165,22 @@ pub fn rewrite_chunk(
                 encodings.push(*e);
             }
         }
-        for ((b, h), &rows) in enc.pages.iter().zip(&enc.page_rows) {
-            page_ids.push(t.put_page_rows(b, h, rows)?);
+        for (((b, h), &rows), st) in enc.pages.iter().zip(&enc.page_rows).zip(&enc.page_stats) {
+            page_ids.push(t.put_page_rows(b, h, rows, st.as_ref())?);
             counts.written += 1;
-            data_out += h.kind.is_data() as usize;
+            if h.kind.is_data() {
+                data_out += 1;
+                out_stats.push(st.clone());
+            }
         }
     }
     if data_out == 0 {
         return Err(Error::Invalid("page rewrite would leave a column chunk without rows".into()));
     }
+    // Exact chunk statistics from the pages when all of them have statistics.
+    let stats = match out_stats.into_iter().collect::<Option<Vec<_>>>() {
+        Some(ps) => Some(merge_pages(&leaf.stat_type()?, &ps)),
+        None => stats,
+    };
     t.put_chunk(&NewChunk { physical: chunk.physical, codec: chunk.codec, encodings, stats }, &page_ids)
 }

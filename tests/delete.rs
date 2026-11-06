@@ -145,11 +145,11 @@ fn single_row_delete_rewrites_one_page_per_column() {
     assert!(store.delete_where("f", "nope = 1").is_err());
     assert!(store.delete_where("f", "id = 'x'").is_err());
     assert_eq!(store.view("f", None).unwrap().snapshot.snapshot_id, cur);
-    // Relaxed statistics after row removal.
+    // Exact statistics recomputed from page statistics after row removal.
     let vf = store.open_snapshot("f", None).unwrap();
     let st = vf.metadata().row_group(0).column(0).statistics().unwrap();
-    assert!(!st.min_is_exact() && !st.max_is_exact());
-    assert_eq!(st.null_count_opt(), None);
+    assert!(st.min_is_exact() && st.max_is_exact());
+    assert_eq!(st.null_count_opt(), Some(0));
 }
 
 #[test]

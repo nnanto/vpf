@@ -18,7 +18,7 @@ use crate::meta::PageRow;
 use crate::store::BlobStore;
 use crate::layout::{ByteSource, ChunkLayout, FileProps, PageSrc, RowGroupLayout, VirtualFile};
 use crate::schema::Leaf;
-use crate::stats::StoredStats;
+use crate::stats::{PageStats, StatType, StoredStats};
 use crate::thrift::{PageHeaderInfo, PageKind, split_pages};
 use crate::values::{ColumnData, Values};
 
@@ -61,6 +61,8 @@ pub struct EncodedChunk {
     pub codec: Compression,
     /// Rows held by each page (0 for dictionary pages); pages start on row boundaries.
     pub page_rows: Vec<i64>,
+    /// Statistics of each page (`None` for dictionary pages and unordered types).
+    pub page_stats: Vec<Option<PageStats>>,
 }
 
 impl EncodedChunk {
@@ -69,12 +71,17 @@ impl EncodedChunk {
             pages: self
                 .pages
                 .iter()
-                .map(|(b, h)| PageSrc {
+                .zip(&self.page_rows)
+                .zip(&self.page_stats)
+                .map(|(((b, h), &rows), st)| PageSrc {
                     src: ByteSource::Mem(b.clone()),
                     len: b.len() as u64,
                     kind: h.kind,
                     num_values: h.num_values,
                     uncompressed_len: (h.header_len + h.uncompressed_size) as i64,
+                    // 0 rows on a data page means unknown (records spanning pages).
+                    num_rows: (h.kind.is_data() && rows > 0).then_some(rows),
+                    stats: st.clone(),
                 })
                 .collect(),
             codec: self.codec,
@@ -99,6 +106,8 @@ fn single_leaf_file(leaf: &Leaf, codec: Compression, pages: &[RawPage]) -> Resul
                 kind: p.kind,
                 num_values: p.num_values,
                 uncompressed_len: p.uncompressed_len,
+                num_rows: None,
+                stats: None,
             })
             .collect(),
         codec,
@@ -316,7 +325,9 @@ pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, diction
         Some(r) => rows_per_page(r, pages.iter().map(|(_, h)| (h.kind.is_data(), h.num_values)))
             .ok_or_else(|| Error::Corrupt("encoder split a record across pages".into()))?,
     };
+    let page_stats = page_stats(&leaf.stat_type()?, data, &page_rows);
     Ok(EncodedChunk {
+        page_stats,
         page_rows,
         pages,
         encodings: cmd.encodings().collect(),
@@ -324,4 +335,22 @@ pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, diction
         num_values: cmd.num_values(),
         codec,
     })
+}
+
+/// Statistics of each page of a chunk holding `data`, split by `page_rows` (0 rows marks a
+/// dictionary page, which gets `None`).
+pub fn page_stats(t: &StatType, data: &ColumnData, page_rows: &[i64]) -> Vec<Option<PageStats>> {
+    let mut start = 0usize;
+    page_rows
+        .iter()
+        .map(|&rows| {
+            if rows == 0 {
+                return None;
+            }
+            let rows = rows as usize;
+            let page = if start == 0 && rows == data.num_rows() { None } else { Some(data.slice(start, rows)) };
+            start += rows;
+            PageStats::compute(t, page.as_ref().unwrap_or(data))
+        })
+        .collect()
 }
