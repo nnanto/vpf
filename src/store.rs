@@ -56,6 +56,7 @@ pub struct Store {
     root: PathBuf,
     conn: Mutex<Connection>,
     blobs: Arc<BlobStore>,
+    pub(crate) synth_cache: crate::ops::synth::SynthCache,
 }
 
 impl Store {
@@ -70,7 +71,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(meta::SCHEMA_SQL)?;
         let blobs = Arc::new(BlobStore::open(&root.join("data.bin"))?);
-        Ok(Self { root, conn: Mutex::new(conn), blobs })
+        Ok(Self { root, conn: Mutex::new(conn), blobs, synth_cache: Default::default() })
     }
 
     pub fn root(&self) -> &Path {

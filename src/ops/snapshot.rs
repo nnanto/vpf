@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::layout::{ByteSource, ChunkLayout, FileProps, PageSrc, RowGroupLayout, VirtualFile};
 use crate::meta::{self, BatchRow, ChunkRow, FileRow, RowGroupRow, Segment, SegmentKind, SnapshotInfo};
 use crate::schema::SchemaVersion;
+use crate::ops::synth;
 use crate::store::Store;
 
 /// Fully-resolved metadata of one snapshot.
@@ -109,17 +110,45 @@ impl Store {
     }
 
     pub fn build_virtual_file(&self, view: &SnapshotView) -> Result<VirtualFile> {
+        let codec = synth::write_codec(&view.file);
+        let runs = synth::batch_runs(&view.segments, |s| match s {
+            SegmentData::Batch { batch, .. } => Some(batch.num_rows),
+            _ => None,
+        });
         let mut rgs = Vec::new();
-        for seg in &view.segments {
-            match seg {
+        let mut i = 0;
+        let mut runs = runs.into_iter().peekable();
+        while i < view.segments.len() {
+            if let Some(run) = runs.next_if(|r| r.start == i) {
+                let batches: Vec<&BatchRow> = view.segments[run.clone()]
+                    .iter()
+                    .map(|s| match s {
+                        SegmentData::Batch { batch, .. } => batch,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                let key = (batches.iter().map(|b| b.batch_id).collect(), view.schema.schema_version_id);
+                let rg = self.synth_cache.get_or_build(key, || synth::synthesize(&view.schema, codec, &batches))?;
+                rgs.push(RowGroupLayout {
+                    num_rows: rg.num_rows,
+                    chunks: rg
+                        .chunks
+                        .iter()
+                        .zip(&view.schema.columns)
+                        .map(|(c, spec)| c.layout(spec.physical))
+                        .collect::<Result<_>>()?,
+                });
+                i = run.end;
+                continue;
+            }
+            match &view.segments[i] {
                 SegmentData::RowGroup { rg, chunks, .. } => rgs.push(RowGroupLayout {
                     num_rows: rg.num_rows,
                     chunks: chunks.iter().map(chunk_layout).collect::<Result<_>>()?,
                 }),
-                SegmentData::Batch { .. } => {
-                    return Err(Error::Unsupported("buffered batches are not supported yet".into()));
-                }
+                SegmentData::Batch { .. } => unreachable!("batches are covered by runs"),
             }
+            i += 1;
         }
         VirtualFile::build(
             FileProps {

@@ -116,8 +116,13 @@ pub fn decode_pages(spec: &ColumnSpec, codec: Compression, pages: &[RawPage]) ->
     let reader = SerializedFileReader::new(vf)?;
     let rg = reader.get_row_group(0)?;
     let col = rg.get_column_reader(0)?;
-    let want = num_rows as usize;
+    let data = read_column(col, spec.physical, spec.nullable, num_rows as usize)?;
+    out.append(&data)?;
+    Ok(out)
+}
 
+/// Reads exactly `want` rows of a flat column into physical values.
+pub fn read_column(col: ColumnReader, physical: PhysicalType, nullable: bool, want: usize) -> Result<ColumnData> {
     fn drain<T: DataType>(
         mut r: ColumnReaderImpl<T>,
         want: usize,
@@ -139,8 +144,8 @@ pub fn decode_pages(spec: &ColumnSpec, codec: Compression, pages: &[RawPage]) ->
         Ok(())
     }
 
+    let mut out = ColumnData::empty(physical, nullable);
     let mut defs = Vec::new();
-    let nullable = spec.nullable;
     match (col, &mut out.values) {
         (ColumnReader::BoolColumnReader(r), Values::Bool(v)) => drain(r, want, nullable, v, &mut defs)?,
         (ColumnReader::Int32ColumnReader(r), Values::I32(v)) => drain(r, want, nullable, v, &mut defs)?,

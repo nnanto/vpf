@@ -5,6 +5,7 @@
 //! file assembled on the fly (virtual offsets + regenerated footer).
 
 pub mod codec;
+pub mod convert;
 pub mod error;
 pub mod layout;
 pub mod ops;
