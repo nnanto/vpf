@@ -5,6 +5,8 @@
 //! file assembled on the fly (virtual offsets + regenerated footer).
 
 pub mod error;
+pub mod layout;
+pub mod ops;
 pub mod meta;
 pub mod schema;
 pub mod stats;

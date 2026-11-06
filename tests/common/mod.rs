@@ -89,3 +89,39 @@ pub fn read_parquet(bytes: Bytes) -> Vec<RecordBatch> {
 pub fn concat(batches: &[RecordBatch]) -> RecordBatch {
     arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap()
 }
+
+/// Python interpreter with pyarrow + duckdb, from `VPF_PYTHON` (tests using it are skipped if unset).
+pub fn python() -> Option<String> {
+    std::env::var("VPF_PYTHON").ok().filter(|p| !p.is_empty())
+}
+
+pub fn run_python(args: &[&str]) {
+    let py = python().expect("VPF_PYTHON");
+    let out = std::process::Command::new(&py).args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "python {:?} failed:\n{}\n{}",
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+pub fn py_script(name: &str) -> String {
+    format!("{}/tests/python/{}", env!("CARGO_MANIFEST_DIR"), name)
+}
+
+/// Reads all rows of a virtual file with the arrow reader.
+pub fn read_virtual(vf: &vpf::layout::VirtualFile) -> RecordBatch {
+    let batches: Vec<RecordBatch> = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf.clone())
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let schema = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf.clone())
+        .unwrap()
+        .schema()
+        .clone();
+    arrow::compute::concat_batches(&schema, &batches).unwrap()
+}
