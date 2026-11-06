@@ -3,7 +3,6 @@ mod common;
 use std::sync::Arc;
 
 use arrow::array::*;
-use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use common::*;
 use parquet::basic::{Compression, Type as PhysicalType};
@@ -16,61 +15,6 @@ use vpf::store::Store;
 
 fn rows(store: &Store, name: &str, snap: Option<i64>) -> RecordBatch {
     read_virtual(&store.open_snapshot(name, snap).unwrap())
-}
-
-/// Applies an alter op to an Arrow batch: the reference model.
-fn model(b: &RecordBatch, op: &AlterOp) -> RecordBatch {
-    let s = b.schema();
-    let mut fields: Vec<Field> = s.fields().iter().map(|f| f.as_ref().clone()).collect();
-    let mut cols = b.columns().to_vec();
-    match op {
-        AlterOp::AddColumn { spec, default } => {
-            let ty = match (spec.physical, spec.logical.as_ref()) {
-                (PhysicalType::INT64, None) => DataType::Int64,
-                (PhysicalType::INT32, None) => DataType::Int32,
-                (PhysicalType::DOUBLE, None) => DataType::Float64,
-                (PhysicalType::BOOLEAN, None) => DataType::Boolean,
-                (PhysicalType::BYTE_ARRAY, Some(_)) => DataType::Utf8,
-                (PhysicalType::INT64, Some(_)) => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(_)) => {
-                    DataType::Decimal128(spec.precision as u8, spec.scale as i8)
-                }
-                other => panic!("model lacks {other:?}"),
-            };
-            let one = match default {
-                Some(l) => vpf::predicate::literal_array(l, &ty).unwrap(),
-                None => new_null_array(&ty, 1),
-            };
-            let idx = UInt32Array::from(vec![0u32; b.num_rows()]);
-            cols.push(arrow::compute::take(&one, &idx, None).unwrap());
-            fields.push(Field::new(&spec.name, ty, spec.nullable));
-        }
-        AlterOp::DropColumn(n) => {
-            let i = s.index_of(n).unwrap();
-            fields.remove(i);
-            cols.remove(i);
-        }
-        AlterOp::RenameColumn { from, to } => {
-            let i = s.index_of(from).unwrap();
-            fields[i] = fields[i].clone().with_name(to);
-        }
-        AlterOp::Reorder(order) => {
-            let p: Vec<usize> = order.iter().map(|n| s.index_of(n).unwrap()).collect();
-            fields = p.iter().map(|&i| fields[i].clone()).collect();
-            cols = p.iter().map(|&i| cols[i].clone()).collect();
-        }
-        AlterOp::Widen { column, to } => {
-            let i = s.index_of(column).unwrap();
-            let ty = if *to == PhysicalType::INT64 { DataType::Int64 } else { DataType::Float64 };
-            cols[i] = cast(&cols[i], &ty).unwrap();
-            fields[i] = fields[i].clone().with_data_type(ty);
-        }
-        AlterOp::MakeOptional(n) => {
-            let i = s.index_of(n).unwrap();
-            fields[i] = fields[i].clone().with_nullable(true);
-        }
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
 }
 
 fn add(name: &str, ty: &str, nullable: bool, default: Option<&str>) -> AlterOp {
@@ -146,7 +90,7 @@ fn every_op_matches_model_and_keeps_history() {
         for op in &ops {
             let before = rg_ids(&store);
             let s = store.alter("f", op.clone()).unwrap();
-            expected = model(&expected, op);
+            expected = alter_model(&expected, op);
             assert_eq!(rows(&store, "f", None), expected, "{op:?} {codec:?}");
             let after = rg_ids(&store);
             assert_eq!(before.len(), after.len());
@@ -177,7 +121,7 @@ fn every_op_matches_model_and_keeps_history() {
         // Appending with the old (pre-alter) column set: missing columns get defaults,
         // renamed/widened columns are matched by name and cast.
         let more = sample_batch(5000, 30);
-        let more_m = ops.iter().fold(more.clone(), |b, op| model(&b, op));
+        let more_m = ops.iter().fold(more.clone(), |b, op| alter_model(&b, op));
         let more_schema = more.schema();
         let renamed = more_schema.fields().iter().map(|f| {
             let n = if f.name() == "name" { "label" } else { f.name().as_str() };
@@ -211,7 +155,7 @@ fn delete_and_update_after_alter() {
     let mut expected = base;
     for op in &ops {
         store.alter("f", op.clone()).unwrap();
-        expected = model(&expected, op);
+        expected = alter_model(&expected, op);
     }
     store.update_where("f", "tag = 'hit', i32 = 9999999999", "id IN (0, 100, 1700, 2600, 3210) OR id >= 3245").unwrap();
     store.delete_where("f", "pts IS NULL OR id BETWEEN 10 AND 20").unwrap();
@@ -265,7 +209,7 @@ fn arrow_schema_hint_survives_alter() {
         AlterOp::Reorder(["kind", "when", "id", "v", "extra"].map(String::from).to_vec()),
     ] {
         store.alter("f", op.clone()).unwrap();
-        expected = model(&expected, &op);
+        expected = alter_model(&expected, &op);
         assert_eq!(rows(&store, "f", None), expected, "{op:?}");
     }
     let s = rows(&store, "f", None).schema();

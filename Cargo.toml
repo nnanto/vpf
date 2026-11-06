@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-arrow = { version = "60", features = ["chrono-tz"] }
+arrow = { version = "60", features = ["chrono-tz", "json", "prettyprint"] }
 bytes = "1.12.1"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 parquet = { version = "60", features = ["arrow", "snap", "zstd", "lz4", "flate2", "brotli"] }
 rusqlite = { version = "0.41.1", features = ["bundled", "blob"] }
 serde = { version = "1.0.229", features = ["derive"] }

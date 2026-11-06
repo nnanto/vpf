@@ -1,0 +1,147 @@
+# vpf — mutable virtual Parquet files
+
+`vpf` stores Parquet data as **immutable pages** plus **SQLite metadata**, and serves every
+snapshot as a **byte-addressable, standards-compliant Parquet file** that is assembled on the
+fly. Updates, deletes, appends and schema changes are page-level copy-on-write: only the
+pages that actually change are written, and every earlier version stays readable (time travel).
+
+Any Parquet reader can consume a snapshot, either through the `ChunkReader` API (`VirtualFile`)
+or after `vpf export`. The test suite checks the output with arrow-rs, PyArrow and DuckDB.
+
+## How it works
+
+```
+store/
+  meta.db    SQLite (WAL): files, schema versions, snapshots, pages, chunks,
+             row groups, buffered batches, segments
+  data.bin   append-only blob log of compressed Parquet pages (header + body)
+```
+
+* **Pages** are stored exactly as found in the source file (compressed, with their Thrift
+  header), so importing a file and reading it back returns the original page bytes.
+* A **chunk** is an ordered list of page ids plus column-chunk metadata (codec, encodings,
+  statistics). A **row group** maps column ids to chunk ids.
+* A **snapshot** is the list of visible **segments** (row groups or buffered batches), stored
+  with `added_in` / `removed_in` snapshot ids. A snapshot never changes after it is
+  committed.
+* **Reading** a snapshot (`Store::open_snapshot`) builds a `VirtualFile`. It assigns virtual
+  offsets to every page, rewrites each page header only where needed (for example dictionary
+  offsets), synthesizes Parquet for buffered batches, and generates a fresh footer. Reads
+  are served by range from the blob log.
+* **Columns have stable ids**. Rename, reorder and drop only change metadata, and a chunk
+  keeps belonging to its column across schema versions.
+
+### Operations
+
+| Operation | What is written |
+|---|---|
+| `import` | Every page of the source file, verbatim. |
+| `append` (buffered) | One SQLite row with the rows in a compact columnar encoding. The rows are visible immediately as a synthesized row group. Synthesized row groups are cached. |
+| `append` (direct, or auto with ≥ 65,536 rows) | A new row group of freshly encoded pages. |
+| `flush` | Converts runs of buffered batches into stored row groups. |
+| `delete WHERE p` | Untouched pages are reused by id. Each touched page is decoded, filtered and re-encoded in PLAIN, using the dictionary page from the original chunk. Row groups where every row matches are dropped. Batches are filtered. If no row matches, no snapshot is created. |
+| `update SET c = lit WHERE p` | Only the touched pages of the assigned columns are rewritten. Every other chunk is reused. |
+| `alter` add column | One constant chunk per distinct row-group size, shared between those row groups. |
+| `alter` drop / rename / reorder | Metadata only. |
+| `alter` widen (INT32→INT64, FLOAT→DOUBLE) and make-optional | Only the affected column's chunks are re-encoded. |
+| time travel | `--at <snapshot>` on any read command. |
+
+Buffered batches are stored conformed to the schema in effect when they were written. They
+are adapted to newer schemas when read (defaults for added columns, widening, nullability).
+Every write runs in one SQLite transaction. Page blobs are appended and synced before the
+metadata commit, so a crash leaves at most unreferenced bytes in the blob log.
+
+## Trade-offs and limitations
+
+The rule behind these choices: **nothing may compromise basic reads or writes.** Anything
+that would risk producing an invalid file, or that some readers might mis-handle, is left
+out.
+
+* **Flat schemas only.** Nested, repeated and map types are rejected when a file is
+  imported or created. Supporting them would require repetition and definition-level aware
+  page splitting for every delete and update.
+* **Statistics.** After a delete, a chunk keeps its min/max values but they are marked
+  inexact, and its null count is dropped. Updated chunks drop their statistics entirely.
+  Stale statistics would make readers skip pages incorrectly; missing statistics only cost
+  pruning.
+* **Page indexes and bloom filters are not emitted.** Keeping them correct across
+  page-level rewrites is not worth the risk of wrong results.
+* **Rewritten pages are PLAIN encoded,** even inside dictionary-encoded chunks. Mixing
+  dictionary and plain pages in one chunk is valid Parquet. Readers fall back exactly as
+  they do when a writer's dictionary overflows.
+* **LZO** files can be imported and read, but pages are never re-encoded with LZO. Chunks
+  that are rewritten use the file's fallback codec (SNAPPY).
+* **`UPDATE SET` takes literals only** (no expressions), and the predicate language is a
+  small SQL subset:
+  * comparisons, `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, `[NOT] LIKE`
+  * `AND`, `OR`, `NOT`
+  * double-quoted identifiers
+* **Widening** is limited to the lossless cases INT32 → INT64 (signed or plain) and
+  FLOAT → DOUBLE.
+* **No compaction or garbage collection.** Old snapshots and orphaned pages stay in the
+  blob log forever. Long chains of small batches or small row groups are not merged, apart
+  from what `flush` does.
+* The `ARROW:schema` metadata of imported files (time zones, dictionary types, and so on)
+  is kept and updated by `alter`. `pandas` metadata is dropped after the first schema
+  change.
+
+## CLI
+
+```
+cargo build --release
+export VPF_STORE=./mystore            # or --store DIR
+
+vpf import sales data.parquet
+vpf create events id:int64:required name:string at:timestamp_us amount:decimal(12,2) --codec zstd
+vpf append sales --parquet more.parquet           # --mode auto|buffered|direct
+echo '{"id": 1, "name": "x"}' | vpf append events --json -
+vpf delete sales --where "region = 'EU' AND amount < 10"
+vpf update sales --set "status = 'void', amount = NULL" --where "id IN (3, 5, 8)"
+vpf alter sales add-column level int64 --required --default 0
+vpf alter sales rename-column amount total
+vpf alter sales widen qty int64
+vpf alter sales make-optional id
+vpf alter sales reorder id total level ...
+vpf alter sales drop-column legacy
+vpf flush sales
+vpf ls | snapshots sales | schema sales --at 3 | stats sales
+vpf cat sales --limit 20 --format table|json|csv --at 5
+vpf export sales out.parquet --at 5
+```
+
+Column types for `create` and `add-column`:
+* `bool`, `int32`, `int64`, `float`, `double`
+* `string`, `binary`, `date`
+* `timestamp_ms`, `timestamp_us`, `timestamp_ns`
+* `decimal(p,s)`
+
+## Library
+
+```rust
+use vpf::store::Store;
+use vpf::ops::append::AppendMode;
+
+let store = Store::open("mystore")?;
+store.import_file("t", "data.parquet")?;
+store.append("t", &record_batch, AppendMode::Auto)?;
+store.update_where("t", "flag = TRUE", "id < 10")?;
+let vf = store.open_snapshot("t", None)?;   // impl parquet ChunkReader
+let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf)?.build()?;
+```
+
+## Tests
+
+```
+cargo test                                   # Rust-only checks
+python -m venv ~/.vpf-venv && ~/.vpf-venv/bin/pip install pyarrow duckdb
+VPF_PYTHON=~/.vpf-venv/bin/python cargo test # also verifies with PyArrow and DuckDB
+VPF_FUZZ_SEEDS=200 VPF_FUZZ_STEPS=1000 cargo test --release --test fuzz
+```
+
+What the suites cover:
+* Byte-exact round trips of imported files, for every codec and for data page v1 and v2.
+* Dictionary and plain chunks.
+* Every operation, checked against an Arrow reference model.
+* Time travel to every historical snapshot.
+* CLI workflows.
+* A randomized fuzz test that mixes appends, deletes, updates, schema changes and flushes.

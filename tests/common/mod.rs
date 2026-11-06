@@ -125,3 +125,59 @@ pub fn read_virtual(vf: &vpf::layout::VirtualFile) -> RecordBatch {
         .clone();
     arrow::compute::concat_batches(&schema, &batches).unwrap()
 }
+
+/// Applies an alter op to an Arrow batch: the reference model.
+pub fn alter_model(b: &RecordBatch, op: &vpf::ops::alter::AlterOp) -> RecordBatch {
+    let s = b.schema();
+    let mut fields: Vec<Field> = s.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut cols = b.columns().to_vec();
+    match op {
+        vpf::ops::alter::AlterOp::AddColumn { spec, default } => {
+            let ty = match (spec.physical, spec.logical.as_ref()) {
+                (parquet::basic::Type::INT64, None) => DataType::Int64,
+                (parquet::basic::Type::INT32, None) => DataType::Int32,
+                (parquet::basic::Type::DOUBLE, None) => DataType::Float64,
+                (parquet::basic::Type::BOOLEAN, None) => DataType::Boolean,
+                (parquet::basic::Type::BYTE_ARRAY, Some(_)) => DataType::Utf8,
+                (parquet::basic::Type::INT64, Some(_)) => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                (parquet::basic::Type::FIXED_LEN_BYTE_ARRAY, Some(_)) => {
+                    DataType::Decimal128(spec.precision as u8, spec.scale as i8)
+                }
+                other => panic!("model lacks {other:?}"),
+            };
+            let one = match default {
+                Some(l) => vpf::predicate::literal_array(l, &ty).unwrap(),
+                None => new_null_array(&ty, 1),
+            };
+            let idx = UInt32Array::from(vec![0u32; b.num_rows()]);
+            cols.push(arrow::compute::take(&one, &idx, None).unwrap());
+            fields.push(Field::new(&spec.name, ty, spec.nullable));
+        }
+        vpf::ops::alter::AlterOp::DropColumn(n) => {
+            let i = s.index_of(n).unwrap();
+            fields.remove(i);
+            cols.remove(i);
+        }
+        vpf::ops::alter::AlterOp::RenameColumn { from, to } => {
+            let i = s.index_of(from).unwrap();
+            fields[i] = fields[i].clone().with_name(to);
+        }
+        vpf::ops::alter::AlterOp::Reorder(order) => {
+            let p: Vec<usize> = order.iter().map(|n| s.index_of(n).unwrap()).collect();
+            fields = p.iter().map(|&i| fields[i].clone()).collect();
+            cols = p.iter().map(|&i| cols[i].clone()).collect();
+        }
+        vpf::ops::alter::AlterOp::Widen { column, to } => {
+            let i = s.index_of(column).unwrap();
+            let ty = if *to == parquet::basic::Type::INT64 { DataType::Int64 } else { DataType::Float64 };
+            cols[i] = arrow::compute::cast(&cols[i], &ty).unwrap();
+            fields[i] = fields[i].clone().with_data_type(ty);
+        }
+        vpf::ops::alter::AlterOp::MakeOptional(n) => {
+            let i = s.index_of(n).unwrap();
+            fields[i] = fields[i].clone().with_nullable(true);
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+}
+
