@@ -55,6 +55,20 @@ are adapted to newer schemas when read (defaults for added columns, widening, nu
 Every write runs in one SQLite transaction. Page blobs are appended and synced before the
 metadata commit, so a crash leaves at most unreferenced bytes in the blob log.
 
+Deletes and updates evaluate predicates and rewrite pages one row group at a time,
+discarding each group's row masks before processing the next. All groups still commit
+atomically as one snapshot; a failure rolls back metadata for the entire operation.
+Mask memory is bounded by the largest row group (including synthesized buffered runs),
+not the total row count. Snapshot metadata and buffered data are still loaded in memory.
+
+Mutation predicates use VPF-computed page statistics to skip impossible row ranges and
+entire row groups, with offset indexes enabling the reader to skip excluded pages.
+Pruning supports flat integer, boolean, string/binary and compatible temporal comparisons,
+`IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, and boolean combinations. Imported chunk
+bounds are not used for pruning. Missing statistics, nested comparisons, floating-point
+and decimal comparisons, `LIKE`, column-to-column comparisons and unsupported mappings
+fall back to evaluation; pruning never assumes an overlapping range actually matches.
+
 ## Trade-offs and limitations
 
 The rule behind these choices: **nothing may compromise basic reads or writes.** Anything

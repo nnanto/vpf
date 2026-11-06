@@ -52,25 +52,21 @@ impl Store {
                 }
                 values.push((i, (data.values.len() == 1).then_some(data.values)));
             }
-            let masks = self.match_rows(&view, &expr)?;
-            let rows_updated: i64 = masks.iter().map(|m| m.iter().filter(|x| **x).count() as i64).sum();
-            let mut s = UpdateSummary { rows_updated, ..Default::default() };
-            if rows_updated == 0 {
-                return Ok(s);
-            }
+            let mut s = UpdateSummary::default();
             let file_id = view.file.file_id;
-            let sid = t.new_snapshot(
-                file_id,
-                view.schema.schema_version_id,
-                "update",
-                Some(&format!("{rows_updated} rows: SET {set} WHERE {predicate}")),
-            )?;
             let codec = write_codec(&view.file);
             let leaves = view.schema.leaves()?;
-            for (seg, mask) in view.segments.iter().zip(&masks) {
-                if !mask.iter().any(|x| *x) {
-                    continue;
-                }
+            self.for_each_matching_segment(&view, &expr, |si, mask| {
+                let seg = &view.segments[si];
+                let sid = match s.snapshot_id {
+                    Some(sid) => sid,
+                    None => {
+                        let sid = t.new_snapshot(file_id, view.schema.schema_version_id, "update", None)?;
+                        s.snapshot_id = Some(sid);
+                        sid
+                    }
+                };
+                s.rows_updated += mask.iter().filter(|x| **x).count() as i64;
                 s.segments_rewritten += 1;
                 match seg {
                     SegmentData::RowGroup { rg, chunks, seg: seg_row } => {
@@ -115,9 +111,15 @@ impl Store {
                         t.replace_segment(file_id, seg_row, SegmentKind::Batch, b, sid)?;
                     }
                 }
+                Ok(())
+            })?;
+            if let Some(sid) = s.snapshot_id {
+                t.conn().execute(
+                    "UPDATE snapshots SET summary = ?1 WHERE snapshot_id = ?2",
+                    rusqlite::params![format!("{} rows: SET {set} WHERE {predicate}", s.rows_updated), sid],
+                )?;
+                t.finish_snapshot(file_id, sid)?;
             }
-            t.finish_snapshot(file_id, sid)?;
-            s.snapshot_id = Some(sid);
             Ok(s)
         })
     }

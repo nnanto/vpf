@@ -27,30 +27,27 @@ impl Store {
         let expr = Expr::parse(predicate)?;
         self.write(|t| {
             let view = load_view(t.conn(), name, None)?;
-            let masks = self.match_rows(&view, &expr)?;
-            let rows_deleted: i64 = masks.iter().map(|m| m.iter().filter(|x| **x).count() as i64).sum();
-            let mut s = DeleteSummary { rows_deleted, ..Default::default() };
-            if rows_deleted == 0 {
-                return Ok(s);
-            }
+            let mut s = DeleteSummary::default();
             let file_id = view.file.file_id;
-            let sid = t.new_snapshot(
-                file_id,
-                view.schema.schema_version_id,
-                "delete",
-                Some(&format!("{rows_deleted} rows where {predicate}")),
-            )?;
             let codec = write_codec(&view.file);
-            for (seg, mask) in view.segments.iter().zip(&masks) {
+            let leaves = view.schema.leaves()?;
+            self.for_each_matching_segment(&view, &expr, |si, mask| {
+                let seg = &view.segments[si];
                 let n_del = mask.iter().filter(|x| **x).count();
-                if n_del == 0 {
-                    continue;
-                }
+                let sid = match s.snapshot_id {
+                    Some(sid) => sid,
+                    None => {
+                        let sid = t.new_snapshot(file_id, view.schema.schema_version_id, "delete", None)?;
+                        s.snapshot_id = Some(sid);
+                        sid
+                    }
+                };
+                s.rows_deleted += n_del as i64;
                 let seg_row = seg.segment();
                 if n_del == mask.len() {
                     t.remove_segment(seg_row.segment_id, sid)?;
                     s.segments_removed += 1;
-                    continue;
+                    return Ok(());
                 }
                 s.segments_rewritten += 1;
                 let keep: Vec<bool> = mask.iter().map(|m| !m).collect();
@@ -58,7 +55,7 @@ impl Store {
                 match seg {
                     SegmentData::RowGroup { chunks, .. } => {
                         let mut ids = Vec::with_capacity(chunks.len());
-                        for (leaf, chunk) in view.schema.leaves()?.iter().zip(chunks) {
+                        for (leaf, chunk) in leaves.iter().zip(chunks) {
                             let id = rewrite_chunk(
                                 t,
                                 leaf,
@@ -82,9 +79,15 @@ impl Store {
                         t.replace_segment(file_id, seg_row, SegmentKind::Batch, b, sid)?;
                     }
                 }
+                Ok(())
+            })?;
+            if let Some(sid) = s.snapshot_id {
+                t.conn().execute(
+                    "UPDATE snapshots SET summary = ?1 WHERE snapshot_id = ?2",
+                    rusqlite::params![format!("{} rows where {predicate}", s.rows_deleted), sid],
+                )?;
+                t.finish_snapshot(file_id, sid)?;
             }
-            t.finish_snapshot(file_id, sid)?;
-            s.snapshot_id = Some(sid);
             Ok(s)
         })
     }

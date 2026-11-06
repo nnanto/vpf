@@ -4,14 +4,18 @@
 use std::ops::Range;
 
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    RowSelection, RowSelector,
+};
 use parquet::basic::{Compression, Encoding};
 
 use crate::codec::{RawPage, decode_pages, encode_column};
 use crate::error::{Error, Result};
 use crate::meta::ChunkRow;
 use crate::ops::append::store_chunk;
-use crate::ops::snapshot::SnapshotView;
+use crate::ops::pruning::PruningExpr;
+use crate::ops::snapshot::{SegmentData, SnapshotView};
 use crate::predicate::Expr;
 use crate::schema::Leaf;
 use crate::stats::{PageStats, StoredStats, merge_pages};
@@ -34,6 +38,26 @@ pub struct PageCounts {
 impl Store {
     /// Evaluates `expr` over a snapshot; returns one mask (`true` = match) per segment.
     pub fn match_rows(&self, view: &SnapshotView, expr: &Expr) -> Result<Vec<Vec<bool>>> {
+        let mut out = vec![Vec::new(); view.segments.len()];
+        self.for_each_matching_segment(view, expr, |si, mask| {
+            out[si] = mask.to_vec();
+            Ok(())
+        })?;
+        for (mask, segment) in out.iter_mut().zip(&view.segments) {
+            if mask.is_empty() { mask.resize(segment.num_rows() as usize, false); }
+        }
+        Ok(out)
+    }
+
+    /// Evaluates and consumes masks one row group at a time against the frozen view.
+    /// Segments proven not to match are omitted; the callback may write within the
+    /// caller's transaction without changing the input snapshot.
+    pub(crate) fn for_each_matching_segment(
+        &self,
+        view: &SnapshotView,
+        expr: &Expr,
+        mut consume: impl FnMut(usize, &[bool]) -> Result<()>,
+    ) -> Result<()> {
         let mut idx = expr
             .columns()
             .iter()
@@ -46,28 +70,96 @@ impl Store {
             idx.push(0);
         }
         let (vf, sources) = self.assemble(view)?;
-        let md = ArrowReaderMetadata::load(&vf, ArrowReaderOptions::default())?;
-        let mut out = vec![Vec::new(); view.segments.len()];
+        let md = ArrowReaderMetadata::try_new(vf.metadata().clone(), ArrowReaderOptions::default())?;
+        let pruning = PruningExpr::compile(expr, &view.schema, md.schema())?;
         for (rg, src) in sources.into_iter().enumerate() {
+            let rows = vf.metadata().row_group(rg).num_rows() as usize;
+            let ranges = match &view.segments[src.start] {
+                SegmentData::RowGroup { chunks, .. } => candidate_ranges(&pruning, chunks, rows)?,
+                SegmentData::Batch { .. } => vec![0..rows],
+            };
+            if ranges.is_empty() {
+                continue;
+            }
             let b = ParquetRecordBatchReaderBuilder::new_with_metadata(vf.clone(), md.clone());
-            let mask = ProjectionMask::roots(b.parquet_schema(), idx.iter().copied());
-            let reader = b.with_row_groups(vec![rg]).with_projection(mask).with_batch_size(64 * 1024).build()?;
-            let mut m = Vec::new();
+            let projection = ProjectionMask::roots(b.parquet_schema(), idx.iter().copied());
+            let mut selectors = Vec::new();
+            let mut end = 0;
+            for r in &ranges {
+                if r.start > end { selectors.push(RowSelector::skip(r.start - end)); }
+                selectors.push(RowSelector::select(r.len()));
+                end = r.end;
+            }
+            if end < rows { selectors.push(RowSelector::skip(rows - end)); }
+            let reader = b.with_row_groups(vec![rg]).with_projection(projection)
+                .with_row_selection(RowSelection::from(selectors))
+                .with_batch_size(64 * 1024).build()?;
+            let mut m = vec![false; rows];
+            let mut selected = ranges.iter().flat_map(|r| r.clone());
             for batch in reader {
-                m.extend(expr.matches(&batch?)?);
+                for matches in expr.matches(&batch?)? {
+                    let row = selected.next().ok_or_else(|| Error::Corrupt("row count mismatch".into()))?;
+                    m[row] = matches;
+                }
+            }
+            if selected.next().is_some() {
+                return Err(Error::Corrupt("row count mismatch".into()));
             }
             let mut off = 0;
             for si in src {
                 let n = view.segments[si].num_rows() as usize;
-                out[si] = m.get(off..off + n).ok_or_else(|| Error::Corrupt("row count mismatch".into()))?.to_vec();
+                let mask = m.get(off..off + n).ok_or_else(|| Error::Corrupt("row count mismatch".into()))?;
+                if mask.iter().any(|v| *v) { consume(si, mask)?; }
                 off += n;
             }
             if off != m.len() {
                 return Err(Error::Corrupt("row count mismatch".into()));
             }
         }
-        Ok(out)
+        Ok(())
     }
+}
+
+fn candidate_ranges(pruning: &PruningExpr, chunks: &[ChunkRow], rows: usize) -> Result<Vec<Range<usize>>> {
+    let mut columns = Vec::new();
+    pruning.columns(&mut columns);
+    columns.sort_unstable();
+    columns.dedup();
+    let mut boundaries = vec![0, rows];
+    let mut pages = Vec::new();
+    for column in columns {
+        let mut end = 0usize;
+        let mut spans = Vec::new();
+        for p in &chunks[column].pages {
+            if !p.kind.is_data() { continue; }
+            let n = usize::try_from(p.num_rows).map_err(|_| Error::Corrupt("negative page row count".into()))?;
+            end = end.checked_add(n).ok_or_else(|| Error::Corrupt("page row count overflow".into()))?;
+            boundaries.push(end);
+            spans.push((end, p.stats.as_ref(), n as u64));
+        }
+        if end != rows { return Err(Error::Corrupt("chunk page row count mismatch".into())); }
+        pages.push((column, spans));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for pair in boundaries.windows(2) {
+        let start = pair[0];
+        let page = |column| {
+            let (_, spans) = pages.iter().find(|(c, _)| *c == column)?;
+            let i = spans.partition_point(|(end, _, _)| *end <= start);
+            let (_, stats, n) = spans.get(i)?;
+            stats.map(|s| (s, *n))
+        };
+        if pruning.may_match(&page) {
+            if let Some(last) = ranges.last_mut() && last.end == start {
+                last.end = pair[1];
+            } else {
+                ranges.push(start..pair[1]);
+            }
+        }
+    }
+    Ok(ranges)
 }
 
 /// Row ranges covered by each page of a chunk (`None` for non-data pages).
