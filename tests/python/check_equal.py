@@ -22,7 +22,9 @@ if b.num_columns:
 con = duckdb.connect()
 q = "SELECT * FROM read_parquet('{}') EXCEPT ALL SELECT * FROM read_parquet('{}')"
 for x, y in ((exp, act), (act, exp)):
-    diff = con.execute(q.format(x, y)).fetchall()
+    sub = q.format(x, y)
+    n = con.execute(f"SELECT count(*) FROM ({sub})").fetchone()[0]
+    diff = con.execute(f"SELECT CAST(id AS VARCHAR) FROM ({sub}) LIMIT 5").fetchall() if n else []
     assert not diff, f"duckdb diff {x} vs {y}: {diff[:5]}"
 cnt = con.execute(f"SELECT count(*) FROM read_parquet('{act}')").fetchone()[0]
 assert cnt == a.num_rows, (cnt, a.num_rows)

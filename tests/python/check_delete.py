@@ -16,7 +16,9 @@ exp_rel = f"(SELECT * FROM read_parquet('{src}') WHERE {cond})"
 got_rel = f"read_parquet('{act}')"
 q = "SELECT * FROM {} EXCEPT ALL SELECT * FROM {}"
 for x, y in ((exp_rel, got_rel), (got_rel, exp_rel)):
-    diff = con.execute(q.format(x, y)).fetchall()
+    sub = q.format(x, y)
+    n = con.execute(f"SELECT count(*) FROM ({sub})").fetchone()[0]
+    diff = con.execute(f"SELECT CAST(id AS VARCHAR) FROM ({sub}) LIMIT 5").fetchall() if n else []
     assert not diff, f"duckdb diff: {diff[:5]}"
 n_exp = con.execute(f"SELECT count(*) FROM {exp_rel}").fetchone()[0]
 assert con.execute(f"SELECT count(*) FROM {got_rel}").fetchone()[0] == n_exp

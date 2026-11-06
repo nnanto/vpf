@@ -436,6 +436,12 @@ fn strict() -> CastOptions<'static> {
 
 /// A single-element array holding `lit` cast to `ty`.
 pub fn literal_array(lit: &Literal, ty: &DataType) -> Result<ArrayRef> {
+    if let (DataType::FixedSizeBinary(n), Literal::Str(v)) = (ty, lit) {
+        if v.len() != *n as usize {
+            return Err(Error::Invalid(format!("predicate literal {lit:?} is not {n} bytes long")));
+        }
+        return Ok(Arc::new(arrow::array::FixedSizeBinaryArray::try_from_iter(std::iter::once(v.as_bytes()))?));
+    }
     let src: ArrayRef = match lit {
         Literal::Null => return Ok(new_null_array(ty, 1)),
         Literal::Str(s) | Literal::Num(s) => Arc::new(StringArray::from(vec![s.as_str()])),
@@ -458,4 +464,35 @@ fn compare(
         CmpOp::Gt => cmp::gt(l, r),
         CmpOp::Ge => cmp::gt_eq(l, r),
     }
+}
+
+/// Parses `col = literal, col2 = literal` assignments (UPDATE ... SET syntax).
+pub fn parse_assignments(s: &str) -> Result<Vec<(String, Literal)>> {
+    let toks = tokenize(s)?;
+    let mut p = Parser { toks, pos: 0 };
+    let mut out: Vec<(String, Literal)> = Vec::new();
+    loop {
+        let col = match p.operand()? {
+            Operand::Column(c) => c,
+            _ => return p.err("expected column name"),
+        };
+        match p.peek() {
+            Some(Tok::Op(o)) if o == "=" || o == "==" => p.pos += 1,
+            _ => return p.err("expected '='"),
+        }
+        let lit = match p.operand()? {
+            Operand::Lit(l) => l,
+            Operand::Column(_) => return p.err("SET value must be a literal"),
+        };
+        if out.iter().any(|(c, _)| *c == col) {
+            return Err(Error::Invalid(format!("column '{col}' assigned twice")));
+        }
+        out.push((col, lit));
+        match p.peek() {
+            None => break,
+            Some(Tok::Comma) => p.pos += 1,
+            _ => return p.err("expected ','"),
+        }
+    }
+    Ok(out)
 }
