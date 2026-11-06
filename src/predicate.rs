@@ -496,3 +496,16 @@ pub fn parse_assignments(s: &str) -> Result<Vec<(String, Literal)>> {
     }
     Ok(out)
 }
+
+/// Parses a single literal (`'text'`, number, TRUE/FALSE or NULL).
+pub fn parse_literal(s: &str) -> Result<Literal> {
+    let mut p = Parser { toks: tokenize(s)?, pos: 0 };
+    let lit = match p.operand()? {
+        Operand::Lit(l) => l,
+        Operand::Column(_) => return p.err("expected a literal"),
+    };
+    if p.pos != p.toks.len() {
+        return p.err("unexpected trailing input");
+    }
+    Ok(lit)
+}

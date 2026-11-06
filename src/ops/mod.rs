@@ -7,3 +7,4 @@ pub mod synth;
 pub mod delete;
 pub mod rewrite;
 pub mod update;
+pub mod alter;
