@@ -4,3 +4,5 @@ pub mod import;
 pub mod snapshot;
 pub mod append;
 pub mod synth;
+pub mod delete;
+pub mod rewrite;

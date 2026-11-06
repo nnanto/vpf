@@ -110,6 +110,13 @@ impl Store {
     }
 
     pub fn build_virtual_file(&self, view: &SnapshotView) -> Result<VirtualFile> {
+        Ok(self.assemble(view)?.0)
+    }
+
+    /// Builds the virtual file and, for each of its row groups, the range of `view.segments`
+    /// it was assembled from (a stored row group, or a run of buffered batches).
+    pub fn assemble(&self, view: &SnapshotView) -> Result<(VirtualFile, Vec<std::ops::Range<usize>>)> {
+        let mut sources = Vec::new();
         let codec = synth::write_codec(&view.file);
         let runs = synth::batch_runs(&view.segments, |s| match s {
             SegmentData::Batch { batch, .. } => Some(batch.num_rows),
@@ -138,6 +145,7 @@ impl Store {
                         .map(|(c, spec)| c.layout(spec.physical))
                         .collect::<Result<_>>()?,
                 });
+                sources.push(run.clone());
                 i = run.end;
                 continue;
             }
@@ -148,9 +156,10 @@ impl Store {
                 }),
                 SegmentData::Batch { .. } => unreachable!("batches are covered by runs"),
             }
+            sources.push(i..i + 1);
             i += 1;
         }
-        VirtualFile::build(
+        let vf = VirtualFile::build(
             FileProps {
                 schema: view.schema.descriptor()?,
                 created_by: view.file.created_by.clone(),
@@ -159,7 +168,8 @@ impl Store {
                 blobs: Some(self.blobs()),
             },
             rgs,
-        )
+        )?;
+        Ok((vf, sources))
     }
 
     /// Writes a snapshot as a standalone `.parquet` file.

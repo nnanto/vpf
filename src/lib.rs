@@ -10,6 +10,7 @@ pub mod error;
 pub mod layout;
 pub mod ops;
 pub mod meta;
+pub mod predicate;
 pub mod schema;
 pub mod stats;
 pub mod store;
