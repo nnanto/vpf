@@ -53,7 +53,7 @@ impl Fixture {
     fn create() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.parquet");
-        let seed = dir.path().join("seed");
+        let seed = dir.path().join("data.vpf");
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("bucket", DataType::Int64, false),
@@ -119,7 +119,7 @@ impl Fixture {
         );
         // Iterations copy a closed, checkpointed store, not a live WAL database.
         drop(store);
-        let conn = rusqlite::Connection::open(seed.join("meta.db")).unwrap();
+        let conn = rusqlite::Connection::open(&seed).unwrap();
         let (busy, _, _): (i64, i64, i64) = conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -143,17 +143,12 @@ impl Fixture {
 
     fn fresh_store(&self) -> (TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        copy(self.seed.join("meta.db"), dir.path().join("meta.db")).unwrap();
-        copy(self.seed.join("data.bin"), dir.path().join("data.bin")).unwrap();
-        // Do not charge the timed mutation's blob sync for dirty bytes written
-        // by the untimed GiB seed copy.
-        for name in ["meta.db", "data.bin"] {
-            File::open(dir.path().join(name))
-                .unwrap()
-                .sync_all()
-                .unwrap();
-        }
-        let store = Store::open(dir.path()).unwrap();
+        let path = dir.path().join("data.vpf");
+        copy(&self.seed, &path).unwrap();
+        // Do not charge the timed mutation's sync for dirty bytes written by
+        // the untimed GiB seed copy.
+        File::open(&path).unwrap().sync_all().unwrap();
+        let store = Store::open(&path).unwrap();
         (dir, store)
     }
 }
