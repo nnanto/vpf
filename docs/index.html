@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An interactive guide to VPF: immutable Parquet pages, mutable tables, and byte-addressable snapshots in one SQLite file.">
+  <meta name="theme-color" content="#101b28">
+  <title>VPF / Inside the virtual file</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23b7ef63'/%3E%3Ctext x='7' y='29' font-size='28' font-family='monospace' fill='%23101b28'%3Ev%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.mjs"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./"><span class="brand-icon">v</span> vpf <span class="brand-sub">/ FILE SYSTEM LAB</span></a>
+    <a class="source-link" href="https://github.com/nnanto/vpf">Source on GitHub <span aria-hidden="true">↗</span></a>
+  </header>
+  <main>
+    <section class="hero">
+      <div><p class="eyebrow"><span class="live-dot"></span> THE VIRTUAL PARQUET FILE, EXPLAINED</p>
+        <h1>Change the table.<br><span>Not the whole file.</span></h1>
+        <p class="intro">Immutable Parquet pages. Mutable metadata. One SQLite file.<br>Explore how VPF changes data without losing its history, then serves it as ordinary Parquet.</p>
+      </div>
+      <aside class="hero-note"><span class="small-label">THE BIG IDEA</span><p>Store once.<br>Reference many times.</p><div class="mini-pages"><i></i><i></i><i></i><span>→</span><b>S1</b><b>S2</b><b>S3</b></div><small>Snapshots share unchanged pages.</small></aside>
+    </section>
+    <nav class="tabs" aria-label="Explorer views">
+      <button class="tab active" data-tab="storage" aria-pressed="true"><span>01</span> Storage & mutations</button>
+      <button class="tab" data-tab="retrieval" aria-pressed="false"><span>02</span> Retrieval & byte ranges</button>
+      <button class="tab" data-tab="special" aria-pressed="false"><span>03</span> Why it’s different</button>
+    </nav>
+    <section id="storage" class="view">
+      <div class="workspace">
+        <aside class="control-panel panel">
+          <div class="panel-heading"><span class="small-label">YOUR SANDBOX</span><span class="pill">sales.vpf</span></div>
+          <h2>Make a change</h2>
+          <p class="muted">A tiny table. Real storage concepts.<br>Run the guided sequence below.</p>
+          <div id="operations" class="operations"></div>
+          <button id="reset" class="text-button">↺ Reset sandbox</button>
+          <div class="divider"></div>
+          <label class="small-label" for="snapshot">TIME TRAVEL</label>
+          <select id="snapshot"></select>
+          <p id="snapshot-note" class="muted"></p>
+          <div class="legend"><span><i class="reused"></i> Reused</span><span><i class="new"></i> New</span><span><i class="historical"></i> Historical only</span></div>
+        </aside>
+        <div class="diagram-panel panel">
+          <div class="panel-heading"><div><span class="small-label">INSIDE THE SQLITE FILE</span><h2>Metadata points. Pages persist.</h2></div><span id="snapshot-badge" class="pill accent"></span></div>
+          <div class="diagram-labels"><span>SNAPSHOT → SEGMENTS</span><span>ROW GROUP → CHUNKS → PAGE IDS</span></div>
+          <div id="storage-diagram"></div>
+          <div class="blob-heading"><span class="small-label">blobs <span class="muted">/ immutable page bytes</span></span><span id="blob-count" class="muted"></span></div>
+          <div id="blob-ledger" class="blob-ledger"></div>
+          <p class="diagram-caption">Click any page to inspect its values, statistics, and snapshot references.<br>Parquet data pages are not the same thing as SQLite’s internal database pages.</p>
+        </div>
+      </div>
+      <div class="bottom-grid">
+        <section class="panel event-panel"><span class="small-label">WHAT JUST HAPPENED</span><h3 id="event-title"></h3><p id="event-description"></p><div id="metrics" class="metrics"></div><code id="command"></code></section>
+        <section class="panel inspector"><span class="small-label">PAGE INSPECTOR</span><div id="inspector"></div></section>
+        <section class="panel table-panel"><div class="panel-heading"><span class="small-label">VISIBLE ROWS</span><span id="row-count" class="pill"></span></div><div class="table-scroll"><table id="rows"></table></div></section>
+      </div>
+    </section>
+    <section id="retrieval" class="view" hidden>
+      <div class="read-intro"><div><p class="eyebrow">NO EXPORT REQUIRED</p><h2>A real Parquet file.<br>Without a second file on disk.</h2><p class="muted">A snapshot becomes a frozen VirtualFile: an offset map over stored pages, synthesized batches, and a fresh footer.</p></div><div class="reader-controls panel"><label for="read-snapshot">Pinned snapshot</label><select id="read-snapshot"></select><label for="read-column">Projected column</label><select id="read-column"></select><button id="read-next" class="primary-button">Start read →</button><button id="read-reset" class="text-button">Reset reader</button></div></div>
+      <section class="panel read-panel"><div class="panel-heading"><span class="small-label">VIRTUAL BYTE ADDRESS SPACE</span><span class="pill">Illustrative offsets · not encoded Parquet</span></div><div id="byte-strip" class="byte-strip"></div><div id="read-steps" class="read-steps"></div><div id="read-detail" class="read-detail" aria-live="polite"></div><div id="range-map"></div></section>
+      <div class="feature-grid">
+        <article class="panel"><span class="feature-number">A</span><h3>Resolve & pin</h3><p>Resolve <code>/files/sales/latest</code> once. Keep the snapshot ID for the whole query: its Parquet URL never changes.</p></article>
+        <article class="panel"><span class="feature-number">B</span><h3>Seek, don’t export</h3><p><code>read_range(offset, len)</code> finds overlapping extents and reads just those bytes from SQLite blobs or memory. The full file is not materialized.</p></article>
+        <article class="panel"><span class="feature-number">C</span><h3>Let the reader choose</h3><p>DuckDB, Arrow, and PyArrow see standard Parquet. Column projection and page-index pruning depend on the reader; VPF doesn’t execute arbitrary SQL queries.</p></article>
+      </div>
+    </section>
+    <section id="special" class="view" hidden>
+      <div class="special-header"><p class="eyebrow">THE DESIGN TRADE-OFF</p><h2>Parquet compatibility.<br>Page-level mutability.</h2><p class="muted">Not a new query engine. A different way to store and expose a table.</p></div>
+      <div class="feature-grid">
+        <article class="panel"><span class="feature-number">01</span><h3>Copy-on-write, below the file</h3><p>Updating one value rewrites its affected column page, not every column or the entire file. Deletes rewrite affected pages across columns. Unchanged page IDs are reused.</p></article>
+        <article class="panel"><span class="feature-number">02</span><h3>History is a reference graph</h3><p>Snapshots use segment visibility bounds <code>[added_in, removed_in)</code>. Old page bytes remain readable. Rename, reorder, and drop use stable column IDs: metadata-only changes.</p></article>
+        <article class="panel"><span class="feature-number">03</span><h3>One portable storage unit</h3><p>One table per SQLite file. Page blobs and metadata commit atomically in a transaction. WAL supports several readers and one writer. Copy with no active writer, or use SQLite backup.</p></article>
+        <article class="panel"><span class="feature-number">04</span><h3>Small appends, buffered</h3><p>Compact columnar batches are immediately visible through cached, synthesized Parquet row groups. Auto mode uses direct pages at 65,536 rows or more. Flush persists buffered runs.</p></article>
+        <article class="panel"><span class="feature-number">05</span><h3>Statistics you can trust</h3><p>VPF computes page bounds from decoded values, rather than trusting imported indexes. Supported mutation predicates can skip impossible ranges; missing or unsupported statistics fall back to evaluation.</p></article>
+        <article class="panel"><span class="feature-number">06</span><h3>Ordinary readers, three paths</h3><p>Use Rust’s <code>ChunkReader</code>, HTTP byte ranges, or a read-only FUSE mount. Export a standalone Parquet file when needed. Nested columns map to one chunk per leaf.</p></article>
+      </div>
+      <section class="panel tradeoffs"><span class="small-label">WHAT YOU PAY FOR THIS</span><h3>History takes space. Compatibility sets the boundaries.</h3><p>No garbage collection or compaction: old pages remain stored. Rewritten pages use PLAIN encoding. No emitted bloom filters. UPDATE assignments take literals only; nested assignments are limited to NULL on optional columns. Predicate pruning is conservative, not a guarantee that a page contains a match.</p></section>
+    </section>
+    <footer><span>VPF / An interactive architecture guide</span><span>Browser simulation, not the Rust engine. No data leaves your browser.</span><a href="https://github.com/nnanto/vpf/blob/main/README.md">Implementation & limitations ↗</a></footer>
+  </main>
+</body>
+</html>
