@@ -189,7 +189,21 @@ store.append("t", &record_batch, AppendMode::Auto)?;
 store.update_where("t", "flag = TRUE", "id < 10")?;
 let vf = store.open_snapshot("t", None)?;   // impl parquet ChunkReader
 let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf)?.build()?;
+
+store.begin()?;                              // explicit transaction: holds the write lock
+store.delete_rows("t", base_snapshot, &[0, 5])?;
+store.append("t", &more_rows, AppendMode::Auto)?;
+store.commit()?;                             // or rollback(); others see nothing until commit
 ```
+
+## DuckDB, C API and other engines
+
+* [`vpf-ffi`](crates/vpf-ffi/include/vpf.h) is a small C API over the Arrow C data and
+  stream interfaces: open, create, scan (with row ids), append, update/delete by row id,
+  and transactions. Any engine or language with Arrow support can bind to it.
+* [`vpf-duckdb`](crates/vpf-duckdb/README.md) is a DuckDB storage extension built on it:
+  `ATTACH 't.vpf' (TYPE vpf)`, then plain SQL `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+  `CREATE TABLE [AS]` and transactions.
 
 ## HTTP and FUSE adapters
 
@@ -218,7 +232,9 @@ cargo test                                   # Rust-only checks
 python -m venv ~/.vpf-venv && ~/.vpf-venv/bin/pip install pyarrow duckdb fsspec
 VPF_PYTHON=~/.vpf-venv/bin/python cargo test # also verifies with PyArrow and DuckDB
 VPF_FUZZ_SEEDS=200 VPF_FUZZ_STEPS=1000 cargo test --release --test fuzz
-cargo test --workspace                       # core and adapter Rust checks
+cargo test --workspace                       # core, C API and adapter Rust checks
+crates/vpf-duckdb/build.sh && VPF_BIN=target/debug/vpf \
+  ~/.vpf-venv/bin/python crates/vpf-duckdb/test/test_duckdb.py   # DuckDB extension
 ```
 
 What the suites cover:

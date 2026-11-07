@@ -63,6 +63,13 @@ impl SynthCache {
         Ok(v)
     }
 
+    /// Drops all entries (batch ids of rolled-back writes can be reused).
+    pub fn clear(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.0.clear();
+        g.1.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().0.len()
     }

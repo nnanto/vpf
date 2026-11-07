@@ -2,10 +2,13 @@
 //! snapshot history and immutable page bytes.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use parking_lot::ReentrantMutex;
+
 use parquet::basic::Compression;
-use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::meta::{self, SegmentKind, codec_to_code};
@@ -50,21 +53,21 @@ fn read_blob_at(conn: &Connection, buf: &mut [u8], offset: u64) -> Result<()> {
     Ok(())
 }
 
-/// Reads committed page bytes through a pool of read-only connections, so pinned
-/// snapshots can be read concurrently without the store's write connection.
+/// The store's single read-write connection. Reentrant, so code running inside a write
+/// can read page bytes (written or not yet committed) on the same thread.
+type Writer = Arc<ReentrantMutex<Connection>>;
+
+/// Reads page bytes. Committed pages are read through a pool of read-only connections, so
+/// pinned snapshots can be read concurrently; while an explicit transaction is open, reads
+/// go through the writer so they also see the transaction's uncommitted pages.
 pub struct BlobStore {
     path: PathBuf,
     pool: Mutex<Vec<Connection>>,
+    writer: Writer,
+    in_txn: AtomicBool,
 }
 
 impl BlobStore {
-    fn new(path: &Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            pool: Mutex::new(Vec::new()),
-        }
-    }
-
     fn reader(&self) -> Result<Connection> {
         if let Some(c) = self.pool.lock().unwrap().pop() {
             return Ok(c);
@@ -80,6 +83,9 @@ impl BlobStore {
 
 impl BlobRead for BlobStore {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        if self.in_txn.load(Ordering::Acquire) {
+            return read_blob_at(&self.writer.lock(), buf, offset);
+        }
         let conn = self.reader()?;
         let out = read_blob_at(&conn, buf, offset);
         let mut pool = self.pool.lock().unwrap();
@@ -101,7 +107,7 @@ impl BlobRead for TxnBlobs<'_> {
 
 pub struct Store {
     path: PathBuf,
-    conn: Mutex<Connection>,
+    conn: Writer,
     blobs: Arc<BlobStore>,
     pub(crate) synth_cache: crate::ops::synth::SynthCache,
 }
@@ -139,10 +145,16 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(meta::SCHEMA_SQL)?;
         meta::migrate(&conn)?;
-        let blobs = Arc::new(BlobStore::new(&path));
+        let conn: Writer = Arc::new(ReentrantMutex::new(conn));
+        let blobs = Arc::new(BlobStore {
+            path: path.clone(),
+            pool: Mutex::new(Vec::new()),
+            writer: conn.clone(),
+            in_txn: AtomicBool::new(false),
+        });
         Ok(Self {
             path,
-            conn: Mutex::new(conn),
+            conn,
             blobs,
             synth_cache: Default::default(),
         })
@@ -161,23 +173,90 @@ impl Store {
         self.read(|c| Ok(meta::list_files(c)?.into_iter().next()))
     }
 
-    /// Runs `f` against a consistent read view.
+    /// Runs `f` against a consistent read view (inside an open transaction, its view).
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let out = f(&tx)?;
-        tx.finish()?;
-        Ok(out)
+        let conn = self.conn.lock();
+        if !conn.is_autocommit() {
+            return f(&conn);
+        }
+        conn.execute_batch("BEGIN DEFERRED")?;
+        let out = f(&conn);
+        conn.execute_batch("COMMIT")?;
+        out
     }
 
-    /// Runs `f` in an exclusive write transaction; page bytes and metadata commit atomically.
+    /// Runs `f` atomically: page bytes and metadata commit together, or not at all.
+    /// Inside an explicit transaction ([`Store::begin`]) the changes become part of it.
     pub fn write<T>(&self, f: impl FnOnce(&mut Txn) -> Result<T>) -> Result<T> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut txn = Txn { tx };
-        let out = f(&mut txn)?;
-        txn.tx.commit()?;
-        Ok(out)
+        let conn = self.conn.lock();
+        let nested = !conn.is_autocommit();
+        conn.execute_batch(if nested {
+            "SAVEPOINT vpf_write"
+        } else {
+            "BEGIN IMMEDIATE"
+        })?;
+        let out = f(&mut Txn { tx: &conn });
+        let end = match (&out, nested) {
+            (Ok(_), true) => "RELEASE vpf_write",
+            (Ok(_), false) => "COMMIT",
+            (Err(_), true) => "ROLLBACK TO vpf_write; RELEASE vpf_write",
+            (Err(_), false) => "ROLLBACK",
+        };
+        if out.is_err() {
+            self.synth_cache.clear();
+        }
+        if let Err(e) = conn.execute_batch(end) {
+            if out.is_ok() {
+                self.synth_cache.clear();
+                if !nested && !conn.is_autocommit() {
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
+                return Err(e.into());
+            }
+        }
+        out
+    }
+
+    /// Starts an explicit transaction: it takes the file's write lock (waiting up to 30 s
+    /// for other writers), and every following read and write sees its changes until
+    /// [`Store::commit`] or [`Store::rollback`].
+    pub fn begin(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        if !conn.is_autocommit() {
+            return Err(Error::Invalid("a transaction is already open".into()));
+        }
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.blobs.in_txn.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        if conn.is_autocommit() {
+            return Err(Error::Invalid("no transaction is open".into()));
+        }
+        let out = conn.execute_batch("COMMIT");
+        if out.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+            self.synth_cache.clear();
+        }
+        self.blobs.in_txn.store(false, Ordering::Release);
+        Ok(out?)
+    }
+
+    pub fn rollback(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        if conn.is_autocommit() {
+            return Err(Error::Invalid("no transaction is open".into()));
+        }
+        let out = conn.execute_batch("ROLLBACK");
+        self.synth_cache.clear();
+        self.blobs.in_txn.store(false, Ordering::Release);
+        Ok(out?)
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        !self.conn.lock().is_autocommit()
     }
 }
 
@@ -186,7 +265,7 @@ pub const APPLICATION_ID: i32 = 0x5650_4631;
 
 /// An open write transaction.
 pub struct Txn<'a> {
-    pub(crate) tx: rusqlite::Transaction<'a>,
+    pub(crate) tx: &'a Connection,
 }
 
 /// Metadata for a new column chunk.
@@ -200,11 +279,11 @@ pub struct NewChunk {
 
 impl<'a> Txn<'a> {
     pub fn conn(&self) -> &Connection {
-        &self.tx
+        self.tx
     }
 
     pub fn blobs(&self) -> TxnBlobs<'_> {
-        TxnBlobs(&self.tx)
+        TxnBlobs(self.tx)
     }
 
     /// Stores one physical page (header + body bytes) of a non-repeated column, where every

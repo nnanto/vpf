@@ -143,6 +143,19 @@ pub fn codec_to_code(c: Compression) -> Result<i64> {
     })
 }
 
+/// Parses a codec name: none, snappy, gzip, brotli, lz4, zstd.
+pub fn parse_codec(s: &str) -> Result<Compression> {
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "none" | "uncompressed" => Compression::UNCOMPRESSED,
+        "snappy" => Compression::SNAPPY,
+        "gzip" => Compression::GZIP(Default::default()),
+        "brotli" => Compression::BROTLI(Default::default()),
+        "lz4" | "lz4_raw" => Compression::LZ4_RAW,
+        "zstd" => Compression::ZSTD(Default::default()),
+        _ => return Err(Error::Invalid(format!("unknown codec '{s}'"))),
+    })
+}
+
 pub fn codec_from_code(c: i64) -> Result<Compression> {
     Ok(match c {
         0 => Compression::UNCOMPRESSED,

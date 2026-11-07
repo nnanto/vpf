@@ -1,0 +1,17 @@
+[package]
+name = "vpf-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "C API for VPF files over the Arrow C data and stream interfaces"
+
+[lib]
+name = "vpf_ffi"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+vpf = { path = "../.." }
+arrow = { version = "60", features = ["ffi"] }
+parquet = { version = "60", features = ["arrow"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

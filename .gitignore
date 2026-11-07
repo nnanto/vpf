@@ -1,2 +1,3 @@
 /target
 *.vpf/
+/crates/vpf-duckdb/build/

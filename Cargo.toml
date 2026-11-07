@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/vpf-http", "crates/vpf-fuse"]
+members = [".", "crates/vpf-http", "crates/vpf-fuse", "crates/vpf-ffi"]
 resolver = "3"
 
 [dependencies]
@@ -12,6 +12,7 @@ anyhow = "1.0.104"
 arrow = { version = "60", features = ["chrono-tz", "json", "prettyprint"] }
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+parking_lot = "0.12"
 parquet = { version = "60", features = ["arrow", "snap", "zstd", "lz4", "flate2", "brotli"] }
 rusqlite = { version = "0.41.1", features = ["bundled", "blob"] }
 serde = { version = "1.0.229", features = ["derive"] }
