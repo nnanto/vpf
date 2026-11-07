@@ -3,6 +3,10 @@ name = "vpf"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "crates/vpf-http", "crates/vpf-fuse"]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0.104"
 arrow = { version = "60", features = ["chrono-tz", "json", "prettyprint"] }

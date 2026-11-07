@@ -185,13 +185,33 @@ let vf = store.open_snapshot("t", None)?;   // impl parquet ChunkReader
 let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf)?.build()?;
 ```
 
+## HTTP and FUSE adapters
+
+Two separate workspace crates expose snapshots without exporting Parquet:
+
+* [`vpf-http`](crates/vpf-http/README.md) serves snapshot-specific URLs with HTTP
+  byte ranges, for DuckDB's native `httpfs` reader and other HTTP-aware readers.
+  Resolve `/files/<name>/latest` once, then query
+  `/files/<name>/snapshots/<id>.parquet` for query-wide consistency.
+* [`vpf-fuse`](crates/vpf-fuse/README.md) provides a read-only local filesystem
+  mount. Open handles pin a snapshot; later opens can see newer data.
+
+```sh
+cargo run -p vpf-http -- --store ./mystore --listen 127.0.0.1:8080
+cargo test -p vpf-http -p vpf-fuse
+```
+
+See each crate's README for DuckDB queries, mounting prerequisites and laptop
+instructions. The core `vpf` crate does not depend on either adapter.
+
 ## Tests
 
 ```
 cargo test                                   # Rust-only checks
-python -m venv ~/.vpf-venv && ~/.vpf-venv/bin/pip install pyarrow duckdb
+python -m venv ~/.vpf-venv && ~/.vpf-venv/bin/pip install pyarrow duckdb fsspec
 VPF_PYTHON=~/.vpf-venv/bin/python cargo test # also verifies with PyArrow and DuckDB
 VPF_FUZZ_SEEDS=200 VPF_FUZZ_STEPS=1000 cargo test --release --test fuzz
+cargo test --workspace                       # core and adapter Rust checks
 ```
 
 What the suites cover:
@@ -205,6 +225,11 @@ What the suites cover:
 * CLI workflows.
 * A randomized fuzz test that mixes appends, deletes, updates, schema changes and flushes,
   on a schema with flat and nested columns.
+* DuckDB reads frozen and current snapshots directly through a test-only `fsspec`
+  filesystem adapter, whose random-access reads call `VirtualFile::read_range`. No Parquet
+  export or filesystem mount is involved. Run it alone with
+  `VPF_PYTHON=~/.vpf-venv/bin/python cargo test --test duckdb_direct -- --nocapture`.
+  This adapter is for testing, not a production filesystem integration.
 
 ## Benchmarks
 

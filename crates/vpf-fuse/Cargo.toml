@@ -1,0 +1,20 @@
+[package]
+name = "vpf-fuse"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only FUSE mount for VPF stores"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+vpf = { path = "../.." }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.15", default-features = false, features = ["libfuse"] }
+
+[dev-dependencies]
+arrow = "60"
+parquet = "60"
+tempfile = "3.27"
