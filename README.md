@@ -240,7 +240,24 @@ cargo bench --bench parquet_io -- write/         # only write comparisons
 cargo bench --bench parquet_io -- append_stages/ # direct-append CPU breakdown
 cargo bench --bench parquet_io -- update/        # small update vs full rewrite
 cargo bench --bench parquet_io -- --test         # correctness/smoke run, without timing
+VPF_LARGE_BENCH=1 cargo bench --bench large_mutations -- --test # 1 GiB correctness/smoke run
+VPF_LARGE_BENCH=1 cargo bench --bench large_mutations -- --noplot
 ```
+
+The separate `large_mutations` suite generates an **at least 1 GiB on-disk Snappy
+file**, using streamed 65,536-row groups and deterministic, incompressible 256-byte
+binary payloads. It compares VPF updates with full Parquet rewrites for 100 clustered
+rows in one group, one row in every group, and an unclustered bucket predicate that
+cannot prune groups. Fixture size, row count and group count are printed on startup.
+Each iteration starts from an independent copy of a checkpointed seed store; copying
+and syncing that copy are outside the timed mutation. Both updated output and time
+travel are checked by streaming comparisons, including unchanged payloads. Allow about **5 GiB of free
+temporary disk space** and several minutes; temporary files are removed automatically.
+Without `VPF_LARGE_BENCH=1`, this suite skips fixture generation even with `cargo bench`.
+These are warm-cache elapsed-time measurements, not a peak-RAM or cold-I/O benchmark.
+The byte throughput uses total fixture size for comparison; VPF does not read/rewrite
+all those bytes on selective updates. This wide-row fixture does not model billions
+of narrow rows.
 
 The Criterion harness uses 80,000 deterministic rows with 11 flat columns, nulls,
 dictionary encoding, and SNAPPY/ZSTD compression. It follows the public reader/writer

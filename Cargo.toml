@@ -26,3 +26,7 @@ tempfile = "3.27.0"
 [[bench]]
 name = "parquet_io"
 harness = false
+
+[[bench]]
+name = "large_mutations"
+harness = false

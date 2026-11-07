@@ -1,6 +1,52 @@
 # Parquet I/O benchmark results
 
-## Latest: direct Arrow append
+## Latest: 1 GiB multi-row-group mutations
+
+Recorded on **2026-11-07**, with the `large_mutations` benchmark added on top of
+`b132172`. The Snappy input is **1,074,285,061 bytes** on disk, with **3,932,160 rows
+in 60 row groups** of 65,536 rows. Columns are sorted `id`, an interleaved `bucket`
+(`id % 1024`), `name`, and a deterministic pseudo-random 256-byte binary `payload`.
+The payload is deliberately incompressible, so the target measures actual file size,
+not uncompressed Arrow size. Generation and verification stream bounded batches.
+
+```bash
+VPF_LARGE_BENCH=1 cargo bench --bench large_mutations -- --test
+VPF_LARGE_BENCH=1 cargo bench --bench large_mutations -- \
+  --noplot --save-baseline large-mutations-1gib-synced
+```
+
+All six smoke cases passed. Timing uses 10 samples, flat sampling, a 1 s warm-up and
+a 5 s measurement target; expensive cases extend collection to obtain 10 samples.
+Times below are Criterion mean estimates and 95% confidence intervals, in milliseconds.
+
+| Workload | Rows changed | Groups touched | VPF update (ms) | VPF 95% CI (ms) | Full rewrite (ms) | Rewrite 95% CI (ms) | Speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 100 clustered rows | 100 | 1 | 16.606 | 16.359-16.900 | 3227.841 | 3207.823-3246.128 | 194.4x |
+| One row per group | 60 | 60 | 293.100 | 291.355-294.923 | 3326.784 | 3293.035-3366.598 | 11.4x |
+| Unclustered `bucket = 0` | 3840 | 60 | 749.935 | 747.452-752.814 | 3215.366 | 3186.616-3247.888 | 4.3x |
+
+Both paths assign `name = 'changed'`. Clustered predicates can prune most ID pages;
+the bucket predicate cannot prune row groups because every group contains every bucket.
+VPF preserves payload chunks and all other unassigned columns by reference. Full
+rewrites decode and re-encode every column, including the binary payload.
+
+Each VPF iteration receives an independent copy of a closed, checkpointed seed store.
+**Copying and syncing the copied metadata/blob files are excluded from timing**:
+otherwise the mutation's blob sync also flushes the unrelated 1 GiB setup copy.
+The measured VPF operation includes its normal blob sync and SQLite commit; full
+rewrites include output sync. Their durability policies still differ as described below.
+Before timing each workload, streaming equality checks validate the updated snapshot,
+the original time-travel snapshot and the full-rewrite output. Row counts, touched-group
+counts and reuse of unassigned chunks are asserted.
+
+This is a warm-cache elapsed-time benchmark in a shared environment, not a cold-I/O,
+peak-RAM or terabyte-scale measurement. The 256-byte payload favors page-level
+copy-on-write over full rewrites; do not generalize these speedups to narrow-row files.
+Throughput labels use total input file bytes, **not bytes actually processed by VPF**.
+Temporary fixtures/copies are removed automatically; allow about 5 GiB of free space.
+Without `VPF_LARGE_BENCH=1`, the separate suite skips generation.
+
+## Earlier: direct Arrow append
 
 Recorded on **2026-11-06**, with the Arrow append fast path applied on top of
 `2a10e1d4af102fd08c27dac359b88db6947b779c`. The complete 36-case run finished at
