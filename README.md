@@ -11,6 +11,21 @@ or after `vpf export`. The test suite checks the output with arrow-rs, PyArrow a
 
 ## How it works
 
+### Interactive architecture guide
+
+The dependency-free [VPF explorer](docs/index.html) walks through page-level updates,
+deletes, buffered appends, flushes, schema renames, time travel, and a projected
+byte-range read. It is an illustrative browser simulation, not a Parquet encoder or
+the Rust engine. Run `python3 -m http.server 8000 --directory docs` and open
+`http://localhost:8000` locally. Its reference model is checked with
+`node --test tests/explainer.test.mjs`.
+
+To publish at `https://nnanto.github.io/vpf/`, enable **Settings → Pages → Build and
+deployment → Source: GitHub Actions**. The Pages workflow deploys `docs/` on changes
+to `main` or a manual run; pull requests only check the model. The repository can
+remain private if the account's GitHub plan supports Pages for private repositories.
+The published guide contains only static documentation and illustrative data.
+
 ```
 sales.vpf    one SQLite database (WAL) holding one table:
   blobs        compressed Parquet pages (header + body), never modified once written
