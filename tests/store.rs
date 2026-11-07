@@ -10,7 +10,7 @@ use parquet::schema::types::SchemaDescriptor;
 use vpf::meta::{self, SegmentKind};
 use vpf::schema::{ColumnSpec, build_descriptor, spec_for_type_name};
 use vpf::stats::StoredStats;
-use vpf::store::{NewChunk, Store};
+use vpf::store::{BlobRead, NewChunk, Store};
 use vpf::thrift::parse_page_header;
 
 const MSG: &str = "
@@ -52,8 +52,11 @@ fn schema_roundtrips_through_sqlite() {
     assert_eq!(rebuilt.root_schema(), descr.root_schema());
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let kv = vec![parquet::file::metadata::KeyValue::new("k".into(), "v".to_string())];
+    let store = Store::open(dir.path().join("t.vpf")).unwrap();
+    let kv = vec![parquet::file::metadata::KeyValue::new(
+        "k".into(),
+        "v".to_string(),
+    )];
     let svid = store
         .write(|t| {
             let f = t.create_file("x", Compression::SNAPPY, Some("test"), 1)?;
@@ -62,8 +65,14 @@ fn schema_roundtrips_through_sqlite() {
         .unwrap();
     let loaded = store.read(|c| meta::load_schema(c, svid)).unwrap();
     assert_eq!(loaded.columns, specs);
-    assert_eq!(loaded.key_value.as_ref().unwrap()[0].value.as_deref(), Some("v"));
-    assert_eq!(loaded.descriptor().unwrap().root_schema(), descr.root_schema());
+    assert_eq!(
+        loaded.key_value.as_ref().unwrap()[0].value.as_deref(),
+        Some("v")
+    );
+    assert_eq!(
+        loaded.descriptor().unwrap().root_schema(),
+        descr.root_schema()
+    );
 }
 
 const NESTED: &str = "message spark_schema {
@@ -86,12 +95,16 @@ fn nested_schemas_roundtrip_through_sqlite() {
         .map(|(i, f)| ColumnSpec::from_parquet_type(i as i64 + 1, f).unwrap())
         .collect();
     assert_eq!(specs.iter().filter(|s| s.is_nested()).count(), 5);
-    assert!(specs[4].top_level_nullable() && specs[3].top_level_nullable() && !specs[2].top_level_nullable());
+    assert!(
+        specs[4].top_level_nullable()
+            && specs[3].top_level_nullable()
+            && !specs[2].top_level_nullable()
+    );
     let rebuilt = build_descriptor("spark_schema", &specs).unwrap();
     assert_eq!(rebuilt.root_schema(), descr.root_schema());
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open(dir.path().join("t.vpf")).unwrap();
     let svid = store
         .write(|t| {
             let f = t.create_file("x", Compression::SNAPPY, None, 1)?;
@@ -100,13 +113,21 @@ fn nested_schemas_roundtrip_through_sqlite() {
         .unwrap();
     let loaded = store.read(|c| meta::load_schema(c, svid)).unwrap();
     assert_eq!(loaded.columns, specs);
-    assert_eq!(loaded.descriptor().unwrap().root_schema(), descr.root_schema());
+    assert_eq!(
+        loaded.descriptor().unwrap().root_schema(),
+        descr.root_schema()
+    );
 
     let leaves = loaded.leaves().unwrap();
     assert_eq!(leaves.len(), descr.num_columns());
     for (i, l) in leaves.iter().enumerate() {
         let c = descr.column(i);
-        assert_eq!((l.max_def, l.max_rep), (c.max_def_level(), c.max_rep_level()), "{}", l.spec.name);
+        assert_eq!(
+            (l.max_def, l.max_rep),
+            (c.max_def_level(), c.max_rep_level()),
+            "{}",
+            l.spec.name
+        );
         assert_eq!(l.physical(), c.physical_type());
         assert_eq!(l.field, descr.get_column_root_idx(i));
         assert_eq!(l.spec.name, c.path().string());
@@ -114,11 +135,27 @@ fn nested_schemas_roundtrip_through_sqlite() {
         let d = l.descriptor().unwrap();
         assert_eq!(d.num_columns(), 1);
         let lc = d.column(0);
-        assert_eq!((lc.max_def_level(), lc.max_rep_level(), lc.physical_type()), (c.max_def_level(), c.max_rep_level(), c.physical_type()));
+        assert_eq!(
+            (lc.max_def_level(), lc.max_rep_level(), lc.physical_type()),
+            (c.max_def_level(), c.max_rep_level(), c.physical_type())
+        );
         assert_eq!(lc.type_length(), c.type_length());
     }
     let keys: Vec<(i64, i64)> = leaves.iter().map(|l| (l.column_id, l.leaf)).collect();
-    assert_eq!(keys, vec![(1, 0), (1, 1), (1, 2), (2, 0), (3, 0), (3, 1), (4, 0), (5, 0), (6, 0)]);
+    assert_eq!(
+        keys,
+        vec![
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 0),
+            (3, 0),
+            (3, 1),
+            (4, 0),
+            (5, 0),
+            (6, 0)
+        ]
+    );
 
     // Renaming / making optional rebuilds the type tree.
     let mut s0 = specs[0].clone();
@@ -126,20 +163,42 @@ fn nested_schemas_roundtrip_through_sqlite() {
     s0.nullable = false;
     let t = s0.to_parquet_type().unwrap();
     assert_eq!(t.name(), "renamed");
-    assert_eq!(t.get_basic_info().repetition(), parquet::basic::Repetition::REQUIRED);
+    assert_eq!(
+        t.get_basic_info().repetition(),
+        parquet::basic::Repetition::REQUIRED
+    );
     assert_eq!(t.get_fields().len(), 3);
 }
 
 #[test]
 fn unsupported_nested_types_are_rejected() {
-    let empty = Arc::new(parquet::schema::types::Type::group_type_builder("g").with_repetition(parquet::basic::Repetition::OPTIONAL).build().unwrap());
+    let empty = Arc::new(
+        parquet::schema::types::Type::group_type_builder("g")
+            .with_repetition(parquet::basic::Repetition::OPTIONAL)
+            .build()
+            .unwrap(),
+    );
     assert!(ColumnSpec::from_parquet_type(1, &empty).is_err());
 }
 
 #[test]
 fn type_names_build_valid_columns() {
-    for t in ["bool", "int32", "int64", "float", "double", "string", "binary", "date",
-              "timestamp_ms", "timestamp", "timestamp_ns", "decimal(10,2)", "decimal(38,0)", "decimal(1,1)"] {
+    for t in [
+        "bool",
+        "int32",
+        "int64",
+        "float",
+        "double",
+        "string",
+        "binary",
+        "date",
+        "timestamp_ms",
+        "timestamp",
+        "timestamp_ns",
+        "decimal(10,2)",
+        "decimal(38,0)",
+        "decimal(1,1)",
+    ] {
         let s = spec_for_type_name(1, "c", t, true).unwrap();
         build_descriptor("r", &[s]).unwrap();
     }
@@ -149,16 +208,29 @@ fn type_names_build_valid_columns() {
 
 #[test]
 fn statistics_roundtrip_all_types() {
-    let bytes = write_parquet(&[sample_batch(0, 3000)], props(Compression::SNAPPY, false, true, 500, 3000));
-    let md = ParquetMetaDataReader::new().parse_and_finish(&bytes).unwrap();
+    let bytes = write_parquet(
+        &[sample_batch(0, 3000)],
+        props(Compression::SNAPPY, false, true, 500, 3000),
+    );
+    let md = ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes)
+        .unwrap();
     let mut n = 0;
     for col in md.row_group(0).columns() {
         let s = col.statistics().expect("stats");
         let stored = StoredStats::from_parquet(s);
         let json = serde_json::to_string(&stored).unwrap();
         let back: StoredStats = serde_json::from_str(&json).unwrap();
-        assert_eq!(&back.to_parquet(col.column_type()).unwrap(), s, "{}", col.column_path());
-        let relaxed = back.after_row_removal().to_parquet(col.column_type()).unwrap();
+        assert_eq!(
+            &back.to_parquet(col.column_type()).unwrap(),
+            s,
+            "{}",
+            col.column_path()
+        );
+        let relaxed = back
+            .after_row_removal()
+            .to_parquet(col.column_type())
+            .unwrap();
         assert_eq!(relaxed.null_count_opt(), None);
         assert!(!relaxed.min_is_exact() && !relaxed.max_is_exact());
         assert_eq!(relaxed.min_bytes_opt(), s.min_bytes_opt());
@@ -170,9 +242,14 @@ fn statistics_roundtrip_all_types() {
 #[test]
 fn write_txn_is_atomic_and_blobs_are_stable() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let bytes = write_parquet(&[sample_batch(0, 100)], props(Compression::UNCOMPRESSED, false, false, 100, 100));
-    let md = ParquetMetaDataReader::new().parse_and_finish(&bytes).unwrap();
+    let store = Store::open(dir.path().join("t.vpf")).unwrap();
+    let bytes = write_parquet(
+        &[sample_batch(0, 100)],
+        props(Compression::UNCOMPRESSED, false, false, 100, 100),
+    );
+    let md = ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes)
+        .unwrap();
     let (start, _) = md.row_group(0).column(0).byte_range();
     let h = parse_page_header(&bytes[start as usize..]).unwrap();
     let page = bytes[start as usize..start as usize + h.total_len()].to_vec();
@@ -191,7 +268,12 @@ fn write_txn_is_atomic_and_blobs_are_stable() {
             let fid = t.create_file("f", Compression::SNAPPY, None, 1)?;
             let page_id = t.put_page(&page, &h)?;
             let chunk_id = t.put_chunk(
-                &NewChunk { physical: parquet::basic::Type::INT64, codec: Compression::UNCOMPRESSED, encodings: vec![], stats: None },
+                &NewChunk {
+                    physical: parquet::basic::Type::INT64,
+                    codec: Compression::UNCOMPRESSED,
+                    encodings: vec![],
+                    stats: None,
+                },
                 &[page_id],
             )?;
             let rg = t.put_row_group(100, &[((1, 0), chunk_id)])?;
@@ -205,10 +287,19 @@ fn write_txn_is_atomic_and_blobs_are_stable() {
     assert_eq!(chunk.pages[0].page_id, page_id);
     assert_eq!(chunk.num_values, 100);
     assert_eq!(chunk.pages[0].num_rows, 100);
-    let got = store.blobs().read(chunk.pages[0].blob_offset, chunk.pages[0].blob_len).unwrap();
+    let got = store
+        .blobs()
+        .read(chunk.pages[0].blob_offset, chunk.pages[0].blob_len)
+        .unwrap();
     assert_eq!(got, page);
-    // The aborted transaction's bytes precede the committed blob and are never referenced.
-    assert_eq!(chunk.pages[0].blob_offset, page.len() as u64);
+    // The aborted transaction's page bytes were rolled back with its metadata.
+    assert_eq!(chunk.pages[0].blob_offset, 0);
+    assert_eq!(
+        store
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get::<_, i64>(0))?))
+            .unwrap(),
+        1
+    );
 
     // Replace + append segments in a second snapshot; visibility is per-snapshot.
     let s2 = store
@@ -232,9 +323,21 @@ fn write_txn_is_atomic_and_blobs_are_stable() {
     assert_ne!(v2[0].obj_id, rg_id);
     assert_eq!(v2[1].kind, SegmentKind::Batch);
     let snaps = store.read(|c| meta::list_snapshots(c, fid)).unwrap();
-    assert_eq!(snaps.iter().map(|s| (s.num_rows, s.parent_id)).collect::<Vec<_>>(), vec![(100, None), (105, Some(s1))]);
+    assert_eq!(
+        snaps
+            .iter()
+            .map(|s| (s.num_rows, s.parent_id))
+            .collect::<Vec<_>>(),
+        vec![(100, None), (105, Some(s1))]
+    );
     drop(store);
     // Reopen: persisted.
-    let store = Store::open(dir.path()).unwrap();
-    assert_eq!(store.read(|c| meta::load_file(c, "f")).unwrap().current_snapshot_id, Some(s2));
+    let store = Store::open(dir.path().join("t.vpf")).unwrap();
+    assert_eq!(
+        store
+            .read(|c| meta::load_file(c, "f"))
+            .unwrap()
+            .current_snapshot_id,
+        Some(s2)
+    );
 }

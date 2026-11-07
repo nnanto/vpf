@@ -1,15 +1,16 @@
 //! VPF: mutable virtual Parquet files.
 //!
-//! Physical Parquet pages are stored immutably in an append-only blob file and referenced
-//! from SQLite metadata. Every committed snapshot is exposed as a byte-exact, valid Parquet
+//! A `.vpf` file is a SQLite database holding one table: immutable Parquet pages plus the
+//! metadata and snapshot history that reference them. Every committed snapshot is exposed as a byte-exact, valid Parquet
 //! file assembled on the fly (virtual offsets + regenerated footer).
 
+pub mod catalog;
 pub mod codec;
 pub mod convert;
 pub mod error;
 pub mod layout;
-pub mod ops;
 pub mod meta;
+pub mod ops;
 pub mod predicate;
 pub mod schema;
 pub mod stats;

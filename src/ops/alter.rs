@@ -34,13 +34,22 @@ use crate::values::{ColumnData, decode_value, encode_value};
 pub enum AlterOp {
     /// Adds a column at the end. `spec.column_id` and `spec.default_value` are ignored;
     /// existing rows get `default` (NULL if `None`; required columns need a default).
-    AddColumn { spec: ColumnSpec, default: Option<Literal> },
+    AddColumn {
+        spec: ColumnSpec,
+        default: Option<Literal>,
+    },
     DropColumn(String),
-    RenameColumn { from: String, to: String },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
     /// New column order; must be a permutation of all column names.
     Reorder(Vec<String>),
     /// Lossless widening: INT32 -> INT64 or FLOAT -> DOUBLE.
-    Widen { column: String, to: PhysicalType },
+    Widen {
+        column: String,
+        to: PhysicalType,
+    },
     /// REQUIRED -> OPTIONAL.
     MakeOptional(String),
 }
@@ -68,7 +77,9 @@ impl Store {
             let mut cols = old.columns.clone();
             let mut fields: Vec<FieldRef> = arrow_schema(old)?.fields().iter().cloned().collect();
             let idx = |cols: &[ColumnSpec], n: &str| {
-                cols.iter().position(|c| c.name == n).ok_or_else(|| Error::NotFound(format!("column '{n}'")))
+                cols.iter()
+                    .position(|c| c.name == n)
+                    .ok_or_else(|| Error::NotFound(format!("column '{n}'")))
             };
             let (rewrite, desc) = match &op {
                 AlterOp::AddColumn { spec, default } => {
@@ -76,12 +87,22 @@ impl Store {
                         return Err(Error::Invalid("empty column name".into()));
                     }
                     if cols.iter().any(|c| c.name == spec.name) {
-                        return Err(Error::Invalid(format!("column '{}' already exists", spec.name)));
+                        return Err(Error::Invalid(format!(
+                            "column '{}' already exists",
+                            spec.name
+                        )));
                     }
-                    let mut spec = ColumnSpec { column_id: 0, default_value: None, ..spec.clone() };
+                    let mut spec = ColumnSpec {
+                        column_id: 0,
+                        default_value: None,
+                        ..spec.clone()
+                    };
                     if spec.is_nested() {
                         if default.as_ref().is_some_and(|l| *l != Literal::Null) {
-                            return Err(Error::Unsupported(format!("default value for nested column '{}'", spec.name)));
+                            return Err(Error::Unsupported(format!(
+                                "default value for nested column '{}'",
+                                spec.name
+                            )));
                         }
                         if !spec.top_level_nullable() {
                             return Err(Error::Invalid(format!(
@@ -90,16 +111,22 @@ impl Store {
                             )));
                         }
                     }
-                    let field = parquet_to_arrow_schema(build_descriptor("s", std::slice::from_ref(&spec))?.as_ref(), None)?
-                        .field(0)
-                        .clone();
+                    let field = parquet_to_arrow_schema(
+                        build_descriptor("s", std::slice::from_ref(&spec))?.as_ref(),
+                        None,
+                    )?
+                    .field(0)
+                    .clone();
                     if let Some(lit) = default.as_ref().filter(|l| **l != Literal::Null) {
                         let arr = literal_array(lit, field.data_type())?;
                         let data = array_to_column(&spec, field.data_type(), &arr)?;
                         spec.default_value = Some(encode_value(&data.values)?);
                     }
                     if !spec.top_level_nullable() && spec.default_value.is_none() {
-                        return Err(Error::Invalid(format!("required column '{}' needs a default", spec.name)));
+                        return Err(Error::Invalid(format!(
+                            "required column '{}' needs a default",
+                            spec.name
+                        )));
                     }
                     spec.column_id = t.alloc_column_ids(file_id, 1)?;
                     let desc = format!("add column {}", spec.name);
@@ -134,17 +161,24 @@ impl Store {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     if perm.len() != cols.len() {
-                        return Err(Error::Invalid("reorder must list every column exactly once".into()));
+                        return Err(Error::Invalid(
+                            "reorder must list every column exactly once".into(),
+                        ));
                     }
                     cols = perm.iter().map(|&i| cols[i].clone()).collect();
                     fields = perm.iter().map(|&i| fields[i].clone()).collect();
-                    (Rewrite::None, format!("reorder columns {}", order.join(", ")))
+                    (
+                        Rewrite::None,
+                        format!("reorder columns {}", order.join(", ")),
+                    )
                 }
                 AlterOp::Widen { column, to } => {
                     let i = idx(&cols, column)?;
                     let c = &mut cols[i];
                     if c.is_nested() {
-                        return Err(Error::Unsupported(format!("widening nested column '{column}'")));
+                        return Err(Error::Unsupported(format!(
+                            "widening nested column '{column}'"
+                        )));
                     }
                     let new_ty = widen_spec(c, *to)?;
                     fields[i] = Arc::new(fields[i].as_ref().clone().with_data_type(new_ty));
@@ -171,14 +205,25 @@ impl Store {
             )?;
             let schema = meta::load_schema(t.conn(), svid)?;
             let sid = t.new_snapshot(file_id, svid, "alter", Some(&desc))?;
-            let mut summary =
-                AlterSummary { snapshot_id: sid, schema_version_id: svid, row_groups_rewritten: 0, chunks_written: 0 };
+            let mut summary = AlterSummary {
+                snapshot_id: sid,
+                schema_version_id: svid,
+                row_groups_rewritten: 0,
+                chunks_written: 0,
+            };
             let codec = write_codec(&view.file);
             let leaves = schema.leaves()?;
             let old_leaves = old.leaves()?;
             let mut shared: HashMap<(i64, i64), i64> = HashMap::new();
             for seg in &view.segments {
-                let SegmentData::RowGroup { seg: seg_row, rg, chunks } = seg else { continue };
+                let SegmentData::RowGroup {
+                    seg: seg_row,
+                    rg,
+                    chunks,
+                } = seg
+                else {
+                    continue;
+                };
                 let field = match rewrite {
                     Rewrite::None => continue,
                     Rewrite::Add(i) | Rewrite::Recode(i) => i,
@@ -193,10 +238,24 @@ impl Store {
                             None => {
                                 let n = rg.num_rows as usize;
                                 let data = if spec.is_nested() {
-                                    ColumnData::nulls(leaf.physical(), leaf.max_def, leaf.max_rep, n)?
+                                    ColumnData::nulls(
+                                        leaf.physical(),
+                                        leaf.max_def,
+                                        leaf.max_rep,
+                                        n,
+                                    )?
                                 } else {
-                                    let default = spec.default_value.as_deref().map(decode_value).transpose()?;
-                                    ColumnData::repeat(spec.physical, spec.nullable, default.as_ref(), n)?
+                                    let default = spec
+                                        .default_value
+                                        .as_deref()
+                                        .map(decode_value)
+                                        .transpose()?;
+                                    ColumnData::repeat(
+                                        spec.physical,
+                                        spec.nullable,
+                                        default.as_ref(),
+                                        n,
+                                    )?
                                 };
                                 let enc = encode_column(leaf, codec, &data, true)?;
                                 let id = store_chunk(t, leaf, &enc)?;
@@ -211,10 +270,21 @@ impl Store {
                                 .position(|l| (l.column_id, l.leaf) == key)
                                 .ok_or_else(|| Error::Corrupt(format!("missing leaf {key:?}")))?;
                             let chunk = &chunks[old_i];
-                            let raw =
-                                chunk.pages.iter().map(|p| RawPage::load(t.blobs(), p)).collect::<Result<Vec<_>>>()?;
-                            let data = conform_leaf(decode_pages(&old_leaves[old_i], chunk.codec, &raw)?, leaf, spec.is_nested())?;
-                            let c = if chunk.codec == Compression::LZO { codec } else { chunk.codec };
+                            let raw = chunk
+                                .pages
+                                .iter()
+                                .map(|p| RawPage::load(&t.blobs(), p))
+                                .collect::<Result<Vec<_>>>()?;
+                            let data = conform_leaf(
+                                decode_pages(&old_leaves[old_i], chunk.codec, &raw)?,
+                                leaf,
+                                spec.is_nested(),
+                            )?;
+                            let c = if chunk.codec == Compression::LZO {
+                                codec
+                            } else {
+                                chunk.codec
+                            };
                             let enc = encode_column(leaf, c, &data, true)?;
                             summary.chunks_written += 1;
                             store_chunk(t, leaf, &enc)?
@@ -230,7 +300,12 @@ impl Store {
                             .get(&key)
                             .or_else(|| rg.chunks.get(&key))
                             .map(|id| (key, *id))
-                            .ok_or_else(|| Error::Corrupt(format!("row group {} lacks column {}", rg.rg_id, l.spec.name)))
+                            .ok_or_else(|| {
+                                Error::Corrupt(format!(
+                                    "row group {} lacks column {}",
+                                    rg.rg_id, l.spec.name
+                                ))
+                            })
                     })
                     .collect::<Result<_>>()?;
                 let new_rg = t.put_row_group(rg.num_rows, &ids)?;
@@ -245,22 +320,33 @@ impl Store {
 
 /// Applies a lossless widening to a column spec; returns the Arrow type readers will see.
 fn widen_spec(c: &mut ColumnSpec, to: PhysicalType) -> Result<DataType> {
-    let bad = || Error::Unsupported(format!("widening column '{}' from {} to {to}", c.name, c.physical));
+    let bad = || {
+        Error::Unsupported(format!(
+            "widening column '{}' from {} to {to}",
+            c.name, c.physical
+        ))
+    };
     let ty = match (c.physical, to) {
         (PhysicalType::INT32, PhysicalType::INT64) => {
             match &c.logical {
                 None => {}
-                Some(LogicalType::Integer(i)) if i.is_signed => c.logical = Some(LogicalType::integer(64, true)),
+                Some(LogicalType::Integer(i)) if i.is_signed => {
+                    c.logical = Some(LogicalType::integer(64, true))
+                }
                 _ => return Err(bad()),
             }
             c.converted = match c.converted {
                 ConvertedType::NONE => ConvertedType::NONE,
-                ConvertedType::INT_8 | ConvertedType::INT_16 | ConvertedType::INT_32 => ConvertedType::INT_64,
+                ConvertedType::INT_8 | ConvertedType::INT_16 | ConvertedType::INT_32 => {
+                    ConvertedType::INT_64
+                }
                 _ => return Err(bad()),
             };
             DataType::Int64
         }
-        (PhysicalType::FLOAT, PhysicalType::DOUBLE) if c.logical.is_none() && c.converted == ConvertedType::NONE => {
+        (PhysicalType::FLOAT, PhysicalType::DOUBLE)
+            if c.logical.is_none() && c.converted == ConvertedType::NONE =>
+        {
             DataType::Float64
         }
         _ => return Err(bad()),

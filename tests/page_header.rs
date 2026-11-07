@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
-use vpf::thrift::{split_pages, PageKind};
+use vpf::thrift::{PageKind, split_pages};
 
 #[test]
 fn split_pages_matches_offset_index_across_writers() {
@@ -23,7 +23,8 @@ fn split_pages_matches_offset_index_across_writers() {
                         let chunk = &bytes[start as usize..(start + len) as usize];
                         let pages = split_pages(chunk).unwrap();
                         let locs = pidx.page_locations(ci).unwrap();
-                        let data: Vec<_> = pages.iter().filter(|p| p.header.kind.is_data()).collect();
+                        let data: Vec<_> =
+                            pages.iter().filter(|p| p.header.kind.is_data()).collect();
                         assert_eq!(data.len(), locs.len(), "codec={codec} v2={v2} dict={dict}");
                         let mut first_row = 0i64;
                         for (p, loc) in data.iter().zip(locs) {
@@ -40,7 +41,10 @@ fn split_pages_matches_offset_index_across_writers() {
                             first_row += rows;
                         }
                         assert_eq!(first_row, rg.num_rows());
-                        let dict_pages = pages.iter().filter(|p| p.header.kind == PageKind::Dictionary).count();
+                        let dict_pages = pages
+                            .iter()
+                            .filter(|p| p.header.kind == PageKind::Dictionary)
+                            .count();
                         assert_eq!(dict_pages, col.dictionary_page_offset().is_some() as usize);
                         let total: usize = pages.iter().map(|p| p.header.total_len()).sum();
                         assert_eq!(total as i64, col.compressed_size());
@@ -55,8 +59,13 @@ fn split_pages_matches_offset_index_across_writers() {
 
 #[test]
 fn corrupt_headers_are_rejected_not_panicking() {
-    let bytes = write_parquet(&[sample_batch(0, 100)], props(parquet::basic::Compression::SNAPPY, false, true, 50, 100));
-    let md = ParquetMetaDataReader::new().parse_and_finish(&bytes).unwrap();
+    let bytes = write_parquet(
+        &[sample_batch(0, 100)],
+        props(parquet::basic::Compression::SNAPPY, false, true, 50, 100),
+    );
+    let md = ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes)
+        .unwrap();
     let (start, len) = md.row_group(0).column(2).byte_range();
     let chunk = bytes[start as usize..(start + len) as usize].to_vec();
     for cut in 0..chunk.len().min(64) {
@@ -68,7 +77,9 @@ fn corrupt_headers_are_rejected_not_panicking() {
         let n = (seed % 40) as usize;
         let buf: Vec<u8> = (0..n)
             .map(|_| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (seed >> 33) as u8
             })
             .collect();

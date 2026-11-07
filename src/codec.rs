@@ -14,11 +14,11 @@ use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::file::writer::SerializedFileWriter;
 
 use crate::error::{Error, Result};
-use crate::meta::PageRow;
-use crate::store::BlobStore;
 use crate::layout::{ByteSource, ChunkLayout, FileProps, PageSrc, RowGroupLayout, VirtualFile};
+use crate::meta::PageRow;
 use crate::schema::Leaf;
 use crate::stats::{PageStats, StatType, StoredStats};
+use crate::store::BlobRead;
 use crate::thrift::{PageHeaderInfo, PageKind, split_pages};
 use crate::values::{ColumnData, Values};
 
@@ -32,7 +32,7 @@ pub struct RawPage {
 }
 
 impl RawPage {
-    pub fn load(blobs: &BlobStore, p: &PageRow) -> Result<Self> {
+    pub fn load(blobs: &dyn BlobRead, p: &PageRow) -> Result<Self> {
         Ok(Self {
             bytes: Bytes::from(blobs.read(p.blob_offset, p.blob_len)?),
             kind: p.kind,
@@ -86,14 +86,26 @@ impl EncodedChunk {
                 .collect(),
             codec: self.codec,
             encodings: self.encodings.clone(),
-            stats: self.stats.as_ref().map(|s| s.to_parquet(physical)).transpose()?,
+            stats: self
+                .stats
+                .as_ref()
+                .map(|s| s.to_parquet(physical))
+                .transpose()?,
             num_values: self.num_values,
         })
     }
 }
 
-fn single_leaf_file(leaf: &Leaf, codec: Compression, pages: &[RawPage]) -> Result<Option<VirtualFile>> {
-    let num_values: i64 = pages.iter().filter(|p| p.kind.is_data()).map(|p| p.num_values).sum();
+fn single_leaf_file(
+    leaf: &Leaf,
+    codec: Compression,
+    pages: &[RawPage],
+) -> Result<Option<VirtualFile>> {
+    let num_values: i64 = pages
+        .iter()
+        .filter(|p| p.kind.is_data())
+        .map(|p| p.num_values)
+        .sum();
     if num_values == 0 {
         return Ok(None);
     }
@@ -117,8 +129,17 @@ fn single_leaf_file(leaf: &Leaf, codec: Compression, pages: &[RawPage]) -> Resul
     };
     // The row count only feeds the synthetic footer; reading stops when the pages run out.
     Ok(Some(VirtualFile::build(
-        FileProps { schema: leaf.descriptor()?, created_by: None, key_value: None, version: 1, blobs: None },
-        vec![RowGroupLayout { num_rows: num_values, chunks: vec![chunk] }],
+        FileProps {
+            schema: leaf.descriptor()?,
+            created_by: None,
+            key_value: None,
+            version: 1,
+            blobs: None,
+        },
+        vec![RowGroupLayout {
+            num_rows: num_values,
+            chunks: vec![chunk],
+        }],
     )?))
 }
 
@@ -126,15 +147,25 @@ fn single_leaf_file(leaf: &Leaf, codec: Compression, pages: &[RawPage]) -> Resul
 /// dictionary page), including definition and repetition levels.
 pub fn decode_pages(leaf: &Leaf, codec: Compression, pages: &[RawPage]) -> Result<ColumnData> {
     let Some(vf) = single_leaf_file(leaf, codec, pages)? else {
-        return Ok(ColumnData::empty_leaf(leaf.physical(), leaf.max_def, leaf.max_rep));
+        return Ok(ColumnData::empty_leaf(
+            leaf.physical(),
+            leaf.max_def,
+            leaf.max_rep,
+        ));
     };
     let reader = SerializedFileReader::new(vf)?;
     let col = reader.get_row_group(0)?.get_column_reader(0)?;
     let out = read_leaf(col, leaf.physical(), leaf.max_def, leaf.max_rep, None)?;
-    let levels: i64 = pages.iter().filter(|p| p.kind.is_data()).map(|p| p.num_values).sum();
+    let levels: i64 = pages
+        .iter()
+        .filter(|p| p.kind.is_data())
+        .map(|p| p.num_values)
+        .sum();
     let got = out.defs.as_ref().map_or(out.values.len(), Vec::len) as i64;
     if got != levels {
-        return Err(Error::Corrupt(format!("decoded {got} levels, pages declare {levels}")));
+        return Err(Error::Corrupt(format!(
+            "decoded {got} levels, pages declare {levels}"
+        )));
     }
     Ok(out)
 }
@@ -142,12 +173,24 @@ pub fn decode_pages(leaf: &Leaf, codec: Compression, pages: &[RawPage]) -> Resul
 /// Rows held by each page of a chunk (0 for dictionary pages), or `None` if some data page
 /// does not start at a row boundary (possible for repeated columns in V1 pages written by
 /// other tools), in which case the pages cannot be addressed individually.
-pub fn chunk_page_rows(leaf: &Leaf, codec: Compression, pages: &[RawPage]) -> Result<Option<Vec<i64>>> {
+pub fn chunk_page_rows(
+    leaf: &Leaf,
+    codec: Compression,
+    pages: &[RawPage],
+) -> Result<Option<Vec<i64>>> {
     if leaf.max_rep == 0 {
-        return Ok(Some(pages.iter().map(|p| if p.kind.is_data() { p.num_values } else { 0 }).collect()));
+        return Ok(Some(
+            pages
+                .iter()
+                .map(|p| if p.kind.is_data() { p.num_values } else { 0 })
+                .collect(),
+        ));
     }
     let data = decode_pages(leaf, codec, pages)?;
-    Ok(rows_per_page(data.reps.as_deref().unwrap_or(&[]), pages.iter().map(|p| (p.kind.is_data(), p.num_values))))
+    Ok(rows_per_page(
+        data.reps.as_deref().unwrap_or(&[]),
+        pages.iter().map(|p| (p.kind.is_data(), p.num_values)),
+    ))
 }
 
 fn rows_per_page(reps: &[i16], pages: impl Iterator<Item = (bool, i64)>) -> Option<Vec<i64>> {
@@ -192,7 +235,8 @@ pub fn read_leaf(
                 Some(w) => w - got,
                 None => step.min(1 << 20),
             };
-            let (recs, _, _) = r.read_records(ask, defs.as_deref_mut(), reps.as_deref_mut(), values)?;
+            let (recs, _, _) =
+                r.read_records(ask, defs.as_deref_mut(), reps.as_deref_mut(), values)?;
             if recs == 0 {
                 break;
             }
@@ -219,7 +263,9 @@ pub fn read_leaf(
         (ColumnReader::FloatColumnReader(c), Values::F32(v)) => drain(c, want, d, r, v)?,
         (ColumnReader::DoubleColumnReader(c), Values::F64(v)) => drain(c, want, d, r, v)?,
         (ColumnReader::ByteArrayColumnReader(c), Values::Bytes(v)) => drain(c, want, d, r, v)?,
-        (ColumnReader::FixedLenByteArrayColumnReader(c), Values::Fixed(v)) => drain(c, want, d, r, v)?,
+        (ColumnReader::FixedLenByteArrayColumnReader(c), Values::Fixed(v)) => {
+            drain(c, want, d, r, v)?
+        }
         _ => return Err(Error::Corrupt("column reader type mismatch".into())),
     }
     if max_def > 0 {
@@ -233,7 +279,12 @@ pub fn read_leaf(
 }
 
 /// Reads exactly `want` rows of a flat column into physical values.
-pub fn read_column(col: ColumnReader, physical: PhysicalType, nullable: bool, want: usize) -> Result<ColumnData> {
+pub fn read_column(
+    col: ColumnReader,
+    physical: PhysicalType,
+    nullable: bool,
+    want: usize,
+) -> Result<ColumnData> {
     read_leaf(col, physical, nullable as i16, 0, Some(want))
 }
 
@@ -242,7 +293,12 @@ pub const DATA_PAGE_SIZE: usize = 1024 * 1024;
 pub const DATA_PAGE_ROWS: usize = 20_000;
 
 /// Encodes values as a single column chunk (V1 data pages, optional dictionary).
-pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, dictionary: bool) -> Result<EncodedChunk> {
+pub fn encode_column(
+    leaf: &Leaf,
+    codec: Compression,
+    data: &ColumnData,
+    dictionary: bool,
+) -> Result<EncodedChunk> {
     let spec = &leaf.spec;
     if data.num_rows() == 0 {
         return Err(Error::Invalid("cannot encode an empty column chunk".into()));
@@ -251,13 +307,19 @@ pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, diction
         || data.reps.is_some() != (leaf.max_rep > 0)
         || data.values.physical() != spec.physical
     {
-        return Err(Error::Invalid(format!("data does not match column '{}' type", spec.name)));
+        return Err(Error::Invalid(format!(
+            "data does not match column '{}' type",
+            spec.name
+        )));
     }
     data.validate()?;
     if let Some(r) = &data.reps
         && r.iter().any(|&x| x > leaf.max_rep)
     {
-        return Err(Error::Invalid(format!("repetition level out of range for column '{}'", spec.name)));
+        return Err(Error::Invalid(format!(
+            "repetition level out of range for column '{}'",
+            spec.name
+        )));
     }
     if codec == Compression::LZO {
         return Err(Error::Unsupported("writing LZO-compressed pages".into()));
@@ -277,7 +339,9 @@ pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, diction
     {
         let mut w = SerializedFileWriter::new(&mut buf, descr.root_schema_ptr(), Arc::new(props))?;
         let mut rg = w.next_row_group()?;
-        let mut col = rg.next_column()?.ok_or_else(|| Error::Corrupt("no column writer".into()))?;
+        let mut col = rg
+            .next_column()?
+            .ok_or_else(|| Error::Corrupt("no column writer".into()))?;
         let defs = data.defs.as_deref();
         let reps = data.reps.as_deref();
         match &data.values {
@@ -297,7 +361,8 @@ pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, diction
                         spec.type_length
                     )));
                 }
-                col.typed::<FixedLenByteArrayType>().write_batch(v, defs, reps)?
+                col.typed::<FixedLenByteArrayType>()
+                    .write_batch(v, defs, reps)?
             }
         };
         col.close()?;
@@ -307,7 +372,9 @@ pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, diction
     let bytes = Bytes::from(buf);
     let md = ParquetMetaDataReader::new().parse_and_finish(&bytes)?;
     if md.num_row_groups() != 1 {
-        return Err(Error::Corrupt("encoder produced multiple row groups".into()));
+        return Err(Error::Corrupt(
+            "encoder produced multiple row groups".into(),
+        ));
     }
     let cmd = md.row_group(0).column(0);
     let levels = data.defs.as_ref().map_or(data.values.len(), Vec::len) as i64;
@@ -318,12 +385,23 @@ pub fn encode_column(leaf: &Leaf, codec: Compression, data: &ColumnData, diction
     let chunk = bytes.slice(start as usize..(start + len) as usize);
     let pages = split_pages(&chunk)?
         .into_iter()
-        .map(|p| (chunk.slice(p.offset..p.offset + p.header.total_len()), p.header))
+        .map(|p| {
+            (
+                chunk.slice(p.offset..p.offset + p.header.total_len()),
+                p.header,
+            )
+        })
         .collect::<Vec<(Bytes, PageHeaderInfo)>>();
     let page_rows = match &data.reps {
-        None => pages.iter().map(|(_, h)| if h.kind.is_data() { h.num_values } else { 0 }).collect(),
-        Some(r) => rows_per_page(r, pages.iter().map(|(_, h)| (h.kind.is_data(), h.num_values)))
-            .ok_or_else(|| Error::Corrupt("encoder split a record across pages".into()))?,
+        None => pages
+            .iter()
+            .map(|(_, h)| if h.kind.is_data() { h.num_values } else { 0 })
+            .collect(),
+        Some(r) => rows_per_page(
+            r,
+            pages.iter().map(|(_, h)| (h.kind.is_data(), h.num_values)),
+        )
+        .ok_or_else(|| Error::Corrupt("encoder split a record across pages".into()))?,
     };
     let page_stats = page_stats(&leaf.stat_type()?, data, &page_rows);
     Ok(EncodedChunk {
@@ -348,7 +426,11 @@ pub fn page_stats(t: &StatType, data: &ColumnData, page_rows: &[i64]) -> Vec<Opt
                 return None;
             }
             let rows = rows as usize;
-            let page = if start == 0 && rows == data.num_rows() { None } else { Some(data.slice(start, rows)) };
+            let page = if start == 0 && rows == data.num_rows() {
+                None
+            } else {
+                Some(data.slice(start, rows))
+            };
             start += rows;
             PageStats::compute(t, page.as_ref().unwrap_or(data))
         })

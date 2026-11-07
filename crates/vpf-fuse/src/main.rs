@@ -6,10 +6,10 @@ use vpf_fuse::VpfFs;
 #[derive(Debug, Parser)]
 #[command(
     name = "vpf-fuse",
-    about = "Mount a VPF store as a read-only filesystem"
+    about = "Mount a directory of .vpf files as read-only Parquet files"
 )]
 struct Args {
-    /// Path to the VPF store directory.
+    /// Directory of `.vpf` files; `<name>.vpf` appears as `<name>.parquet`.
     store_dir: PathBuf,
     /// Mount point (must already exist).
     mountpoint: PathBuf,
@@ -20,10 +20,7 @@ fn main() {
     let fs = match VpfFs::open(&args.store_dir) {
         Ok(fs) => fs,
         Err(error) => {
-            eprintln!(
-                "vpf-fuse: opening store {}: {error}",
-                args.store_dir.display()
-            );
+            eprintln!("vpf-fuse: opening {}: {error}", args.store_dir.display());
             std::process::exit(1);
         }
     };

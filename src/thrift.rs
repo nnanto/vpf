@@ -238,7 +238,9 @@ fn parse_sub_num_values(r: &mut CompactReader, want_rows: bool) -> Result<(i64, 
     }
     let nv = num_values.ok_or_else(|| Error::Corrupt("page header missing num_values".into()))?;
     if want_rows && num_rows.is_none() {
-        return Err(Error::Corrupt("data page v2 header missing num_rows".into()));
+        return Err(Error::Corrupt(
+            "data page v2 header missing num_rows".into(),
+        ));
     }
     Ok((nv, num_rows))
 }
@@ -267,7 +269,8 @@ pub fn parse_page_header(buf: &[u8]) -> Result<PageHeaderInfo> {
         }
     }
     let kind = kind.ok_or_else(|| Error::Corrupt("page header missing type".into()))?;
-    let uncompressed = uncompressed.ok_or_else(|| Error::Corrupt("missing uncompressed size".into()))?;
+    let uncompressed =
+        uncompressed.ok_or_else(|| Error::Corrupt("missing uncompressed size".into()))?;
     let compressed = compressed.ok_or_else(|| Error::Corrupt("missing compressed size".into()))?;
     if uncompressed < 0 || compressed < 0 {
         return Err(Error::Corrupt("negative page size".into()));
@@ -304,7 +307,10 @@ pub fn split_pages(chunk: &[u8]) -> Result<Vec<LocatedPage>> {
         if pos + len > chunk.len() {
             return Err(Error::Corrupt("page extends beyond column chunk".into()));
         }
-        out.push(LocatedPage { offset: pos, header });
+        out.push(LocatedPage {
+            offset: pos,
+            header,
+        });
         pos += len;
     }
     Ok(out)

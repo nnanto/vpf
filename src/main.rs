@@ -23,41 +23,43 @@ use vpf::store::Store;
 #[derive(Parser)]
 #[command(name = "vpf", version)]
 struct Cli {
-    /// Store directory (created if missing).
-    #[arg(long, short = 's', env = "VPF_STORE", default_value = ".vpf")]
-    store: PathBuf,
+    /// The `.vpf` file; it holds exactly one table. `create` and `import` create it.
+    file: PathBuf,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Creates the store directory.
-    Init,
-    /// Imports an existing Parquet file; its pages are stored as-is.
-    Import { name: String, path: PathBuf },
-    /// Creates an empty file from column definitions like `id:int64:required`, `name:string`,
+    /// Creates the file's table from an existing Parquet file; its pages are stored as-is.
+    Import {
+        path: PathBuf,
+        /// Table name (defaults to the file stem).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Creates the file's (empty) table from column definitions like `id:int64:required`, `name:string`,
     /// `tags:list<string>`, `attrs:map<string,int64>` or `pt:struct<x:double!,y:double>`.
     Create {
-        name: String,
         #[arg(required = true)]
         columns: Vec<String>,
         #[arg(long, default_value = "snappy")]
         codec: String,
+        /// Table name (defaults to the file stem).
+        #[arg(long)]
+        name: Option<String>,
     },
-    /// Lists files.
-    Ls,
-    /// Lists snapshots of a file.
-    Snapshots { name: String },
+    /// Shows the table name, row count and current snapshot.
+    Info,
+    /// Lists snapshots.
+    Snapshots,
     /// Prints the schema of a snapshot.
     Schema {
-        name: String,
         #[arg(long)]
         at: Option<i64>,
     },
     /// Prints rows of a snapshot.
     Cat {
-        name: String,
         #[arg(long)]
         at: Option<i64>,
         #[arg(long)]
@@ -67,14 +69,12 @@ enum Cmd {
     },
     /// Writes a snapshot as a standalone Parquet file.
     Export {
-        name: String,
         out: PathBuf,
         #[arg(long)]
         at: Option<i64>,
     },
     /// Appends rows from a Parquet file or newline-delimited JSON (`-` for stdin).
     Append {
-        name: String,
         #[arg(long, conflicts_with = "json", required_unless_present = "json")]
         parquet: Option<PathBuf>,
         #[arg(long)]
@@ -83,16 +83,14 @@ enum Cmd {
         mode: Mode,
     },
     /// Converts buffered appends into stored row groups.
-    Flush { name: String },
+    Flush,
     /// Deletes rows matching a predicate.
     Delete {
-        name: String,
         #[arg(long = "where")]
         predicate: String,
     },
     /// Sets columns to literal values on rows matching a predicate.
     Update {
-        name: String,
         #[arg(long)]
         set: String,
         #[arg(long = "where")]
@@ -100,13 +98,11 @@ enum Cmd {
     },
     /// Changes the schema.
     Alter {
-        name: String,
         #[command(subcommand)]
         op: AlterCmd,
     },
     /// Shows storage statistics of a snapshot.
     Stats {
-        name: String,
         #[arg(long)]
         at: Option<i64>,
     },
@@ -124,15 +120,25 @@ enum AlterCmd {
         #[arg(long)]
         default: Option<String>,
     },
-    DropColumn { column: String },
-    RenameColumn { from: String, to: String },
+    DropColumn {
+        column: String,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
     Reorder {
         #[arg(required = true)]
         columns: Vec<String>,
     },
     /// INT32 -> int64, FLOAT -> double.
-    Widen { column: String, to: WidenTo },
-    MakeOptional { column: String },
+    Widen {
+        column: String,
+        to: WidenTo,
+    },
+    MakeOptional {
+        column: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -174,7 +180,12 @@ fn parse_codec(s: &str) -> Result<Compression> {
     })
 }
 
-fn read_snapshot(store: &Store, name: &str, at: Option<i64>, limit: Option<usize>) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+fn read_snapshot(
+    store: &Store,
+    name: &str,
+    at: Option<i64>,
+    limit: Option<usize>,
+) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
     let vf = store.open_snapshot(name, at)?;
     let b = ParquetRecordBatchReaderBuilder::try_new(vf)?;
     let schema = b.schema().clone();
@@ -206,28 +217,62 @@ fn read_json(store: &Store, name: &str, path: &PathBuf) -> Result<RecordBatch> {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
     };
     let mut keys = BTreeSet::new();
-    for (i, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
-        let v: serde_json::Value = serde_json::from_str(line).with_context(|| format!("line {}", i + 1))?;
-        let obj = v.as_object().with_context(|| format!("line {} is not an object", i + 1))?;
+    for (i, line) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let v: serde_json::Value =
+            serde_json::from_str(line).with_context(|| format!("line {}", i + 1))?;
+        let obj = v
+            .as_object()
+            .with_context(|| format!("line {} is not an object", i + 1))?;
         keys.extend(obj.keys().cloned());
     }
     let full = arrow_schema(&store.view(name, None)?.schema)?;
     if let Some(k) = keys.iter().find(|k| full.field_with_name(k).is_err()) {
         bail!("unknown column '{k}'");
     }
-    let fields: Vec<_> = full.fields().iter().filter(|f| keys.contains(f.name())).cloned().collect();
+    let fields: Vec<_> = full
+        .fields()
+        .iter()
+        .filter(|f| keys.contains(f.name()))
+        .cloned()
+        .collect();
     let schema = Arc::new(Schema::new(fields));
-    let reader = arrow::json::ReaderBuilder::new(schema.clone()).with_batch_size(1 << 20).build(text.as_bytes())?;
+    let reader = arrow::json::ReaderBuilder::new(schema.clone())
+        .with_batch_size(1 << 20)
+        .build(text.as_bytes())?;
     let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(arrow::compute::concat_batches(&schema, &batches)?)
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let store = Store::open(&cli.store).with_context(|| format!("opening store {}", cli.store.display()))?;
+    let path = &cli.file;
+    let creating = matches!(cli.cmd, Cmd::Import { .. } | Cmd::Create { .. });
+    if !creating && !path.exists() {
+        bail!(
+            "{} does not exist; create it with `create` or `import`",
+            path.display()
+        );
+    }
+    let store = Store::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let default_name = || -> Result<String> {
+        Ok(path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .context("cannot derive a table name from the file name")?
+            .to_string())
+    };
+    let name = if creating {
+        String::new()
+    } else {
+        store.table()?.context("the file has no table yet")?
+    };
     let mut out = std::io::stdout().lock();
     match cli.cmd {
-        Cmd::Init => writeln!(out, "initialized {}", cli.store.display())?,
-        Cmd::Import { name, path } => {
+        Cmd::Import { path, name } => {
+            let name = name.map_or_else(default_name, Ok)?;
             let s = store.import_file(&name, &path)?;
             writeln!(
                 out,
@@ -235,7 +280,12 @@ fn run(cli: Cli) -> Result<()> {
                 s.num_rows, s.row_groups, s.pages, s.snapshot_id
             )?;
         }
-        Cmd::Create { name, columns, codec } => {
+        Cmd::Create {
+            columns,
+            codec,
+            name,
+        } => {
+            let name = name.map_or_else(default_name, Ok)?;
             let specs = columns
                 .iter()
                 .map(|c| {
@@ -246,18 +296,24 @@ fn run(cli: Cli) -> Result<()> {
             let sid = store.create(&name, &specs, parse_codec(&codec)?)?;
             writeln!(out, "created {name} (snapshot {sid})")?;
         }
-        Cmd::Ls => {
-            for name in store.read(meta::list_files)? {
-                let v = store.view(&name, None)?;
-                writeln!(out, "{name}\t{} rows\tsnapshot {}", v.snapshot.num_rows, v.snapshot.snapshot_id)?;
-            }
+        Cmd::Info => {
+            let v = store.view(&name, None)?;
+            writeln!(
+                out,
+                "{name}\t{} rows\tsnapshot {}",
+                v.snapshot.num_rows, v.snapshot.snapshot_id
+            )?;
         }
-        Cmd::Snapshots { name } => {
+        Cmd::Snapshots => {
             let file = store.read(|c| meta::load_file(c, &name))?;
             let snaps = store.read(|c| meta::list_snapshots(c, file.file_id))?;
             writeln!(out, "id\tparent\trows\tschema\top\tcreated\tsummary")?;
             for s in snaps {
-                let cur = if Some(s.snapshot_id) == file.current_snapshot_id { "*" } else { "" };
+                let cur = if Some(s.snapshot_id) == file.current_snapshot_id {
+                    "*"
+                } else {
+                    ""
+                };
                 writeln!(
                     out,
                     "{}{cur}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -271,7 +327,7 @@ fn run(cli: Cli) -> Result<()> {
                 )?;
             }
         }
-        Cmd::Schema { name, at } => {
+        Cmd::Schema { at } => {
             let v = store.view(&name, at)?;
             let a = arrow_schema(&v.schema)?;
             writeln!(out, "schema version {}", v.schema.schema_version_id)?;
@@ -295,34 +351,45 @@ fn run(cli: Cli) -> Result<()> {
                 )?;
             }
         }
-        Cmd::Cat { name, at, limit, format } => {
+        Cmd::Cat { at, limit, format } => {
             let (schema, mut batches) = read_snapshot(&store, &name, at, limit)?;
             if batches.is_empty() {
                 batches.push(RecordBatch::new_empty(schema));
             }
             match format {
-                CatFormat::Table => writeln!(out, "{}", arrow::util::pretty::pretty_format_batches(&batches)?)?,
+                CatFormat::Table => writeln!(
+                    out,
+                    "{}",
+                    arrow::util::pretty::pretty_format_batches(&batches)?
+                )?,
                 CatFormat::Json => {
                     let mut w = arrow::json::LineDelimitedWriter::new(&mut out);
                     w.write_batches(&batches.iter().collect::<Vec<_>>())?;
                     w.finish()?;
                 }
                 CatFormat::Csv => {
-                    let mut w = arrow::csv::WriterBuilder::new().with_header(true).build(&mut out);
+                    let mut w = arrow::csv::WriterBuilder::new()
+                        .with_header(true)
+                        .build(&mut out);
                     for b in &batches {
                         w.write(b)?;
                     }
                 }
             }
         }
-        Cmd::Export { name, out: path, at } => {
+        Cmd::Export { out: path, at } => {
             let n = store.export(&name, at, &path)?;
             writeln!(out, "wrote {n} bytes to {}", path.display())?;
         }
-        Cmd::Append { name, parquet, json, mode } => {
+        Cmd::Append {
+            parquet,
+            json,
+            mode,
+        } => {
             let batch = match (parquet, json) {
                 (Some(p), _) => {
-                    let f = std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
+                    let f = std::fs::File::open(&p)
+                        .with_context(|| format!("opening {}", p.display()))?;
                     let b = ParquetRecordBatchReaderBuilder::try_new(f)?;
                     let schema = b.schema().clone();
                     let batches = b.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -337,25 +404,38 @@ fn run(cli: Cli) -> Result<()> {
                 Mode::Direct => AppendMode::Direct,
             };
             let s = store.append(&name, &batch, mode)?;
-            let how = if s.buffered { "buffered" } else { "as a row group" };
-            writeln!(out, "appended {} rows {how} (snapshot {})", s.num_rows, s.snapshot_id)?;
+            let how = if s.buffered {
+                "buffered"
+            } else {
+                "as a row group"
+            };
+            writeln!(
+                out,
+                "appended {} rows {how} (snapshot {})",
+                s.num_rows, s.snapshot_id
+            )?;
         }
-        Cmd::Flush { name } => match store.flush(&name)? {
+        Cmd::Flush => match store.flush(&name)? {
             Some(sid) => writeln!(out, "flushed (snapshot {sid})")?,
             None => writeln!(out, "nothing to flush")?,
         },
-        Cmd::Delete { name, predicate } => {
+        Cmd::Delete { predicate } => {
             let s = store.delete_where(&name, &predicate)?;
             match s.snapshot_id {
                 Some(sid) => writeln!(
                     out,
                     "deleted {} rows; segments removed {}, rewritten {}; pages reused {}, rewritten {}, dropped {} (snapshot {sid})",
-                    s.rows_deleted, s.segments_removed, s.segments_rewritten, s.pages.reused, s.pages.rewritten, s.pages.dropped
+                    s.rows_deleted,
+                    s.segments_removed,
+                    s.segments_rewritten,
+                    s.pages.reused,
+                    s.pages.rewritten,
+                    s.pages.dropped
                 )?,
                 None => writeln!(out, "no rows matched")?,
             }
         }
-        Cmd::Update { name, set, predicate } => {
+        Cmd::Update { set, predicate } => {
             let s = store.update_where(&name, &set, &predicate)?;
             match s.snapshot_id {
                 Some(sid) => writeln!(
@@ -366,9 +446,14 @@ fn run(cli: Cli) -> Result<()> {
                 None => writeln!(out, "no rows matched")?,
             }
         }
-        Cmd::Alter { name, op } => {
+        Cmd::Alter { op } => {
             let op = match op {
-                AlterCmd::AddColumn { column, ty, required, default } => AlterOp::AddColumn {
+                AlterCmd::AddColumn {
+                    column,
+                    ty,
+                    required,
+                    default,
+                } => AlterOp::AddColumn {
                     spec: spec_for_type_name(0, &column, &ty, !required)?,
                     default: default.as_deref().map(parse_literal).transpose()?,
                 },
@@ -391,9 +476,10 @@ fn run(cli: Cli) -> Result<()> {
                 s.schema_version_id, s.chunks_written, s.snapshot_id
             )?;
         }
-        Cmd::Stats { name, at } => {
+        Cmd::Stats { at } => {
             let v = store.view(&name, at)?;
-            let (mut rgs, mut batches, mut buffered_rows, mut pages, mut bytes) = (0, 0, 0, 0, 0u64);
+            let (mut rgs, mut batches, mut buffered_rows, mut pages, mut bytes) =
+                (0, 0, 0, 0, 0u64);
             for s in &v.segments {
                 match s {
                     SegmentData::RowGroup { chunks, .. } => {
@@ -413,7 +499,10 @@ fn run(cli: Cli) -> Result<()> {
             writeln!(out, "snapshot      {}", v.snapshot.snapshot_id)?;
             writeln!(out, "rows          {}", v.snapshot.num_rows)?;
             writeln!(out, "columns       {}", v.schema.columns.len())?;
-            writeln!(out, "row groups    {rgs} stored + {batches} buffered batches ({buffered_rows} rows)")?;
+            writeln!(
+                out,
+                "row groups    {rgs} stored + {batches} buffered batches ({buffered_rows} rows)"
+            )?;
             writeln!(out, "stored pages  {pages} ({bytes} bytes)")?;
             writeln!(out, "virtual size  {} bytes", vf.len())?;
         }

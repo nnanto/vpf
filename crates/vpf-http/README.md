@@ -1,10 +1,11 @@
 # vpf-http
 
 Read VPF snapshots directly over HTTP, without exporting Parquet or mounting a filesystem.
+The server exposes a directory of `.vpf` files; `sales.vpf` is served as `/files/sales/...`.
 Bodies stream in bounded 64 KiB chunks from `VirtualFile::read_range`.
 
 ```sh
-cargo run -p vpf-http -- --store ./mystore --listen 127.0.0.1:8080
+cargo run -p vpf-http -- --dir ./tables --listen 127.0.0.1:8080
 curl http://127.0.0.1:8080/files/sales/latest
 # {"snapshot_id":42}
 curl -I http://127.0.0.1:8080/files/sales/snapshots/42.parquet
@@ -24,7 +25,7 @@ LOAD httpfs;
 SELECT * FROM read_parquet('http://127.0.0.1:8080/files/sales/snapshots/42.parquet');
 ```
 
-URL-encode logical file names as a single path component. The endpoint supports
+Names are file stems made of ASCII letters, digits, `_`, `-` and `.`. The endpoint supports
 GET, HEAD, single byte ranges (including suffix ranges), ETag, If-Match and
 ETag-based If-Range. Invalid, unsatisfiable and multipart ranges return 416.
 HEAD ignores Range. Unknown files or snapshots return 404.
@@ -42,5 +43,5 @@ For an already-downloaded signed extension, set `VPF_DUCKDB_HTTPFS=/absolute/pat
 DuckDB's normal signature verification remains enabled.
 
 The server is read-only but has no authentication or TLS. It defaults to loopback;
-do not expose sensitive stores to an untrusted network. Opening the store uses
-VPF's normal SQLite WAL setup/migrations and may create or upgrade store files.
+do not expose sensitive files to an untrusted network. Opening a file uses VPF's
+normal SQLite WAL setup/migrations and may upgrade it.

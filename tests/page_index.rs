@@ -10,7 +10,9 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use common::*;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+};
 use parquet::basic::Compression;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
@@ -21,25 +23,49 @@ use vpf::store::Store;
 /// Min/max of page `i` as plain-encoded bytes.
 fn bounds(ci: &ColumnIndexMetaData, i: usize) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     match ci {
-        ColumnIndexMetaData::BOOLEAN(x) => (x.min_value(i).map(|v| vec![*v as u8]), x.max_value(i).map(|v| vec![*v as u8])),
-        ColumnIndexMetaData::INT32(x) => (x.min_value(i).map(|v| v.to_le_bytes().to_vec()), x.max_value(i).map(|v| v.to_le_bytes().to_vec())),
-        ColumnIndexMetaData::INT64(x) => (x.min_value(i).map(|v| v.to_le_bytes().to_vec()), x.max_value(i).map(|v| v.to_le_bytes().to_vec())),
-        ColumnIndexMetaData::FLOAT(x) => (x.min_value(i).map(|v| v.to_le_bytes().to_vec()), x.max_value(i).map(|v| v.to_le_bytes().to_vec())),
-        ColumnIndexMetaData::DOUBLE(x) => (x.min_value(i).map(|v| v.to_le_bytes().to_vec()), x.max_value(i).map(|v| v.to_le_bytes().to_vec())),
-        ColumnIndexMetaData::BYTE_ARRAY(x) | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(x) => {
-            (x.min_value(i).map(<[u8]>::to_vec), x.max_value(i).map(<[u8]>::to_vec))
-        }
+        ColumnIndexMetaData::BOOLEAN(x) => (
+            x.min_value(i).map(|v| vec![*v as u8]),
+            x.max_value(i).map(|v| vec![*v as u8]),
+        ),
+        ColumnIndexMetaData::INT32(x) => (
+            x.min_value(i).map(|v| v.to_le_bytes().to_vec()),
+            x.max_value(i).map(|v| v.to_le_bytes().to_vec()),
+        ),
+        ColumnIndexMetaData::INT64(x) => (
+            x.min_value(i).map(|v| v.to_le_bytes().to_vec()),
+            x.max_value(i).map(|v| v.to_le_bytes().to_vec()),
+        ),
+        ColumnIndexMetaData::FLOAT(x) => (
+            x.min_value(i).map(|v| v.to_le_bytes().to_vec()),
+            x.max_value(i).map(|v| v.to_le_bytes().to_vec()),
+        ),
+        ColumnIndexMetaData::DOUBLE(x) => (
+            x.min_value(i).map(|v| v.to_le_bytes().to_vec()),
+            x.max_value(i).map(|v| v.to_le_bytes().to_vec()),
+        ),
+        ColumnIndexMetaData::BYTE_ARRAY(x) | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(x) => (
+            x.min_value(i).map(<[u8]>::to_vec),
+            x.max_value(i).map(<[u8]>::to_vec),
+        ),
         other => panic!("unexpected column index {other:?}"),
     }
 }
 
 /// Statistics of leaf `c` over `rows` of row group `rg`, computed by re-writing those rows
 /// with parquet-rs.
-fn truth(bytes: &Bytes, rg: usize, c: usize, rows: std::ops::Range<usize>) -> parquet::file::statistics::Statistics {
+fn truth(
+    bytes: &Bytes,
+    rg: usize,
+    c: usize,
+    rows: std::ops::Range<usize>,
+) -> parquet::file::statistics::Statistics {
     let b = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
     let schema = b.parquet_schema().clone();
     let root = schema.get_column_root_idx(c);
-    let sel = RowSelection::from(vec![RowSelector::skip(rows.start), RowSelector::select(rows.len())]);
+    let sel = RowSelection::from(vec![
+        RowSelector::skip(rows.start),
+        RowSelector::select(rows.len()),
+    ]);
     let batches: Vec<RecordBatch> = b
         .with_row_groups(vec![rg])
         .with_projection(ProjectionMask::roots(&schema, [root]))
@@ -58,7 +84,12 @@ fn truth(bytes: &Bytes, rg: usize, c: usize, rows: std::ops::Range<usize>) -> pa
     let out = write_parquet(&[batch], props);
     let md = ParquetMetaDataReader::new().parse_and_finish(&out).unwrap();
     let path = schema.column(c).path().clone();
-    let col = md.row_group(0).columns().iter().find(|x| *x.column_path() == path).expect("leaf in rewritten file");
+    let col = md
+        .row_group(0)
+        .columns()
+        .iter()
+        .find(|x| *x.column_path() == path)
+        .expect("leaf in rewritten file");
     col.statistics().expect("parquet-rs statistics").clone()
 }
 
@@ -72,7 +103,10 @@ struct Counts {
 
 /// Verifies the page indexes of a Parquet file against its pages and its data.
 fn verify(bytes: &Bytes) -> Counts {
-    let md = ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Optional).parse_and_finish(bytes).unwrap();
+    let md = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(bytes)
+        .unwrap();
     let mut n = Counts::default();
     for rg in 0..md.num_row_groups() {
         let rgm = md.row_group(rg);
@@ -80,7 +114,9 @@ fn verify(bytes: &Bytes) -> Counts {
         for c in 0..rgm.num_columns() {
             n.chunks += 1;
             let col = rgm.column(c);
-            let Some(oi) = pi.offset_index(c) else { continue };
+            let Some(oi) = pi.offset_index(c) else {
+                continue;
+            };
             n.offset_indexes += 1;
             // Locations are exactly the chunk's data pages.
             let (start, len) = col.byte_range();
@@ -92,22 +128,43 @@ fn verify(bytes: &Bytes) -> Counts {
                 .map(|p| (start as i64 + p.offset as i64, p.header.total_len() as i32))
                 .collect();
             let locs = oi.page_locations();
-            assert_eq!(locs.iter().map(|l| (l.offset, l.compressed_page_size)).collect::<Vec<_>>(), pages, "rg {rg} col {c}");
+            assert_eq!(
+                locs.iter()
+                    .map(|l| (l.offset, l.compressed_page_size))
+                    .collect::<Vec<_>>(),
+                pages,
+                "rg {rg} col {c}"
+            );
             assert_eq!(locs[0].first_row_index, 0);
-            assert!(locs.windows(2).all(|w| w[0].first_row_index < w[1].first_row_index));
+            assert!(
+                locs.windows(2)
+                    .all(|w| w[0].first_row_index < w[1].first_row_index)
+            );
             assert!(locs.last().unwrap().first_row_index < rgm.num_rows());
             n.pages += locs.len();
-            let Some(ci) = pi.column_index(c) else { continue };
+            let Some(ci) = pi.column_index(c) else {
+                continue;
+            };
             n.column_indexes += 1;
             assert_eq!(ci.num_pages() as usize, locs.len());
             let physical = col.column_type();
             for i in 0..locs.len() {
-                let end = locs.get(i + 1).map_or(rgm.num_rows(), |l| l.first_row_index) as usize;
+                let end =
+                    locs.get(i + 1)
+                        .map_or(rgm.num_rows(), |l| l.first_row_index) as usize;
                 let t = truth(bytes, rg, c, locs[i].first_row_index as usize..end);
                 let ctx = format!("rg {rg} col {} page {i}", col.column_path());
-                assert_eq!(ci.null_count(i), t.null_count_opt().map(|x| x as i64), "{ctx}: null count");
+                assert_eq!(
+                    ci.null_count(i),
+                    t.null_count_opt().map(|x| x as i64),
+                    "{ctx}: null count"
+                );
                 if t.nan_count_opt().is_some() || ci.nan_count(i).is_some() {
-                    assert_eq!(ci.nan_count(i), t.nan_count_opt().map(|x| x as i64), "{ctx}: nan count");
+                    assert_eq!(
+                        ci.nan_count(i),
+                        t.nan_count_opt().map(|x| x as i64),
+                        "{ctx}: nan count"
+                    );
                 }
                 let (lo, hi) = bounds(ci, i);
                 match (t.min_bytes_opt(), t.max_bytes_opt()) {
@@ -115,15 +172,25 @@ fn verify(bytes: &Bytes) -> Counts {
                     (Some(tlo), Some(thi)) => {
                         assert!(!ci.is_null_page(i), "{ctx}");
                         let (lo, hi) = (lo.unwrap(), hi.unwrap());
-                        let byte_array = matches!(physical, parquet::basic::Type::BYTE_ARRAY | parquet::basic::Type::FIXED_LEN_BYTE_ARRAY);
+                        let byte_array = matches!(
+                            physical,
+                            parquet::basic::Type::BYTE_ARRAY
+                                | parquet::basic::Type::FIXED_LEN_BYTE_ARRAY
+                        );
                         if byte_array && tlo.len() > 64 {
-                            assert!(lo.len() <= 64 && tlo.starts_with(&lo), "{ctx}: truncated min");
+                            assert!(
+                                lo.len() <= 64 && tlo.starts_with(&lo),
+                                "{ctx}: truncated min"
+                            );
                         } else {
                             assert_eq!(lo, tlo, "{ctx}: min");
                         }
                         if byte_array && thi.len() > 64 {
                             // Untruncatable maxima (all 0xff prefix) are kept whole.
-                            assert!(hi == thi || (hi.as_slice() > thi && hi.len() <= 64), "{ctx}: truncated max");
+                            assert!(
+                                hi == thi || (hi.as_slice() > thi && hi.len() <= 64),
+                                "{ctx}: truncated max"
+                            );
                         } else {
                             assert_eq!(hi, thi, "{ctx}: max");
                         }
@@ -135,13 +202,25 @@ fn verify(bytes: &Bytes) -> Counts {
             let t = truth(bytes, rg, c, 0..rgm.num_rows() as usize);
             if let Some(s) = col.statistics() {
                 if let Some(nc) = s.null_count_opt() {
-                    assert_eq!(Some(nc), t.null_count_opt(), "rg {rg} col {c}: chunk null count");
+                    assert_eq!(
+                        Some(nc),
+                        t.null_count_opt(),
+                        "rg {rg} col {c}: chunk null count"
+                    );
                 }
                 if s.min_is_exact() && s.min_bytes_opt().is_some() {
-                    assert_eq!(s.min_bytes_opt(), t.min_bytes_opt(), "rg {rg} col {c}: chunk min");
+                    assert_eq!(
+                        s.min_bytes_opt(),
+                        t.min_bytes_opt(),
+                        "rg {rg} col {c}: chunk min"
+                    );
                 }
                 if s.max_is_exact() && s.max_bytes_opt().is_some() {
-                    assert_eq!(s.max_bytes_opt(), t.max_bytes_opt(), "rg {rg} col {c}: chunk max");
+                    assert_eq!(
+                        s.max_bytes_opt(),
+                        t.max_bytes_opt(),
+                        "rg {rg} col {c}: chunk max"
+                    );
                 }
             }
         }
@@ -157,7 +236,12 @@ fn check_selection_reads(bytes: &Bytes) {
     if total == 0 {
         return;
     }
-    for (skip, take) in [(0usize, 1usize), (37, 211), (total / 2, 3), (total.saturating_sub(5), 5)] {
+    for (skip, take) in [
+        (0usize, 1usize),
+        (37, 211),
+        (total / 2, 3),
+        (total.saturating_sub(5), 5),
+    ] {
         let skip = skip.min(total - 1);
         let take = take.min(total - skip);
         let mut sel = vec![RowSelector::skip(skip), RowSelector::select(take)];
@@ -165,14 +249,19 @@ fn check_selection_reads(bytes: &Bytes) {
             sel.push(RowSelector::skip(total - skip - take));
         }
         let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-        let got: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes.clone(), opts)
-            .unwrap()
-            .with_row_selection(RowSelection::from(sel))
-            .build()
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let got = if got.is_empty() { all.slice(0, 0) } else { concat(&got) };
+        let got: Vec<RecordBatch> =
+            ParquetRecordBatchReaderBuilder::try_new_with_options(bytes.clone(), opts)
+                .unwrap()
+                .with_row_selection(RowSelection::from(sel))
+                .build()
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let got = if got.is_empty() {
+            all.slice(0, 0)
+        } else {
+            concat(&got)
+        };
         assert_eq!(got, all.slice(skip, take), "selection {skip}+{take}");
     }
 }
@@ -191,7 +280,11 @@ fn py_check(bytes: &Bytes, expect_ci: bool) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("x.parquet");
     std::fs::write(&p, bytes).unwrap();
-    run_python(&[&py_script("check_page_index.py"), p.to_str().unwrap(), if expect_ci { "1" } else { "0" }]);
+    run_python(&[
+        &py_script("check_page_index.py"),
+        p.to_str().unwrap(),
+        if expect_ci { "1" } else { "0" },
+    ]);
 }
 
 fn full(n: &Counts) -> bool {
@@ -200,16 +293,27 @@ fn full(n: &Counts) -> bool {
 
 #[test]
 fn imported_flat_files_get_exact_page_indexes() {
-    for (codec, v2, dict) in [(Compression::SNAPPY, false, true), (Compression::ZSTD(Default::default()), true, false)] {
+    for (codec, v2, dict) in [
+        (Compression::SNAPPY, false, true),
+        (Compression::ZSTD(Default::default()), true, false),
+    ] {
         let d = tempfile::tempdir().unwrap();
-        let store = Store::open(d.path()).unwrap();
+        let store = Store::open(d.path().join("t.vpf")).unwrap();
         let base = sample_batch(0, 2500);
-        store.import("f", &write_parquet(&[base.clone()], props(codec, v2, dict, 100, 1000))).unwrap();
+        store
+            .import(
+                "f",
+                &write_parquet(&[base.clone()], props(codec, v2, dict, 100, 1000)),
+            )
+            .unwrap();
         let bytes = export(&store, "f");
         assert_eq!(concat(&read_parquet(bytes.clone())), base);
         let n = verify(&bytes);
         assert!(full(&n), "{n:?}");
-        assert!(n.pages > 3 * base.num_columns() * 5, "multi-page chunks: {n:?}");
+        assert!(
+            n.pages > 3 * base.num_columns() * 5,
+            "multi-page chunks: {n:?}"
+        );
         // The in-memory metadata carries the same page index.
         let vf = store.open_snapshot("f", None).unwrap();
         assert!(vf.metadata().page_index().is_some());
@@ -220,26 +324,39 @@ fn imported_flat_files_get_exact_page_indexes() {
 #[test]
 fn page_indexes_survive_mutations() {
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
-    store.import("f", &write_parquet(&[sample_batch(0, 3000)], props(Compression::SNAPPY, false, true, 100, 1500))).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
+    store
+        .import(
+            "f",
+            &write_parquet(
+                &[sample_batch(0, 3000)],
+                props(Compression::SNAPPY, false, true, 100, 1500),
+            ),
+        )
+        .unwrap();
     let steps: Vec<Box<dyn Fn(&Store)>> = vec![
         Box::new(|s| {
             s.delete_where("f", "id = 7").unwrap();
         }),
         Box::new(|s| {
-            s.delete_where("f", "name LIKE 'name-1%' AND score > 100").unwrap();
+            s.delete_where("f", "name LIKE 'name-1%' AND score > 100")
+                .unwrap();
         }),
         Box::new(|s| {
-            s.update_where("f", "name = 'changed', i32 = NULL", "id < 450").unwrap();
+            s.update_where("f", "name = 'changed', i32 = NULL", "id < 450")
+                .unwrap();
         }),
         Box::new(|s| {
-            s.update_where("f", "score = 1000000000", "id = 2999").unwrap();
+            s.update_where("f", "score = 1000000000", "id = 2999")
+                .unwrap();
         }),
         Box::new(|s| {
-            s.append("f", &sample_batch(5000, 120), AppendMode::Buffered).unwrap();
+            s.append("f", &sample_batch(5000, 120), AppendMode::Buffered)
+                .unwrap();
         }),
         Box::new(|s| {
-            s.append("f", &sample_batch(9000, 700), AppendMode::Direct).unwrap();
+            s.append("f", &sample_batch(9000, 700), AppendMode::Direct)
+                .unwrap();
         }),
         Box::new(|s| {
             s.flush("f").unwrap();
@@ -265,7 +382,11 @@ fn page_indexes_survive_mutations() {
     for rg in vf.metadata().row_groups() {
         for col in rg.columns() {
             let s = col.statistics().unwrap();
-            assert!(s.null_count_opt().is_some() && s.min_is_exact() && s.max_is_exact(), "{}", col.column_path());
+            assert!(
+                s.null_count_opt().is_some() && s.min_is_exact() && s.max_is_exact(),
+                "{}",
+                col.column_path()
+            );
         }
     }
 }
@@ -273,21 +394,40 @@ fn page_indexes_survive_mutations() {
 #[test]
 fn appended_and_altered_files() {
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
     let b = sample_batch(0, 1);
-    store.create_from_arrow("f", &b.schema(), Compression::LZ4_RAW).unwrap();
-    store.append("f", &sample_batch(0, 30_000), AppendMode::Direct).unwrap();
-    store.append("f", &sample_batch(30_000, 10), AppendMode::Buffered).unwrap();
+    store
+        .create_from_arrow("f", &b.schema(), Compression::LZ4_RAW)
+        .unwrap();
+    store
+        .append("f", &sample_batch(0, 30_000), AppendMode::Direct)
+        .unwrap();
+    store
+        .append("f", &sample_batch(30_000, 10), AppendMode::Buffered)
+        .unwrap();
     let n = verify(&export(&store, "f"));
     assert!(full(&n), "{n:?}");
     let tree = parquet::arrow::ArrowSchemaConverter::new()
-        .convert(&Schema::new(vec![Field::new("extra", DataType::Int64, true)]))
+        .convert(&Schema::new(vec![Field::new(
+            "extra",
+            DataType::Int64,
+            true,
+        )]))
         .unwrap();
-    let spec = vpf::schema::ColumnSpec::from_parquet_type(0, &tree.root_schema().get_fields()[0]).unwrap();
+    let spec =
+        vpf::schema::ColumnSpec::from_parquet_type(0, &tree.root_schema().get_fields()[0]).unwrap();
     store
-        .alter("f", vpf::ops::alter::AlterOp::AddColumn { spec, default: Some(vpf::predicate::Literal::Num("42".into())) })
+        .alter(
+            "f",
+            vpf::ops::alter::AlterOp::AddColumn {
+                spec,
+                default: Some(vpf::predicate::Literal::Num("42".into())),
+            },
+        )
         .unwrap();
-    store.update_where("f", "extra = 7", "id IN (0, 1000, 17000, 29999)").unwrap();
+    store
+        .update_where("f", "extra = 7", "id IN (0, 1000, 17000, 29999)")
+        .unwrap();
     let bytes = export(&store, "f");
     let n = verify(&bytes);
     assert!(full(&n), "{n:?}");
@@ -298,9 +438,24 @@ fn appended_and_altered_files() {
 fn long_strings_are_truncated_and_floats_with_nan() {
     let n = 600usize;
     let s: Vec<Option<String>> = (0..n)
-        .map(|i| (i % 9 != 0).then(|| format!("{}{}-{i:05}", if i % 2 == 0 { "é" } else { "z" }, "x".repeat(60 + i % 50))))
+        .map(|i| {
+            (i % 9 != 0).then(|| {
+                format!(
+                    "{}{}-{i:05}",
+                    if i % 2 == 0 { "é" } else { "z" },
+                    "x".repeat(60 + i % 50)
+                )
+            })
+        })
         .collect();
-    let bin: Vec<Option<Vec<u8>>> = (0..n).map(|i| Some(vec![if i % 3 == 0 { 0xff } else { (i % 250) as u8 }; 70 + i % 7])).collect();
+    let bin: Vec<Option<Vec<u8>>> = (0..n)
+        .map(|i| {
+            Some(vec![
+                if i % 3 == 0 { 0xff } else { (i % 250) as u8 };
+                70 + i % 7
+            ])
+        })
+        .collect();
     // Rows 200..300 hold only NaN in `f`: that chunk gets no column index.
     let f: Vec<Option<f64>> = (0..n)
         .map(|i| match i {
@@ -310,7 +465,15 @@ fn long_strings_are_truncated_and_floats_with_nan() {
             _ => Some(if i % 2 == 0 { -0.0 } else { i as f64 - 300.0 }),
         })
         .collect();
-    let g: Vec<Option<f32>> = (0..n).map(|i| Some(if i % 4 == 0 { f32::NAN } else { (i as f32).sin() })).collect();
+    let g: Vec<Option<f32>> = (0..n)
+        .map(|i| {
+            Some(if i % 4 == 0 {
+                f32::NAN
+            } else {
+                (i as f32).sin()
+            })
+        })
+        .collect();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("s", DataType::Utf8, true),
@@ -330,13 +493,32 @@ fn long_strings_are_truncated_and_floats_with_nan() {
     )
     .unwrap();
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
-    store.import("f", &write_parquet(&[batch.clone()], props(Compression::UNCOMPRESSED, false, false, 100, 600))).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
+    store
+        .import(
+            "f",
+            &write_parquet(
+                &[batch.clone()],
+                props(Compression::UNCOMPRESSED, false, false, 100, 600),
+            ),
+        )
+        .unwrap();
     let bytes = export(&store, "f");
     let c = verify(&bytes);
-    assert_eq!((c.chunks, c.offset_indexes, c.column_indexes), (5, 5, 4), "{c:?}");
-    store.update_where("f", "f = 1.5", "id >= 200 AND id < 300").unwrap();
-    store.delete_where("f", "id IN (1, 11, 21, 250, 251, 599) OR (id > 400 AND id < 420)").unwrap();
+    assert_eq!(
+        (c.chunks, c.offset_indexes, c.column_indexes),
+        (5, 5, 4),
+        "{c:?}"
+    );
+    store
+        .update_where("f", "f = 1.5", "id >= 200 AND id < 300")
+        .unwrap();
+    store
+        .delete_where(
+            "f",
+            "id IN (1, 11, 21, 250, 251, 599) OR (id > 400 AND id < 420)",
+        )
+        .unwrap();
     let bytes = export(&store, "f");
     let c = verify(&bytes);
     assert!(full(&c), "NaN-only page rewritten: {c:?}");
@@ -367,7 +549,8 @@ fn nested_batch(start: i64, n: usize) -> RecordBatch {
         } else {
             for j in 0..(i % 3) {
                 map.keys().append_value(format!("k{}", (i + j) % 13));
-                map.values().append_option(((i + j) % 4 != 0).then_some((i * j) as i32));
+                map.values()
+                    .append_option(((i + j) % 4 != 0).then_some((i * j) as i32));
             }
             map.append(true).unwrap();
         }
@@ -375,8 +558,14 @@ fn nested_batch(start: i64, n: usize) -> RecordBatch {
     }
     let names = names.finish();
     let st = StructArray::from(vec![
-        (Arc::new(Field::new("name", DataType::Utf8, true)), Arc::new(names) as ArrayRef),
-        (Arc::new(Field::new("k", DataType::Int64, false)), Arc::new(Int64Array::from_iter_values(start..start + n as i64)) as ArrayRef),
+        (
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(names) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("k", DataType::Int64, false)),
+            Arc::new(Int64Array::from_iter_values(start..start + n as i64)) as ArrayRef,
+        ),
     ]);
     let ids = Int64Array::from_iter_values(start..start + n as i64);
     RecordBatch::try_from_iter(vec![
@@ -391,16 +580,33 @@ fn nested_batch(start: i64, n: usize) -> RecordBatch {
 #[test]
 fn nested_columns_page_indexes() {
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
     for (v2, dict) in [(false, true), (true, false)] {
         let name = format!("n{v2}");
+        let store = Store::open(d.path().join(format!("{name}.vpf"))).unwrap();
         let b = nested_batch(0, 2000);
-        store.import(&name, &write_parquet(&[b.clone()], props(Compression::SNAPPY, v2, dict, 150, 1000))).unwrap();
+        store
+            .import(
+                &name,
+                &write_parquet(
+                    &[b.clone()],
+                    props(Compression::SNAPPY, v2, dict, 150, 1000),
+                ),
+            )
+            .unwrap();
         let n = verify(&export(&store, &name));
         assert!(full(&n), "{n:?}");
-        store.delete_where(&name, "id IN (3, 20, 37, 999, 1000) OR (id >= 1200 AND id < 1350)").unwrap();
-        store.update_where(&name, "id = -1", "id > 1500 AND id < 1520").unwrap();
-        store.append(&name, &nested_batch(5000, 300), AppendMode::Buffered).unwrap();
+        store
+            .delete_where(
+                &name,
+                "id IN (3, 20, 37, 999, 1000) OR (id >= 1200 AND id < 1350)",
+            )
+            .unwrap();
+        store
+            .update_where(&name, "id = -1", "id > 1500 AND id < 1520")
+            .unwrap();
+        store
+            .append(&name, &nested_batch(5000, 300), AppendMode::Buffered)
+            .unwrap();
         let bytes = export(&store, &name);
         let n = verify(&bytes);
         assert!(full(&n), "{n:?}");
@@ -417,15 +623,24 @@ fn stores_without_page_statistics_still_work() {
     let d = tempfile::tempdir().unwrap();
     let base = sample_batch(0, 2000);
     {
-        let store = Store::open(d.path()).unwrap();
-        store.import("f", &write_parquet(&[base.clone()], props(Compression::SNAPPY, false, true, 100, 1000))).unwrap();
+        let store = Store::open(d.path().join("t.vpf")).unwrap();
+        store
+            .import(
+                "f",
+                &write_parquet(
+                    &[base.clone()],
+                    props(Compression::SNAPPY, false, true, 100, 1000),
+                ),
+            )
+            .unwrap();
     }
     // Simulate a store written before page statistics existed.
     {
-        let conn = rusqlite::Connection::open(d.path().join("meta.db")).unwrap();
-        conn.execute_batch("ALTER TABLE pages DROP COLUMN stats").unwrap();
+        let conn = rusqlite::Connection::open(d.path().join("t.vpf")).unwrap();
+        conn.execute_batch("ALTER TABLE pages DROP COLUMN stats")
+            .unwrap();
     }
-    let store = Store::open(d.path()).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
     let bytes = export(&store, "f");
     assert_eq!(concat(&read_parquet(bytes.clone())), base);
     let n = verify(&bytes);
@@ -439,7 +654,19 @@ fn stores_without_page_statistics_still_work() {
     assert_eq!((n.offset_indexes, n.column_indexes), (n.chunks, 0), "{n:?}");
     let got = concat(&read_parquet(bytes));
     assert_eq!(got.num_rows(), 1999);
-    // New data gets full page indexes.
-    store.import("g", &write_parquet(&[base], props(Compression::SNAPPY, false, true, 100, 1000))).unwrap();
+    // New data in a store upgraded from the old format gets full page indexes.
+    drop(Store::open(d.path().join("g.vpf")).unwrap());
+    {
+        let conn = rusqlite::Connection::open(d.path().join("g.vpf")).unwrap();
+        conn.execute_batch("ALTER TABLE pages DROP COLUMN stats")
+            .unwrap();
+    }
+    let store = Store::open(d.path().join("g.vpf")).unwrap();
+    store
+        .import(
+            "g",
+            &write_parquet(&[base], props(Compression::SNAPPY, false, true, 100, 1000)),
+        )
+        .unwrap();
     assert!(full(&verify(&export(&store, "g"))));
 }

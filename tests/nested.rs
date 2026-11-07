@@ -63,14 +63,26 @@ fn nested_schema() -> SchemaRef {
         Field::new("l", DataType::List(item(DataType::Int64, true)), true),
         Field::new("ls", DataType::List(item(ls_item(), false)), true),
         Field::new("m", map_type(), true),
-        Field::new("ll", DataType::List(item(DataType::List(item(DataType::Int32, true)), true)), true),
-        Field::new("req", DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])), false),
+        Field::new(
+            "ll",
+            DataType::List(item(DataType::List(item(DataType::Int32, true)), true)),
+            true,
+        ),
+        Field::new(
+            "req",
+            DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])),
+            false,
+        ),
         Field::new("tag", DataType::Utf8, true),
     ]))
 }
 
 fn maybe<T: Into<Value>>(rng: &mut StdRng, p: f64, v: impl FnOnce(&mut StdRng) -> T) -> Value {
-    if rng.random_bool(p) { Value::Null } else { v(rng).into() }
+    if rng.random_bool(p) {
+        Value::Null
+    } else {
+        v(rng).into()
+    }
 }
 
 fn gen_row(rng: &mut StdRng, id: i64) -> Value {
@@ -125,26 +137,39 @@ fn assert_model(store: &Store, name: &str, schema: &SchemaRef, rows: &[Value], c
     let got = current(store, name);
     let want = to_batch(schema, rows);
     assert_eq!(got.num_rows(), want.num_rows(), "{ctx}: row count");
-    assert_eq!(got.schema().fields(), want.schema().fields(), "{ctx}: schema");
+    assert_eq!(
+        got.schema().fields(),
+        want.schema().fields(),
+        "{ctx}: schema"
+    );
     for (i, f) in want.schema().fields().iter().enumerate() {
-        assert_eq!(got.column(i).as_ref(), want.column(i).as_ref(), "{ctx}: column {}", f.name());
+        assert_eq!(
+            got.column(i).as_ref(),
+            want.column(i).as_ref(),
+            "{ctx}: column {}",
+            f.name()
+        );
     }
 }
 
 #[test]
 fn arrow_nested_files_import_and_pages_roundtrip() {
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
     let schema = nested_schema();
     let mut rng = StdRng::seed_from_u64(1);
     let rows = gen_rows(&mut rng, 0, 1500);
     let batch = to_batch(&schema, &rows);
     let mut i = 0;
-    for codec in [Compression::SNAPPY, Compression::UNCOMPRESSED, Compression::ZSTD(Default::default())] {
+    for codec in [
+        Compression::SNAPPY,
+        Compression::UNCOMPRESSED,
+        Compression::ZSTD(Default::default()),
+    ] {
         for v2 in [false, true] {
             for dict in [false, true] {
                 let name = format!("f{i}");
                 i += 1;
+                let store = Store::open(d.path().join(format!("{name}.vpf"))).unwrap();
                 let bytes = write_parquet(&[batch.clone()], props(codec, v2, dict, 97, 700));
                 store.import(&name, &bytes).unwrap();
                 assert_eq!(current(&store, &name), batch, "{name}");
@@ -152,19 +177,30 @@ fn arrow_nested_files_import_and_pages_roundtrip() {
                 let leaves = view.schema.leaves().unwrap();
                 assert_eq!(leaves.len(), 12);
                 for seg in &view.segments {
-                    let SegmentData::RowGroup { rg, chunks, .. } = seg else { panic!() };
-                    let mut layouts: Vec<_> = chunks.iter().map(|c| chunk_layout(c).unwrap()).collect();
+                    let SegmentData::RowGroup { rg, chunks, .. } = seg else {
+                        panic!()
+                    };
+                    let mut layouts: Vec<_> =
+                        chunks.iter().map(|c| chunk_layout(c).unwrap()).collect();
                     for (li, (leaf, chunk)) in leaves.iter().zip(chunks).enumerate() {
-                        let raw: Vec<RawPage> =
-                            chunk.pages.iter().map(|p| RawPage::load(store.blobs(), p).unwrap()).collect();
+                        let raw: Vec<RawPage> = chunk
+                            .pages
+                            .iter()
+                            .map(|p| RawPage::load(store.blobs(), p).unwrap())
+                            .collect();
                         let whole = decode_pages(leaf, chunk.codec, &raw).unwrap();
                         assert_eq!(whole.num_rows() as i64, rg.num_rows, "{}", leaf.spec.name);
                         // Stored page row counts match the levels.
                         let rows = chunk_page_rows(leaf, chunk.codec, &raw).unwrap().unwrap();
-                        assert_eq!(rows, chunk.pages.iter().map(|p| p.num_rows).collect::<Vec<_>>());
+                        assert_eq!(
+                            rows,
+                            chunk.pages.iter().map(|p| p.num_rows).collect::<Vec<_>>()
+                        );
                         // Page-by-page decoding equals whole-chunk decoding.
-                        let dict_pages: Vec<RawPage> = raw.iter().filter(|p| !p.kind.is_data()).cloned().collect();
-                        let mut by_page = ColumnData::empty_leaf(leaf.physical(), leaf.max_def, leaf.max_rep);
+                        let dict_pages: Vec<RawPage> =
+                            raw.iter().filter(|p| !p.kind.is_data()).cloned().collect();
+                        let mut by_page =
+                            ColumnData::empty_leaf(leaf.physical(), leaf.max_def, leaf.max_rep);
                         for (p, pr) in raw.iter().zip(&chunk.pages) {
                             if !p.kind.is_data() {
                                 continue;
@@ -179,8 +215,11 @@ fn arrow_nested_files_import_and_pages_roundtrip() {
                         // Re-encoding is lossless and keeps record-aligned pages.
                         let enc = encode_column(leaf, chunk.codec, &whole, li % 2 == 0).unwrap();
                         assert_eq!(enc.page_rows.iter().sum::<i64>(), rg.num_rows);
-                        let raw2: Vec<RawPage> =
-                            enc.pages.iter().map(|(b, h)| RawPage::from_header(b.clone(), h)).collect();
+                        let raw2: Vec<RawPage> = enc
+                            .pages
+                            .iter()
+                            .map(|(b, h)| RawPage::from_header(b.clone(), h))
+                            .collect();
                         assert_eq!(decode_pages(leaf, chunk.codec, &raw2).unwrap(), whole);
                         layouts[li] = enc.layout(leaf.physical()).unwrap();
                     }
@@ -193,11 +232,22 @@ fn arrow_nested_files_import_and_pages_roundtrip() {
                             version: 1,
                             blobs: Some(store.blobs()),
                         },
-                        vec![RowGroupLayout { num_rows: rg.num_rows, chunks: layouts }],
+                        vec![RowGroupLayout {
+                            num_rows: rg.num_rows,
+                            chunks: layouts,
+                        }],
                     )
                     .unwrap();
-                    let start = view.segments.iter().take_while(|s| !std::ptr::eq(*s, seg)).map(|s| s.num_rows()).sum::<i64>();
-                    assert_eq!(read_virtual(&vf), batch.slice(start as usize, rg.num_rows as usize));
+                    let start = view
+                        .segments
+                        .iter()
+                        .take_while(|s| !std::ptr::eq(*s, seg))
+                        .map(|s| s.num_rows())
+                        .sum::<i64>();
+                    assert_eq!(
+                        read_virtual(&vf),
+                        batch.slice(start as usize, rg.num_rows as usize)
+                    );
                 }
             }
         }
@@ -227,13 +277,26 @@ fn nested_mutations_match_model() {
     let schema = nested_schema();
     let mut rng = StdRng::seed_from_u64(7);
     let mut model = gen_rows(&mut rng, 0, 900);
-    store.import("f", &write_parquet(&[to_batch(&schema, &model)], props(Compression::SNAPPY, false, true, 50, 400))).unwrap();
+    store
+        .import(
+            "f",
+            &write_parquet(
+                &[to_batch(&schema, &model)],
+                props(Compression::SNAPPY, false, true, 50, 400),
+            ),
+        )
+        .unwrap();
     assert_model(&store, "f", &schema, &model, "import");
 
     let mut next = 900i64;
     let preds = [
-        "s IS NULL", "s.a > 20", "s.inner.d IS NOT NULL", "m IS NULL AND id < 300", "tag = 'x'",
-        "l IS NOT NULL AND tag = 'y'", "req.k = 3",
+        "s IS NULL",
+        "s.a > 20",
+        "s.inner.d IS NOT NULL",
+        "m IS NULL AND id < 300",
+        "tag = 'x'",
+        "l IS NOT NULL AND tag = 'y'",
+        "req.k = 3",
     ];
     for step in 0..60 {
         let ctx = format!("step {step}");
@@ -242,7 +305,8 @@ fn nested_mutations_match_model() {
                 let n = rng.random_range(1..80);
                 let rows = gen_rows(&mut rng, next, n);
                 next += n as i64;
-                let mode = [AppendMode::Buffered, AppendMode::Direct, AppendMode::Auto][rng.random_range(0..3)];
+                let mode = [AppendMode::Buffered, AppendMode::Direct, AppendMode::Auto]
+                    [rng.random_range(0..3)];
                 store.append("f", &to_batch(&schema, &rows), mode).unwrap();
                 model.extend(rows);
             }
@@ -297,7 +361,9 @@ fn nested_mutations_match_model() {
                 let before = read_virtual(&vf);
                 let rows = gen_rows(&mut rng, next, 3);
                 next += 3;
-                store.append("f", &to_batch(&schema, &rows), AppendMode::Buffered).unwrap();
+                store
+                    .append("f", &to_batch(&schema, &rows), AppendMode::Buffered)
+                    .unwrap();
                 model.extend(rows);
                 assert_eq!(read_virtual(&vf), before);
             }
@@ -316,22 +382,43 @@ fn nested_mutations_match_model() {
     // Other readers see the same nested data.
     if python().is_some() {
         let exp = d.path().join("exp.parquet");
-        std::fs::write(&exp, write_parquet(&[to_batch(&schema, &model)], props(Compression::SNAPPY, false, true, 1000, 100_000))).unwrap();
+        std::fs::write(
+            &exp,
+            write_parquet(
+                &[to_batch(&schema, &model)],
+                props(Compression::SNAPPY, false, true, 1000, 100_000),
+            ),
+        )
+        .unwrap();
         let out = d.path().join("out.parquet");
         store.export("f", None, &out).unwrap();
-        run_python(&[&py_script("check_equal.py"), exp.to_str().unwrap(), out.to_str().unwrap()]);
+        run_python(&[
+            &py_script("check_equal.py"),
+            exp.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ]);
     }
 }
 
 #[test]
 fn nested_appends_into_created_file() {
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
     let schema = nested_schema();
-    store.create_from_arrow("c", &schema, Compression::ZSTD(Default::default())).unwrap();
+    store
+        .create_from_arrow("c", &schema, Compression::ZSTD(Default::default()))
+        .unwrap();
     let mut rng = StdRng::seed_from_u64(3);
     let mut model = Vec::new();
-    for (i, mode) in [AppendMode::Buffered, AppendMode::Direct, AppendMode::Buffered, AppendMode::Buffered].iter().enumerate() {
+    for (i, mode) in [
+        AppendMode::Buffered,
+        AppendMode::Direct,
+        AppendMode::Buffered,
+        AppendMode::Buffered,
+    ]
+    .iter()
+    .enumerate()
+    {
         let rows = gen_rows(&mut rng, i as i64 * 1000, 250);
         store.append("c", &to_batch(&schema, &rows), *mode).unwrap();
         model.extend(rows);
@@ -343,33 +430,65 @@ fn nested_appends_into_created_file() {
     // Missing nested columns are filled with NULL; a missing required nested column fails.
     let partial = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new("req", DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])), false),
+        Field::new(
+            "req",
+            DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])),
+            false,
+        ),
     ]));
     let rows = vec![json!({"id": 5000, "req": {"k": 1}})];
-    store.append("c", &to_batch(&partial, &rows), AppendMode::Buffered).unwrap();
+    store
+        .append("c", &to_batch(&partial, &rows), AppendMode::Buffered)
+        .unwrap();
     model.push(json!({"id": 5000, "req": {"k": 1}}));
     assert_model(&store, "c", &schema, &model, "partial");
     let only_id = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    assert!(store.append("c", &to_batch(&only_id, &[json!({"id": 1})]), AppendMode::Buffered).is_err());
+    assert!(
+        store
+            .append(
+                "c",
+                &to_batch(&only_id, &[json!({"id": 1})]),
+                AppendMode::Buffered
+            )
+            .is_err()
+    );
 
     // Compatible but different Arrow types are cast (Int32 list items -> Int64, LargeUtf8 -> Utf8).
     let alt = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("l", DataType::List(item(DataType::Int32, true)), true),
-        Field::new("req", DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])), false),
+        Field::new(
+            "req",
+            DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])),
+            false,
+        ),
         Field::new("tag", DataType::LargeUtf8, true),
     ]));
     let rows = vec![json!({"id": 6000, "l": [1, null, 3], "req": {"k": 2}, "tag": "t"})];
-    store.append("c", &to_batch(&alt, &rows), AppendMode::Direct).unwrap();
+    store
+        .append("c", &to_batch(&alt, &rows), AppendMode::Direct)
+        .unwrap();
     model.extend(rows);
     assert_model(&store, "c", &schema, &model, "cast");
     // Incompatible nested types are rejected.
     let wrong = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("s", DataType::Int32, true),
-        Field::new("req", DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])), false),
+        Field::new(
+            "req",
+            DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int32, false)])),
+            false,
+        ),
     ]));
-    assert!(store.append("c", &to_batch(&wrong, &[json!({"id": 1, "s": 1, "req": {"k": 1}})]), AppendMode::Direct).is_err());
+    assert!(
+        store
+            .append(
+                "c",
+                &to_batch(&wrong, &[json!({"id": 1, "s": 1, "req": {"k": 1}})]),
+                AppendMode::Direct
+            )
+            .is_err()
+    );
     // Nulls inside a required nested field are rejected.
     let req_fields = Fields::from(vec![Field::new("k", DataType::Int32, false)]);
     let req_col = arrow::array::StructArray::new(
@@ -381,7 +500,14 @@ fn nested_appends_into_created_file() {
         Field::new("id", DataType::Int64, false),
         Field::new("req", DataType::Struct(req_fields), true),
     ]));
-    let nulls = RecordBatch::try_new(lax, vec![Arc::new(arrow::array::Int64Array::from(vec![7000, 7001])), Arc::new(req_col)]).unwrap();
+    let nulls = RecordBatch::try_new(
+        lax,
+        vec![
+            Arc::new(arrow::array::Int64Array::from(vec![7000, 7001])),
+            Arc::new(req_col),
+        ],
+    )
+    .unwrap();
     for mode in [AppendMode::Direct, AppendMode::Buffered] {
         assert!(store.append("c", &nulls, mode).is_err());
     }
@@ -391,42 +517,102 @@ fn nested_appends_into_created_file() {
 #[test]
 fn nested_schema_evolution() {
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
     let schema = nested_schema();
     let mut rng = StdRng::seed_from_u64(11);
     let mut model = gen_rows(&mut rng, 0, 600);
-    store.import("f", &write_parquet(&[to_batch(&schema, &model)], props(Compression::SNAPPY, true, true, 60, 250))).unwrap();
+    store
+        .import(
+            "f",
+            &write_parquet(
+                &[to_batch(&schema, &model)],
+                props(Compression::SNAPPY, true, true, 60, 250),
+            ),
+        )
+        .unwrap();
     let extra = gen_rows(&mut rng, 600, 20);
-    store.append("f", &to_batch(&schema, &extra), AppendMode::Buffered).unwrap();
+    store
+        .append("f", &to_batch(&schema, &extra), AppendMode::Buffered)
+        .unwrap();
     model.extend(extra);
 
     // Add a nested column: existing rows read NULL; it is appendable afterwards.
     let tree = parquet::arrow::ArrowSchemaConverter::new()
-        .convert(&Schema::new(vec![Field::new("extra", DataType::List(item(DataType::Utf8, true)), true)]))
+        .convert(&Schema::new(vec![Field::new(
+            "extra",
+            DataType::List(item(DataType::Utf8, true)),
+            true,
+        )]))
         .unwrap();
     let spec = ColumnSpec::from_parquet_type(0, &tree.root_schema().get_fields()[0]).unwrap();
-    assert!(store.alter("f", AlterOp::AddColumn { spec: spec.clone(), default: Some(Literal::Str("x".into())) }).is_err());
-    let sum = store.alter("f", AlterOp::AddColumn { spec, default: None }).unwrap();
+    assert!(
+        store
+            .alter(
+                "f",
+                AlterOp::AddColumn {
+                    spec: spec.clone(),
+                    default: Some(Literal::Str("x".into()))
+                }
+            )
+            .is_err()
+    );
+    let sum = store
+        .alter(
+            "f",
+            AlterOp::AddColumn {
+                spec,
+                default: None,
+            },
+        )
+        .unwrap();
     assert_eq!(sum.row_groups_rewritten, 3);
     let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-    fields.push(Field::new("extra", DataType::List(item(DataType::Utf8, true)), true));
+    fields.push(Field::new(
+        "extra",
+        DataType::List(item(DataType::Utf8, true)),
+        true,
+    ));
     let mut schema = Arc::new(Schema::new(fields));
     assert_model(&store, "f", &schema, &model, "add");
     let rows = vec![json!({"id": 1000, "req": {"k": 1}, "extra": ["a", null]})];
-    store.append("f", &to_batch(&schema, &rows), AppendMode::Buffered).unwrap();
+    store
+        .append("f", &to_batch(&schema, &rows), AppendMode::Buffered)
+        .unwrap();
     model.extend(rows);
     assert_model(&store, "f", &schema, &model, "append after add");
 
     // Rename / reorder / drop are metadata only.
-    store.alter("f", AlterOp::RenameColumn { from: "s".into(), to: "s2".into() }).unwrap();
+    store
+        .alter(
+            "f",
+            AlterOp::RenameColumn {
+                from: "s".into(),
+                to: "s2".into(),
+            },
+        )
+        .unwrap();
     let rename = |schema: &SchemaRef, from: &str, to: &str| {
         Arc::new(Schema::new(
-            schema.fields().iter().map(|f| if f.name() == from { f.as_ref().clone().with_name(to) } else { f.as_ref().clone() }).collect::<Vec<_>>(),
+            schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    if f.name() == from {
+                        f.as_ref().clone().with_name(to)
+                    } else {
+                        f.as_ref().clone()
+                    }
+                })
+                .collect::<Vec<_>>(),
         ))
     };
     schema = rename(&schema, "s", "s2");
     for r in &mut model {
-        let v = r.as_object_mut().unwrap().remove("s").unwrap_or(Value::Null);
+        let v = r
+            .as_object_mut()
+            .unwrap()
+            .remove("s")
+            .unwrap_or(Value::Null);
         r["s2"] = v;
     }
     assert_model(&store, "f", &schema, &model, "rename");
@@ -435,19 +621,48 @@ fn nested_schema_evolution() {
     assert_model(&store, "f", &schema, &model, "delete by renamed path");
 
     let order = ["m", "id", "ll", "s2", "ls", "l", "extra", "req", "tag"];
-    store.alter("f", AlterOp::Reorder(order.iter().map(|s| s.to_string()).collect())).unwrap();
-    schema = Arc::new(Schema::new(order.iter().map(|n| schema.field_with_name(n).unwrap().clone()).collect::<Vec<_>>()));
+    store
+        .alter(
+            "f",
+            AlterOp::Reorder(order.iter().map(|s| s.to_string()).collect()),
+        )
+        .unwrap();
+    schema = Arc::new(Schema::new(
+        order
+            .iter()
+            .map(|n| schema.field_with_name(n).unwrap().clone())
+            .collect::<Vec<_>>(),
+    ));
     assert_model(&store, "f", &schema, &model, "reorder");
 
     store.alter("f", AlterOp::DropColumn("ls".into())).unwrap();
-    schema = Arc::new(Schema::new(schema.fields().iter().filter(|f| f.name() != "ls").map(|f| f.as_ref().clone()).collect::<Vec<_>>()));
+    schema = Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != "ls")
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+    ));
     assert_model(&store, "f", &schema, &model, "drop");
 
     // Required nested -> optional: every leaf gains a definition level.
     assert!(store.alter("f", AlterOp::MakeOptional("m".into())).is_err());
-    store.alter("f", AlterOp::MakeOptional("req".into())).unwrap();
+    store
+        .alter("f", AlterOp::MakeOptional("req".into()))
+        .unwrap();
     schema = Arc::new(Schema::new(
-        schema.fields().iter().map(|f| if f.name() == "req" { f.as_ref().clone().with_nullable(true) } else { f.as_ref().clone() }).collect::<Vec<_>>(),
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == "req" {
+                    f.as_ref().clone().with_nullable(true)
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect::<Vec<_>>(),
     ));
     assert_model(&store, "f", &schema, &model, "make optional");
     let s = store.update_where("f", "req = NULL", "id < 100").unwrap();
@@ -456,14 +671,29 @@ fn nested_schema_evolution() {
     }
     assert!(s.rows_updated > 0);
     assert_model(&store, "f", &schema, &model, "null after make optional");
-    let rows = vec![json!({"id": 2000, "req": null}), json!({"id": 2001, "req": {"k": 4}})];
-    store.append("f", &to_batch(&schema, &rows), AppendMode::Direct).unwrap();
+    let rows = vec![
+        json!({"id": 2000, "req": null}),
+        json!({"id": 2001, "req": {"k": 4}}),
+    ];
+    store
+        .append("f", &to_batch(&schema, &rows), AppendMode::Direct)
+        .unwrap();
     model.extend(rows);
     store.flush("f").unwrap();
     assert_model(&store, "f", &schema, &model, "append after make optional");
 
     // Widening nested columns is unsupported.
-    assert!(store.alter("f", AlterOp::Widen { column: "l".into(), to: parquet::basic::Type::INT64 }).is_err());
+    assert!(
+        store
+            .alter(
+                "f",
+                AlterOp::Widen {
+                    column: "l".into(),
+                    to: parquet::basic::Type::INT64
+                }
+            )
+            .is_err()
+    );
     assert_model(&store, "f", &schema, &model, "final");
 }
 
@@ -477,27 +707,44 @@ fn pyarrow_nested_fixtures() {
     let fx = d.path().join("fx");
     std::fs::create_dir_all(&fx).unwrap();
     run_python(&[&py_script("gen_nested.py"), fx.to_str().unwrap()]);
-    let store = Store::open(d.path().join("s")).unwrap();
     let mut names: Vec<String> = std::fs::read_dir(&fx)
         .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().trim_end_matches(".parquet").to_string())
+        .map(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .trim_end_matches(".parquet")
+                .to_string()
+        })
         .collect();
     names.sort();
     assert!(names.len() >= 6, "{names:?}");
     for name in &names {
         let src = fx.join(format!("{name}.parquet"));
+        let store = Store::open(d.path().join(format!("{name}.vpf"))).unwrap();
         store.import_file(name, &src).unwrap();
         let out = d.path().join(format!("{name}.out.parquet"));
         store.export(name, None, &out).unwrap();
-        run_python(&[&py_script("check_equal.py"), src.to_str().unwrap(), out.to_str().unwrap()]);
+        run_python(&[
+            &py_script("check_equal.py"),
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ]);
         // Mutate: delete a window of rows and null a nested column, then compare against
         // the same operations done by pyarrow.
         let view = store.view(name, None).unwrap();
         let s = store.delete_where(name, "id >= 100 AND id < 160").unwrap();
         assert!(s.rows_deleted > 0, "{name}");
-        let col = view.schema.columns.iter().find(|c| c.is_nested() && c.nullable).map(|c| c.name.clone());
+        let col = view
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.is_nested() && c.nullable)
+            .map(|c| c.name.clone());
         if let Some(c) = &col {
-            store.update_where(name, &format!("{c} = NULL"), "id < 50").unwrap();
+            store
+                .update_where(name, &format!("{c} = NULL"), "id < 50")
+                .unwrap();
         }
         store.export(name, None, &out).unwrap();
         run_python(&[
@@ -522,12 +769,19 @@ fn legacy_two_level_lists() {
     );
     let mut buf = Vec::new();
     {
-        let props = Arc::new(WriterProperties::builder().set_data_page_row_count_limit(7).set_write_batch_size(5).build());
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_data_page_row_count_limit(7)
+                .set_write_batch_size(5)
+                .build(),
+        );
         let mut w = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
         let mut rg = w.next_row_group().unwrap();
         let ids: Vec<i64> = (0..50).collect();
         let mut c = rg.next_column().unwrap().unwrap();
-        c.typed::<Int64Type>().write_batch(&ids, None, None).unwrap();
+        c.typed::<Int64Type>()
+            .write_batch(&ids, None, None)
+            .unwrap();
         c.close().unwrap();
         // tags: row i has i % 4 elements; i % 5 == 0 is NULL.
         let (mut vals, mut defs, mut reps) = (Vec::new(), Vec::new(), Vec::new());
@@ -549,7 +803,9 @@ fn legacy_two_level_lists() {
             }
         }
         let mut c = rg.next_column().unwrap().unwrap();
-        c.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), Some(&reps)).unwrap();
+        c.typed::<ByteArrayType>()
+            .write_batch(&vals, Some(&defs), Some(&reps))
+            .unwrap();
         c.close().unwrap();
         let (mut vals, mut defs, mut reps) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..50i32 {
@@ -565,7 +821,9 @@ fn legacy_two_level_lists() {
             }
         }
         let mut c = rg.next_column().unwrap().unwrap();
-        c.typed::<parquet::data_type::Int32Type>().write_batch(&vals, Some(&defs), Some(&reps)).unwrap();
+        c.typed::<parquet::data_type::Int32Type>()
+            .write_batch(&vals, Some(&defs), Some(&reps))
+            .unwrap();
         c.close().unwrap();
         rg.close().unwrap();
         w.close().unwrap();
@@ -573,10 +831,12 @@ fn legacy_two_level_lists() {
     let bytes = bytes::Bytes::from(buf);
     let original = concat(&read_parquet(bytes.clone()));
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
     store.import("leg", &bytes).unwrap();
     let view = store.view("leg", None).unwrap();
-    let SegmentData::RowGroup { chunks, .. } = &view.segments[0] else { panic!() };
+    let SegmentData::RowGroup { chunks, .. } = &view.segments[0] else {
+        panic!()
+    };
     assert!(chunks[1].pages.len() > 2, "multiple pages");
     assert_eq!(current(&store, "leg"), original);
 
@@ -593,11 +853,19 @@ fn legacy_two_level_lists() {
     assert_eq!(got.column(2), exp.column(2));
     let tags = got.column(1);
     for i in 0..40 {
-        let id = exp.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(i);
+        let id = exp
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(i);
         if id > 40 {
             assert!(tags.is_null(i));
         } else {
-            assert_eq!(tags.slice(i, 1).to_data(), exp.column(1).slice(i, 1).to_data());
+            assert_eq!(
+                tags.slice(i, 1).to_data(),
+                exp.column(1).slice(i, 1).to_data()
+            );
         }
     }
 
@@ -704,7 +972,10 @@ fn records_split_across_v1_pages_are_reencoded() {
     let n_pages = pages.len();
     let enc = vpf::codec::EncodedChunk {
         pages,
-        encodings: vec![parquet::basic::Encoding::PLAIN, parquet::basic::Encoding::RLE],
+        encodings: vec![
+            parquet::basic::Encoding::PLAIN,
+            parquet::basic::Encoding::RLE,
+        ],
         stats: None,
         num_values: defs.len() as i64,
         codec: Compression::UNCOMPRESSED,
@@ -712,8 +983,17 @@ fn records_split_across_v1_pages_are_reencoded() {
         page_stats: vec![None; n_pages],
     };
     let vf = VirtualFile::build(
-        FileProps { schema: descr, created_by: None, key_value: None, version: 1, blobs: None },
-        vec![RowGroupLayout { num_rows, chunks: vec![enc.layout(parquet::basic::Type::INT32).unwrap()] }],
+        FileProps {
+            schema: descr,
+            created_by: None,
+            key_value: None,
+            version: 1,
+            blobs: None,
+        },
+        vec![RowGroupLayout {
+            num_rows,
+            chunks: vec![enc.layout(parquet::basic::Type::INT32).unwrap()],
+        }],
     )
     .unwrap();
     let bytes = bytes::Bytes::from(vf.to_bytes().unwrap());
@@ -721,19 +1001,37 @@ fn records_split_across_v1_pages_are_reencoded() {
     assert_eq!(original.num_rows(), num_rows as usize);
 
     let d = tempfile::tempdir().unwrap();
-    let store = Store::open(d.path()).unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
     store.import("split", &bytes).unwrap();
     assert_eq!(current(&store, "split"), original);
     // Stored pages are record aligned and their row counts are exact.
     let view = store.view("split", None).unwrap();
     let leaf = &view.schema.leaves().unwrap()[0];
-    let SegmentData::RowGroup { chunks, .. } = &view.segments[0] else { panic!() };
-    let raw: Vec<RawPage> = chunks[0].pages.iter().map(|p| RawPage::load(store.blobs(), p).unwrap()).collect();
-    let rows = chunk_page_rows(leaf, chunks[0].codec, &raw).unwrap().expect("aligned after import");
-    assert_eq!(rows, chunks[0].pages.iter().map(|p| p.num_rows).collect::<Vec<_>>());
+    let SegmentData::RowGroup { chunks, .. } = &view.segments[0] else {
+        panic!()
+    };
+    let raw: Vec<RawPage> = chunks[0]
+        .pages
+        .iter()
+        .map(|p| RawPage::load(store.blobs(), p).unwrap())
+        .collect();
+    let rows = chunk_page_rows(leaf, chunks[0].codec, &raw)
+        .unwrap()
+        .expect("aligned after import");
+    assert_eq!(
+        rows,
+        chunks[0]
+            .pages
+            .iter()
+            .map(|p| p.num_rows)
+            .collect::<Vec<_>>()
+    );
     assert_eq!(rows.iter().sum::<i64>(), num_rows);
     // And page-level mutations work afterwards.
     store.delete_where("split", "l IS NULL").unwrap();
     let keep: arrow::array::BooleanArray = (0..num_rows).map(|i| Some(i % 7 != 0)).collect();
-    assert_eq!(current(&store, "split"), arrow::compute::filter_record_batch(&original, &keep).unwrap());
+    assert_eq!(
+        current(&store, "split"),
+        arrow::compute::filter_record_batch(&original, &keep).unwrap()
+    );
 }

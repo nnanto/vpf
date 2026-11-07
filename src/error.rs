@@ -20,6 +20,9 @@ pub enum Error {
     Invalid(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The table changed since the snapshot a write was based on; retry against the latest.
+    #[error("write conflict: {0}")]
+    Conflict(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

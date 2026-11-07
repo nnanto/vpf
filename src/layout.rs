@@ -7,18 +7,18 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::metadata::{
-    ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData, KeyValue, OffsetIndexBuilder, ParquetMetaData,
-    ParquetMetaDataWriter, RowGroupMetaData, page_index::PageIndexBuilder,
+    ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData, KeyValue, OffsetIndexBuilder,
+    ParquetMetaData, ParquetMetaDataWriter, RowGroupMetaData, page_index::PageIndexBuilder,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
-use parquet::file::writer::TrackedWrite;
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
+use parquet::file::writer::TrackedWrite;
 use parquet::schema::types::SchemaDescPtr;
 
 use crate::error::{Error, Result};
 use crate::stats::{PageStats, StatType, boundary_order};
-use crate::store::BlobStore;
+use crate::store::{BlobRead, BlobStore};
 use crate::thrift::PageKind;
 
 const MAGIC: &[u8; 4] = b"PAR1";
@@ -101,7 +101,11 @@ pub struct FileProps<'a> {
 impl VirtualFile {
     pub fn build(props: FileProps<'_>, row_groups: Vec<RowGroupLayout>) -> Result<Self> {
         let ncols = props.schema.num_columns();
-        let mut extents = vec![Extent { voff: 0, len: 4, src: ByteSource::Mem(Bytes::from_static(MAGIC)) }];
+        let mut extents = vec![Extent {
+            voff: 0,
+            len: 4,
+            src: ByteSource::Mem(Bytes::from_static(MAGIC)),
+        }];
         let mut voff = 4u64;
         let mut rg_meta = Vec::with_capacity(row_groups.len());
         let mut total_rows = 0i64;
@@ -131,7 +135,9 @@ impl VirtualFile {
                     match page.kind {
                         PageKind::Dictionary => {
                             if dict_off.is_some() || data_off.is_some() {
-                                return Err(Error::Corrupt("dictionary page must be first in chunk".into()));
+                                return Err(Error::Corrupt(
+                                    "dictionary page must be first in chunk".into(),
+                                ));
                             }
                             dict_off = Some(voff as i64);
                         }
@@ -161,12 +167,19 @@ impl VirtualFile {
                     }
                     comp += page.len as i64;
                     uncomp += page.uncompressed_len;
-                    extents.push(Extent { voff, len: page.len, src: page.src });
+                    extents.push(Extent {
+                        voff,
+                        len: page.len,
+                        src: page.src,
+                    });
                     voff += page.len;
                 }
-                let data_off = data_off.ok_or_else(|| Error::Corrupt("column chunk without data pages".into()))?;
+                let data_off = data_off
+                    .ok_or_else(|| Error::Corrupt("column chunk without data pages".into()))?;
                 if data_rows != chunk.num_values {
-                    return Err(Error::Corrupt("chunk num_values does not match pages".into()));
+                    return Err(Error::Corrupt(
+                        "chunk num_values does not match pages".into(),
+                    ));
                 }
                 if oi.is_some() && first_row != rg.num_rows {
                     return Err(Error::Corrupt(format!(
@@ -178,7 +191,11 @@ impl VirtualFile {
                     index.put_offset_index(oi.build(), rgi, ci);
                     has_index = true;
                     if let Some(ps) = page_stats {
-                        index.put_column_index(column_index(&stat_type, props.schema.column(ci).physical_type(), &ps)?, rgi, ci);
+                        index.put_column_index(
+                            column_index(&stat_type, props.schema.column(ci).physical_type(), &ps)?,
+                            rgi,
+                            ci,
+                        );
                     }
                 }
                 let mut b = ColumnChunkMetaData::builder(props.schema.column(ci))
@@ -215,15 +232,26 @@ impl VirtualFile {
         );
         let mut metadata = ParquetMetaData::new(file_meta, rg_meta);
         if has_index {
-            metadata = metadata.into_builder().set_page_index(Some(Arc::new(index.build()))).build();
+            metadata = metadata
+                .into_builder()
+                .set_page_index(Some(Arc::new(index.build())))
+                .build();
         }
         let footer = write_footer(&metadata, voff)?;
         let footer_len = footer.len() as u64;
-        extents.push(Extent { voff, len: footer_len, src: ByteSource::Mem(Bytes::from(footer)) });
+        extents.push(Extent {
+            voff,
+            len: footer_len,
+            src: ByteSource::Mem(Bytes::from(footer)),
+        });
         voff += footer_len;
-        let needs_blobs = extents.iter().any(|e| matches!(e.src, ByteSource::Blob { .. }));
+        let needs_blobs = extents
+            .iter()
+            .any(|e| matches!(e.src, ByteSource::Blob { .. }));
         if needs_blobs && props.blobs.is_none() {
-            return Err(Error::Invalid("blob-backed pages require a blob store".into()));
+            return Err(Error::Invalid(
+                "blob-backed pages require a blob store".into(),
+            ));
         }
         Ok(Self {
             inner: Arc::new(Inner {
@@ -268,9 +296,11 @@ impl VirtualFile {
             let dst = &mut buf[done..done + n];
             match &e.src {
                 ByteSource::Mem(b) => dst.copy_from_slice(&b[within as usize..within as usize + n]),
-                ByteSource::Blob { offset: bo } => {
-                    inner.blobs.as_ref().expect("checked at build").read_exact_at(dst, bo + within)?
-                }
+                ByteSource::Blob { offset: bo } => inner
+                    .blobs
+                    .as_ref()
+                    .expect("checked at build")
+                    .read_exact_at(dst, bo + within)?,
             }
             done += n;
             idx += 1;
@@ -279,8 +309,14 @@ impl VirtualFile {
     }
 
     pub fn read_range(&self, offset: u64, len: usize) -> Result<Bytes> {
-        if offset.checked_add(len as u64).is_none_or(|end| end > self.inner.size) {
-            return Err(Error::Invalid(format!("range {offset}+{len} beyond file size {}", self.inner.size)));
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.inner.size)
+        {
+            return Err(Error::Invalid(format!(
+                "range {offset}+{len} beyond file size {}",
+                self.inner.size
+            )));
         }
         let mut buf = vec![0u8; len];
         self.read_at(offset, &mut buf)?;
@@ -319,7 +355,10 @@ pub struct VirtualReader {
 
 impl Read for VirtualReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.file.read_at(self.pos, buf).map_err(std::io::Error::other)?;
+        let n = self
+            .file
+            .read_at(self.pos, buf)
+            .map_err(std::io::Error::other)?;
         self.pos += n as u64;
         Ok(n)
     }
@@ -329,11 +368,15 @@ impl ChunkReader for VirtualFile {
     type T = VirtualReader;
 
     fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
-        Ok(VirtualReader { file: self.clone(), pos: start })
+        Ok(VirtualReader {
+            file: self.clone(),
+            pos: start,
+        })
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
-        self.read_range(start, length).map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+        self.read_range(start, length)
+            .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
     }
 }
 
@@ -351,7 +394,11 @@ fn column_index(
             p.min.clone().unwrap_or_default(),
             p.max.clone().unwrap_or_default(),
             p.null_count as i64,
-            if has_nan { p.nan_count.map(|n| n as i64) } else { None },
+            if has_nan {
+                p.nan_count.map(|n| n as i64)
+            } else {
+                None
+            },
         );
     }
     b.set_boundary_order(boundary_order(t, &pages.iter().collect::<Vec<_>>()));
@@ -381,7 +428,10 @@ impl std::io::Write for SkipSink {
 /// file offset `start`, so that page index offsets in the metadata are absolute.
 fn write_footer(md: &ParquetMetaData, start: u64) -> Result<Vec<u8>> {
     static ZEROS: [u8; 1 << 16] = [0; 1 << 16];
-    let mut sink = SkipSink { skip: start, out: Vec::new() };
+    let mut sink = SkipSink {
+        skip: start,
+        out: Vec::new(),
+    };
     {
         let mut w = TrackedWrite::new(&mut sink);
         let mut left = start;

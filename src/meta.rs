@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS pages (
     uncompressed_len INTEGER NOT NULL,
     stats TEXT
 );
+CREATE TABLE IF NOT EXISTS blobs (
+    start INTEGER PRIMARY KEY,
+    data BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id INTEGER PRIMARY KEY,
     physical_type TEXT NOT NULL,
@@ -232,8 +236,18 @@ pub struct BatchRow {
     pub payload: Vec<u8>,
 }
 
-fn file_from_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, String, Option<i64>, i64, i64, Option<String>, i32)> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+fn file_from_row(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<(i64, String, Option<i64>, i64, i64, Option<String>, i32)> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+    ))
 }
 
 pub fn load_file(conn: &Connection, name: &str) -> Result<FileRow> {
@@ -259,7 +273,9 @@ pub fn load_file(conn: &Connection, name: &str) -> Result<FileRow> {
 
 pub fn list_files(conn: &Connection) -> Result<Vec<String>> {
     let mut st = conn.prepare("SELECT name FROM files ORDER BY name")?;
-    let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    let rows = st
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(rows)
 }
 
@@ -293,7 +309,9 @@ pub fn list_snapshots(conn: &Connection, file_id: i64) -> Result<Vec<SnapshotInf
     let mut st = conn.prepare(&format!(
         "SELECT {SNAPSHOT_COLS} FROM snapshots WHERE file_id = ?1 ORDER BY snapshot_id"
     ))?;
-    let rows = st.query_map([file_id], snapshot_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = st
+        .query_map([file_id], snapshot_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -309,7 +327,10 @@ pub fn load_schema(conn: &Connection, schema_version_id: i64) -> Result<SchemaVe
     let key_value = kv_json
         .map(|s| -> Result<Vec<KeyValue>> {
             let pairs: Vec<(String, Option<String>)> = serde_json::from_str(&s)?;
-            Ok(pairs.into_iter().map(|(k, v)| KeyValue { key: k, value: v }).collect())
+            Ok(pairs
+                .into_iter()
+                .map(|(k, v)| KeyValue { key: k, value: v })
+                .collect())
         })
         .transpose()?;
     let mut st = conn.prepare(
@@ -343,7 +364,12 @@ pub fn load_schema(conn: &Connection, schema_version_id: i64) -> Result<SchemaVe
                 .transpose()?,
         });
     }
-    Ok(SchemaVersion { schema_version_id, root_name, columns, key_value })
+    Ok(SchemaVersion {
+        schema_version_id,
+        root_name,
+        columns,
+        key_value,
+    })
 }
 
 pub fn insert_schema(
@@ -357,11 +383,16 @@ pub fn insert_schema(
     let mut names = std::collections::HashSet::new();
     for c in columns {
         if !names.insert(c.name.as_str()) {
-            return Err(Error::Invalid(format!("duplicate column name '{}'", c.name)));
+            return Err(Error::Invalid(format!(
+                "duplicate column name '{}'",
+                c.name
+            )));
         }
     }
     if columns.is_empty() {
-        return Err(Error::Invalid("schema must have at least one column".into()));
+        return Err(Error::Invalid(
+            "schema must have at least one column".into(),
+        ));
     }
     let kv_json = kv
         .map(|kv| serde_json::to_string(&kv.iter().map(|k| (&k.key, &k.value)).collect::<Vec<_>>()))
@@ -377,8 +408,18 @@ pub fn insert_schema(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     for (i, c) in columns.iter().enumerate() {
-        let logical = c.logical.as_ref().map(logical_to_json).transpose()?.map(|v| v.to_string());
-        let nested = c.nested.as_deref().map(crate::schema::type_to_json).transpose()?.map(|v| v.to_string());
+        let logical = c
+            .logical
+            .as_ref()
+            .map(logical_to_json)
+            .transpose()?
+            .map(|v| v.to_string());
+        let nested = c
+            .nested
+            .as_deref()
+            .map(crate::schema::type_to_json)
+            .transpose()?
+            .map(|v| v.to_string());
         st.execute(params![
             id,
             c.column_id,
@@ -411,7 +452,11 @@ pub fn visible_segments(conn: &Connection, file_id: i64, snapshot_id: i64) -> Re
             Ok(Segment {
                 segment_id: r.get(0)?,
                 pos: r.get(1)?,
-                kind: if kind == 0 { SegmentKind::RowGroup } else { SegmentKind::Batch },
+                kind: if kind == 0 {
+                    SegmentKind::RowGroup
+                } else {
+                    SegmentKind::Batch
+                },
                 obj_id: r.get(3)?,
             })
         })?
@@ -421,14 +466,23 @@ pub fn visible_segments(conn: &Connection, file_id: i64, snapshot_id: i64) -> Re
 
 pub fn load_row_group(conn: &Connection, rg_id: i64) -> Result<RowGroupRow> {
     let num_rows: i64 = conn
-        .query_row("SELECT num_rows FROM row_groups WHERE rg_id = ?1", [rg_id], |r| r.get(0))
+        .query_row(
+            "SELECT num_rows FROM row_groups WHERE rg_id = ?1",
+            [rg_id],
+            |r| r.get(0),
+        )
         .optional()?
         .ok_or_else(|| Error::Corrupt(format!("missing row group {rg_id}")))?;
-    let mut st = conn.prepare_cached("SELECT column_id, leaf, chunk_id FROM rg_chunks WHERE rg_id = ?1")?;
+    let mut st =
+        conn.prepare_cached("SELECT column_id, leaf, chunk_id FROM rg_chunks WHERE rg_id = ?1")?;
     let chunks = st
         .query_map([rg_id], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?
         .collect::<rusqlite::Result<HashMap<(i64, i64), i64>>>()?;
-    Ok(RowGroupRow { rg_id, num_rows, chunks })
+    Ok(RowGroupRow {
+        rg_id,
+        num_rows,
+        chunks,
+    })
 }
 
 pub fn load_chunk(conn: &Connection, chunk_id: i64) -> Result<ChunkRow> {
@@ -443,7 +497,10 @@ pub fn load_chunk(conn: &Connection, chunk_id: i64) -> Result<ChunkRow> {
     let enc_names: Vec<String> = serde_json::from_str(&encodings)?;
     let encodings = enc_names
         .iter()
-        .map(|e| e.parse::<Encoding>().map_err(|e| Error::Corrupt(e.to_string())))
+        .map(|e| {
+            e.parse::<Encoding>()
+                .map_err(|e| Error::Corrupt(e.to_string()))
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut st = conn.prepare_cached(
         "SELECT p.page_id, p.blob_offset, p.blob_len, p.kind, p.num_values, p.num_rows, p.uncompressed_len, p.stats
@@ -463,7 +520,10 @@ pub fn load_chunk(conn: &Connection, chunk_id: i64) -> Result<ChunkRow> {
             num_values: r.get(4)?,
             num_rows: r.get(5)?,
             uncompressed_len: r.get(6)?,
-            stats: r.get::<_, Option<String>>(7)?.map(|s| serde_json::from_str(&s)).transpose()?,
+            stats: r
+                .get::<_, Option<String>>(7)?
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
         });
     }
     Ok(ChunkRow {
@@ -481,7 +541,14 @@ pub fn load_batch(conn: &Connection, batch_id: i64) -> Result<BatchRow> {
     conn.query_row(
         "SELECT schema_version_id, num_rows, payload FROM batches WHERE batch_id = ?1",
         [batch_id],
-        |r| Ok(BatchRow { batch_id, schema_version_id: r.get(0)?, num_rows: r.get(1)?, payload: r.get(2)? }),
+        |r| {
+            Ok(BatchRow {
+                batch_id,
+                schema_version_id: r.get(0)?,
+                num_rows: r.get(1)?,
+                payload: r.get(2)?,
+            })
+        },
     )
     .optional()?
     .ok_or_else(|| Error::Corrupt(format!("missing batch {batch_id}")))

@@ -1,6 +1,7 @@
 # vpf — mutable virtual Parquet files
 
-`vpf` stores Parquet data as **immutable pages** plus **SQLite metadata**, and serves every
+A `.vpf` file holds **one table**, the way a SQLite file holds a database. It stores
+Parquet data as **immutable pages** plus **metadata** in a single SQLite file, and serves every
 snapshot as a **byte-addressable, standards-compliant Parquet file** that is assembled on the
 fly. Updates, deletes, appends and schema changes are page-level copy-on-write: only the
 pages that actually change are written, and every earlier version stays readable (time travel).
@@ -11,11 +12,16 @@ or after `vpf export`. The test suite checks the output with arrow-rs, PyArrow a
 ## How it works
 
 ```
-store/
-  meta.db    SQLite (WAL): files, schema versions, snapshots, pages, chunks,
-             row groups, buffered batches, segments
-  data.bin   append-only blob log of compressed Parquet pages (header + body)
+sales.vpf    one SQLite database (WAL) holding one table:
+  blobs        compressed Parquet pages (header + body), never modified once written
+  metadata     table, schema versions, snapshots, pages, chunks, row groups,
+               buffered batches, segments
 ```
+
+Page bytes and metadata commit in the same SQLite transaction, so a failed write leaves
+nothing behind. A file is a portable unit: copy it (with no writer active, or using
+SQLite's backup API) and you have the table and its full history. Several readers and
+one writer can use a file at a time.
 
 * **Pages** are stored exactly as found in the source file (compressed, with their Thrift
   header), so importing a file and reading it back returns the original page bytes.
@@ -31,7 +37,7 @@ store/
 * **Reading** a snapshot (`Store::open_snapshot`) builds a `VirtualFile`. It assigns virtual
   offsets to every page, rewrites each page header only where needed (for example dictionary
   offsets), synthesizes Parquet for buffered batches, and generates a fresh footer. Reads
-  are served by range from the blob log.
+  are served by range from the stored page blobs.
 * **Columns have stable ids**. Rename, reorder and drop only change metadata, and a chunk
   keeps belonging to its column across schema versions.
 
@@ -140,26 +146,26 @@ out.
 
 ```
 cargo build --release
-export VPF_STORE=./mystore            # or --store DIR
 
-vpf import sales data.parquet
-vpf create events id:int64:required name:string at:timestamp_us amount:decimal(12,2) --codec zstd
-vpf create docs id:int64:required tags:list<string> attrs:map<string,int64> 'pt:struct<x:double!,y:list<int32>>'
-vpf append sales --parquet more.parquet           # --mode auto|buffered|direct
-echo '{"id": 1, "name": "x"}' | vpf append events --json -
-vpf delete sales --where "region = 'EU' AND amount < 10"
-vpf delete docs --where "pt.x > 2 OR tags IS NULL"
-vpf update sales --set "status = 'void', amount = NULL" --where "id IN (3, 5, 8)"
-vpf alter sales add-column level int64 --required --default 0
-vpf alter sales rename-column amount total
-vpf alter sales widen qty int64
-vpf alter sales make-optional id
-vpf alter sales reorder id total level ...
-vpf alter sales drop-column legacy
-vpf flush sales
-vpf ls | snapshots sales | schema sales --at 3 | stats sales
-vpf cat sales --limit 20 --format table|json|csv --at 5
-vpf export sales out.parquet --at 5
+# vpf FILE COMMAND ...   (`create` and `import` create FILE; the table is named after its stem)
+vpf sales.vpf import data.parquet
+vpf events.vpf create id:int64:required name:string at:timestamp_us amount:decimal(12,2) --codec zstd
+vpf docs.vpf create id:int64:required tags:list<string> attrs:map<string,int64> 'pt:struct<x:double!,y:list<int32>>'
+vpf sales.vpf append --parquet more.parquet           # --mode auto|buffered|direct
+echo '{"id": 1, "name": "x"}' | vpf events.vpf append --json -
+vpf sales.vpf delete --where "region = 'EU' AND amount < 10"
+vpf docs.vpf delete --where "pt.x > 2 OR tags IS NULL"
+vpf sales.vpf update --set "status = 'void', amount = NULL" --where "id IN (3, 5, 8)"
+vpf sales.vpf alter add-column level int64 --required --default 0
+vpf sales.vpf alter rename-column amount total
+vpf sales.vpf alter widen qty int64
+vpf sales.vpf alter make-optional id
+vpf sales.vpf alter reorder id total level ...
+vpf sales.vpf alter drop-column legacy
+vpf sales.vpf flush
+vpf sales.vpf info | snapshots | schema --at 3 | stats
+vpf sales.vpf cat --limit 20 --format table|json|csv --at 5
+vpf sales.vpf export out.parquet --at 5
 ```
 
 Column types for `create` and `add-column`:
@@ -177,7 +183,7 @@ Column types for `create` and `add-column`:
 use vpf::store::Store;
 use vpf::ops::append::AppendMode;
 
-let store = Store::open("mystore")?;
+let store = Store::open("t.vpf")?;            // one table per file
 store.import_file("t", "data.parquet")?;
 store.append("t", &record_batch, AppendMode::Auto)?;
 store.update_where("t", "flag = TRUE", "id < 10")?;
@@ -187,7 +193,8 @@ let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_
 
 ## HTTP and FUSE adapters
 
-Two separate workspace crates expose snapshots without exporting Parquet:
+Two separate workspace crates expose a directory of `.vpf` files (one table each, named
+after the file stem) without exporting Parquet:
 
 * [`vpf-http`](crates/vpf-http/README.md) serves snapshot-specific URLs with HTTP
   byte ranges, for DuckDB's native `httpfs` reader and other HTTP-aware readers.
@@ -197,7 +204,7 @@ Two separate workspace crates expose snapshots without exporting Parquet:
   mount. Open handles pin a snapshot; later opens can see newer data.
 
 ```sh
-cargo run -p vpf-http -- --store ./mystore --listen 127.0.0.1:8080
+cargo run -p vpf-http -- --dir ./tables --listen 127.0.0.1:8080
 cargo test -p vpf-http -p vpf-fuse
 ```
 

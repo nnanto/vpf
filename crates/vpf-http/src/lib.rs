@@ -7,14 +7,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::stream;
+use vpf::catalog::Catalog;
 use vpf::layout::VirtualFile;
-use vpf::store::Store;
 
-pub fn router(store: Arc<Store>) -> Router {
+/// Serves every `<name>.vpf` file of a catalog directory as `/files/<name>/...`.
+pub fn router(catalog: Arc<Catalog>) -> Router {
     Router::new()
         .route("/files/{name}/latest", get(latest))
         .route("/files/{name}/snapshots/{snapshot}", get(snapshot))
-        .with_state(store)
+        .with_state(catalog)
 }
 
 fn failure(error: vpf::Error) -> Response {
@@ -31,8 +32,12 @@ fn failure(error: vpf::Error) -> Response {
         .into_response()
 }
 
-async fn latest(State(store): State<Arc<Store>>, Path(name): Path<String>) -> Response {
-    let result = tokio::task::spawn_blocking(move || store.view(&name, None)).await;
+async fn latest(State(catalog): State<Arc<Catalog>>, Path(name): Path<String>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let (store, table) = catalog.table(&name)?;
+        store.view(&table, None)
+    })
+    .await;
     match result {
         Ok(Ok(view)) => {
             let mut response = Json(serde_json::json!({
@@ -102,7 +107,7 @@ fn body(file: VirtualFile, start: u64, end: u64) -> Body {
 }
 
 async fn snapshot(
-    State(store): State<Arc<Store>>,
+    State(catalog): State<Arc<Catalog>>,
     Path((name, snapshot)): Path<(String, String)>,
     method: Method,
     headers: HeaderMap,
@@ -118,7 +123,11 @@ async fn snapshot(
         )
             .into_response();
     };
-    let file = match tokio::task::spawn_blocking(move || store.open_snapshot(&name, Some(id))).await
+    let file = match tokio::task::spawn_blocking(move || {
+        let (store, table) = catalog.table(&name)?;
+        store.open_snapshot(&table, Some(id))
+    })
+    .await
     {
         Ok(Ok(file)) => file,
         Ok(Err(error)) => return failure(error),

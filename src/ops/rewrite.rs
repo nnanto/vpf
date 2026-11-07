@@ -5,8 +5,8 @@ use std::ops::Range;
 
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-    RowSelection, RowSelector,
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
 };
 use parquet::basic::{Compression, Encoding};
 
@@ -44,7 +44,9 @@ impl Store {
             Ok(())
         })?;
         for (mask, segment) in out.iter_mut().zip(&view.segments) {
-            if mask.is_empty() { mask.resize(segment.num_rows() as usize, false); }
+            if mask.is_empty() {
+                mask.resize(segment.num_rows() as usize, false);
+            }
         }
         Ok(out)
     }
@@ -62,7 +64,8 @@ impl Store {
             .columns()
             .iter()
             .map(|c| {
-                let root = crate::predicate::root_column(c, |n| view.schema.column_by_name(n).is_some());
+                let root =
+                    crate::predicate::root_column(c, |n| view.schema.column_by_name(n).is_some());
                 view.schema.column_index(root)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -70,7 +73,8 @@ impl Store {
             idx.push(0);
         }
         let (vf, sources) = self.assemble(view)?;
-        let md = ArrowReaderMetadata::try_new(vf.metadata().clone(), ArrowReaderOptions::default())?;
+        let md =
+            ArrowReaderMetadata::try_new(vf.metadata().clone(), ArrowReaderOptions::default())?;
         let pruning = PruningExpr::compile(expr, &view.schema, md.schema())?;
         for (rg, src) in sources.into_iter().enumerate() {
             let rows = vf.metadata().row_group(rg).num_rows() as usize;
@@ -86,19 +90,28 @@ impl Store {
             let mut selectors = Vec::new();
             let mut end = 0;
             for r in &ranges {
-                if r.start > end { selectors.push(RowSelector::skip(r.start - end)); }
+                if r.start > end {
+                    selectors.push(RowSelector::skip(r.start - end));
+                }
                 selectors.push(RowSelector::select(r.len()));
                 end = r.end;
             }
-            if end < rows { selectors.push(RowSelector::skip(rows - end)); }
-            let reader = b.with_row_groups(vec![rg]).with_projection(projection)
+            if end < rows {
+                selectors.push(RowSelector::skip(rows - end));
+            }
+            let reader = b
+                .with_row_groups(vec![rg])
+                .with_projection(projection)
                 .with_row_selection(RowSelection::from(selectors))
-                .with_batch_size(64 * 1024).build()?;
+                .with_batch_size(64 * 1024)
+                .build()?;
             let mut m = vec![false; rows];
             let mut selected = ranges.iter().flat_map(|r| r.clone());
             for batch in reader {
                 for matches in expr.matches(&batch?)? {
-                    let row = selected.next().ok_or_else(|| Error::Corrupt("row count mismatch".into()))?;
+                    let row = selected
+                        .next()
+                        .ok_or_else(|| Error::Corrupt("row count mismatch".into()))?;
                     m[row] = matches;
                 }
             }
@@ -108,8 +121,12 @@ impl Store {
             let mut off = 0;
             for si in src {
                 let n = view.segments[si].num_rows() as usize;
-                let mask = m.get(off..off + n).ok_or_else(|| Error::Corrupt("row count mismatch".into()))?;
-                if mask.iter().any(|v| *v) { consume(si, mask)?; }
+                let mask = m
+                    .get(off..off + n)
+                    .ok_or_else(|| Error::Corrupt("row count mismatch".into()))?;
+                if mask.iter().any(|v| *v) {
+                    consume(si, mask)?;
+                }
                 off += n;
             }
             if off != m.len() {
@@ -120,7 +137,11 @@ impl Store {
     }
 }
 
-fn candidate_ranges(pruning: &PruningExpr, chunks: &[ChunkRow], rows: usize) -> Result<Vec<Range<usize>>> {
+fn candidate_ranges(
+    pruning: &PruningExpr,
+    chunks: &[ChunkRow],
+    rows: usize,
+) -> Result<Vec<Range<usize>>> {
     let mut columns = Vec::new();
     pruning.columns(&mut columns);
     columns.sort_unstable();
@@ -131,13 +152,20 @@ fn candidate_ranges(pruning: &PruningExpr, chunks: &[ChunkRow], rows: usize) -> 
         let mut end = 0usize;
         let mut spans = Vec::new();
         for p in &chunks[column].pages {
-            if !p.kind.is_data() { continue; }
-            let n = usize::try_from(p.num_rows).map_err(|_| Error::Corrupt("negative page row count".into()))?;
-            end = end.checked_add(n).ok_or_else(|| Error::Corrupt("page row count overflow".into()))?;
+            if !p.kind.is_data() {
+                continue;
+            }
+            let n = usize::try_from(p.num_rows)
+                .map_err(|_| Error::Corrupt("negative page row count".into()))?;
+            end = end
+                .checked_add(n)
+                .ok_or_else(|| Error::Corrupt("page row count overflow".into()))?;
             boundaries.push(end);
             spans.push((end, p.stats.as_ref(), n as u64));
         }
-        if end != rows { return Err(Error::Corrupt("chunk page row count mismatch".into())); }
+        if end != rows {
+            return Err(Error::Corrupt("chunk page row count mismatch".into()));
+        }
         pages.push((column, spans));
     }
     boundaries.sort_unstable();
@@ -152,7 +180,9 @@ fn candidate_ranges(pruning: &PruningExpr, chunks: &[ChunkRow], rows: usize) -> 
             stats.map(|s| (s, *n))
         };
         if pruning.may_match(&page) {
-            if let Some(last) = ranges.last_mut() && last.end == start {
+            if let Some(last) = ranges.last_mut()
+                && last.end == start
+            {
                 last.end = pair[1];
             } else {
                 ranges.push(start..pair[1]);
@@ -197,7 +227,10 @@ pub fn rewrite_chunk(
     counts: &mut PageCounts,
 ) -> Result<i64> {
     if leaf.physical() != chunk.physical {
-        return Err(Error::Corrupt(format!("chunk {} does not match column '{}'", chunk.chunk_id, leaf.spec.name)));
+        return Err(Error::Corrupt(format!(
+            "chunk {} does not match column '{}'",
+            chunk.chunk_id, leaf.spec.name
+        )));
     }
     let ranges = page_row_ranges(chunk);
     let data_pages = ranges.iter().flatten().count();
@@ -206,7 +239,11 @@ pub fn rewrite_chunk(
         return Ok(chunk.chunk_id);
     }
     if chunk.codec == Compression::LZO {
-        let raw = chunk.pages.iter().map(|p| RawPage::load(t.blobs(), p)).collect::<Result<Vec<_>>>()?;
+        let raw = chunk
+            .pages
+            .iter()
+            .map(|p| RawPage::load(&t.blobs(), p))
+            .collect::<Result<Vec<_>>>()?;
         let total = ranges.iter().flatten().last().map(|r| r.end).unwrap_or(0);
         let data = transform(decode_pages(leaf, chunk.codec, &raw)?, 0..total)?;
         let enc = encode_column(leaf, fallback_codec, &data, true)?;
@@ -218,7 +255,7 @@ pub fn rewrite_chunk(
         .pages
         .iter()
         .filter(|p| !p.kind.is_data())
-        .map(|p| RawPage::load(t.blobs(), p))
+        .map(|p| RawPage::load(&t.blobs(), p))
         .collect::<Result<Vec<_>>>()?;
     let mut encodings: Vec<Encoding> = chunk.encodings.clone();
     let mut page_ids = Vec::with_capacity(chunk.pages.len());
@@ -240,10 +277,15 @@ pub fn rewrite_chunk(
             }
         };
         let mut pages = dict.clone();
-        pages.push(RawPage::load(t.blobs(), p)?);
+        pages.push(RawPage::load(&t.blobs(), p)?);
         let data = decode_pages(leaf, chunk.codec, &pages)?;
         if data.num_rows() != r.len() {
-            return Err(Error::Corrupt(format!("page of chunk {} holds {} rows, expected {}", chunk.chunk_id, data.num_rows(), r.len())));
+            return Err(Error::Corrupt(format!(
+                "page of chunk {} holds {} rows, expected {}",
+                chunk.chunk_id,
+                data.num_rows(),
+                r.len()
+            )));
         }
         let new = transform(data, r)?;
         if new.num_rows() == 0 {
@@ -267,12 +309,22 @@ pub fn rewrite_chunk(
         }
     }
     if data_out == 0 {
-        return Err(Error::Invalid("page rewrite would leave a column chunk without rows".into()));
+        return Err(Error::Invalid(
+            "page rewrite would leave a column chunk without rows".into(),
+        ));
     }
     // Exact chunk statistics from the pages when all of them have statistics.
     let stats = match out_stats.into_iter().collect::<Option<Vec<_>>>() {
         Some(ps) => Some(merge_pages(&leaf.stat_type()?, &ps)),
         None => stats,
     };
-    t.put_chunk(&NewChunk { physical: chunk.physical, codec: chunk.codec, encodings, stats }, &page_ids)
+    t.put_chunk(
+        &NewChunk {
+            physical: chunk.physical,
+            codec: chunk.codec,
+            encodings,
+            stats,
+        },
+        &page_ids,
+    )
 }

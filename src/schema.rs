@@ -6,9 +6,7 @@
 
 use std::sync::Arc;
 
-use parquet::basic::{
-    ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType,
-};
+use parquet::basic::{ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use parquet::file::metadata::KeyValue;
 use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor, Type, TypePtr};
 use serde_json::{Value, json};
@@ -70,11 +68,19 @@ impl ColumnSpec {
     /// True if a row may lack this field: an optional field (NULL) or a top-level repeated
     /// field (no elements).
     pub fn top_level_nullable(&self) -> bool {
-        self.nullable || self.nested.as_ref().is_some_and(|t| t.get_basic_info().repetition() == Repetition::REPEATED)
+        self.nullable
+            || self
+                .nested
+                .as_ref()
+                .is_some_and(|t| t.get_basic_info().repetition() == Repetition::REPEATED)
     }
 
     pub fn repetition(&self) -> Repetition {
-        if self.nullable { Repetition::OPTIONAL } else { Repetition::REQUIRED }
+        if self.nullable {
+            Repetition::OPTIONAL
+        } else {
+            Repetition::REQUIRED
+        }
     }
 
     pub fn to_parquet_type(&self) -> Result<TypePtr> {
@@ -97,7 +103,9 @@ impl ColumnSpec {
         if self.physical == PhysicalType::FIXED_LEN_BYTE_ARRAY {
             b = b.with_length(self.type_length);
         }
-        if self.converted == ConvertedType::DECIMAL || matches!(self.logical, Some(LogicalType::Decimal(_))) {
+        if self.converted == ConvertedType::DECIMAL
+            || matches!(self.logical, Some(LogicalType::Decimal(_)))
+        {
             b = b.with_precision(self.precision).with_scale(self.scale);
         }
         Ok(Arc::new(b.build()?))
@@ -113,8 +121,18 @@ impl ColumnSpec {
 
     /// Builds a spec describing a primitive (leaf) type; REPEATED leaves count as required.
     pub fn from_primitive(column_id: i64, t: &Type) -> Result<Self> {
-        let Type::PrimitiveType { basic_info, physical_type, type_length, scale, precision } = t else {
-            return Err(Error::Invalid(format!("'{}' is not a primitive type", t.name())));
+        let Type::PrimitiveType {
+            basic_info,
+            physical_type,
+            type_length,
+            scale,
+            precision,
+        } = t
+        else {
+            return Err(Error::Invalid(format!(
+                "'{}' is not a primitive type",
+                t.name()
+            )));
         };
         let nullable = basic_info.repetition() == Repetition::OPTIONAL;
         let logical = basic_info.logical_type_ref().cloned();
@@ -155,7 +173,14 @@ pub struct Leaf {
 impl Leaf {
     /// A flat field's single leaf.
     pub fn flat(spec: &ColumnSpec) -> Self {
-        Leaf { column_id: spec.column_id, leaf: 0, field: 0, spec: spec.clone(), max_def: spec.max_def(), max_rep: 0 }
+        Leaf {
+            column_id: spec.column_id,
+            leaf: 0,
+            field: 0,
+            spec: spec.clone(),
+            max_def: spec.max_def(),
+            max_rep: 0,
+        }
     }
 
     pub fn physical(&self) -> PhysicalType {
@@ -164,7 +189,9 @@ impl Leaf {
 
     /// How statistics of this leaf are computed and ordered.
     pub fn stat_type(&self) -> Result<crate::stats::StatType> {
-        Ok(crate::stats::StatType::of_column(self.descriptor()?.column(0).as_ref()))
+        Ok(crate::stats::StatType::of_column(
+            self.descriptor()?.column(0).as_ref(),
+        ))
     }
 
     /// True for a leaf whose levels are those of a flat column (at most one definition
@@ -181,8 +208,17 @@ impl Leaf {
         }
         let mut t = self.spec.primitive_type(Repetition::REQUIRED)?;
         for i in 0..self.max_def {
-            let rep = if i < self.max_rep { Repetition::REPEATED } else { Repetition::OPTIONAL };
-            t = Arc::new(Type::group_type_builder(&format!("l{i}")).with_repetition(rep).with_fields(vec![t]).build()?);
+            let rep = if i < self.max_rep {
+                Repetition::REPEATED
+            } else {
+                Repetition::OPTIONAL
+            };
+            t = Arc::new(
+                Type::group_type_builder(&format!("l{i}"))
+                    .with_repetition(rep)
+                    .with_fields(vec![t])
+                    .build()?,
+            );
         }
         let root = Type::group_type_builder("m").with_fields(vec![t]).build()?;
         Ok(Arc::new(SchemaDescriptor::new(Arc::new(root))))
@@ -190,7 +226,12 @@ impl Leaf {
 }
 
 /// Copies a type with a new name, repetition and field id.
-pub fn rebuild_type(t: &TypePtr, name: &str, repetition: Repetition, id: Option<i32>) -> Result<TypePtr> {
+pub fn rebuild_type(
+    t: &TypePtr,
+    name: &str,
+    repetition: Repetition,
+    id: Option<i32>,
+) -> Result<TypePtr> {
     let info = t.get_basic_info();
     let out = match t.as_ref() {
         Type::GroupType { fields, .. } => Type::group_type_builder(name)
@@ -200,7 +241,13 @@ pub fn rebuild_type(t: &TypePtr, name: &str, repetition: Repetition, id: Option<
             .with_id(id)
             .with_fields(fields.clone())
             .build()?,
-        Type::PrimitiveType { physical_type, type_length, scale, precision, .. } => {
+        Type::PrimitiveType {
+            physical_type,
+            type_length,
+            scale,
+            precision,
+            ..
+        } => {
             let mut b = Type::primitive_type_builder(name, *physical_type)
                 .with_repetition(repetition)
                 .with_converted_type(info.converted_type())
@@ -255,9 +302,20 @@ pub fn type_to_json(t: &Type) -> Result<Value> {
     }
     match t {
         Type::GroupType { fields, .. } => {
-            v["fields"] = Value::Array(fields.iter().map(|f| type_to_json(f)).collect::<Result<_>>()?);
+            v["fields"] = Value::Array(
+                fields
+                    .iter()
+                    .map(|f| type_to_json(f))
+                    .collect::<Result<_>>()?,
+            );
         }
-        Type::PrimitiveType { physical_type, type_length, scale, precision, .. } => {
+        Type::PrimitiveType {
+            physical_type,
+            type_length,
+            scale,
+            precision,
+            ..
+        } => {
             v["physical"] = json!(physical_type.to_string());
             v["length"] = json!(type_length);
             v["precision"] = json!(precision);
@@ -270,14 +328,24 @@ pub fn type_to_json(t: &Type) -> Result<Value> {
 pub fn type_from_json(v: &Value) -> Result<TypePtr> {
     let bad = || Error::Corrupt(format!("bad type json {v}"));
     let s = |k: &str| v.get(k).and_then(Value::as_str).ok_or_else(bad);
-    let int = |k: &str| v.get(k).and_then(Value::as_i64).map(|x| x as i32).ok_or_else(bad);
+    let int = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_i64)
+            .map(|x| x as i32)
+            .ok_or_else(bad)
+    };
     let name = s("name")?;
     let repetition: Repetition = s("repetition")?.parse()?;
     let converted: ConvertedType = s("converted")?.parse()?;
     let logical = v.get("logical").map(logical_from_json).transpose()?;
     let id = v.get("id").and_then(Value::as_i64).map(|x| x as i32);
     let t = if let Some(fields) = v.get("fields") {
-        let fields = fields.as_array().ok_or_else(bad)?.iter().map(type_from_json).collect::<Result<Vec<_>>>()?;
+        let fields = fields
+            .as_array()
+            .ok_or_else(bad)?
+            .iter()
+            .map(type_from_json)
+            .collect::<Result<Vec<_>>>()?;
         Type::group_type_builder(name)
             .with_repetition(repetition)
             .with_converted_type(converted)
@@ -294,7 +362,9 @@ pub fn type_from_json(v: &Value) -> Result<TypePtr> {
             .with_id(id)
             .with_length(int("length")?);
         if int("precision")? > 0 {
-            b = b.with_precision(int("precision")?).with_scale(int("scale")?);
+            b = b
+                .with_precision(int("precision")?)
+                .with_scale(int("scale")?);
         }
         b.build()?
     };
@@ -357,8 +427,13 @@ impl SchemaVersion {
 }
 
 pub fn build_descriptor(root_name: &str, columns: &[ColumnSpec]) -> Result<SchemaDescPtr> {
-    let fields = columns.iter().map(|c| c.to_parquet_type()).collect::<Result<Vec<_>>>()?;
-    let root = Type::group_type_builder(root_name).with_fields(fields).build()?;
+    let fields = columns
+        .iter()
+        .map(|c| c.to_parquet_type())
+        .collect::<Result<Vec<_>>>()?;
+    let root = Type::group_type_builder(root_name)
+        .with_fields(fields)
+        .build()?;
     Ok(Arc::new(SchemaDescriptor::new(Arc::new(root))))
 }
 
@@ -389,12 +464,18 @@ pub fn logical_to_json(l: &LogicalType) -> Result<Value> {
         LogicalType::Bson => json!({"type": "BSON"}),
         LogicalType::Uuid => json!({"type": "UUID"}),
         LogicalType::Float16 => json!({"type": "FLOAT16"}),
-        LogicalType::Decimal(d) => json!({"type": "DECIMAL", "scale": d.scale, "precision": d.precision}),
-        LogicalType::Time(t) => json!({"type": "TIME", "utc": t.is_adjusted_to_u_t_c, "unit": unit_str(&t.unit)}),
+        LogicalType::Decimal(d) => {
+            json!({"type": "DECIMAL", "scale": d.scale, "precision": d.precision})
+        }
+        LogicalType::Time(t) => {
+            json!({"type": "TIME", "utc": t.is_adjusted_to_u_t_c, "unit": unit_str(&t.unit)})
+        }
         LogicalType::Timestamp(t) => {
             json!({"type": "TIMESTAMP", "utc": t.is_adjusted_to_u_t_c, "unit": unit_str(&t.unit)})
         }
-        LogicalType::Integer(i) => json!({"type": "INTEGER", "bits": i.bit_width, "signed": i.is_signed}),
+        LogicalType::Integer(i) => {
+            json!({"type": "INTEGER", "bits": i.bit_width, "signed": i.is_signed})
+        }
         LogicalType::List => json!({"type": "LIST"}),
         LogicalType::Map => json!({"type": "MAP"}),
         other => return Err(Error::Unsupported(format!("logical type {other:?}"))),
@@ -427,7 +508,12 @@ pub fn logical_from_json(v: &Value) -> Result<LogicalType> {
 }
 
 /// User-facing column type names for `add column`.
-pub fn spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) -> Result<ColumnSpec> {
+pub fn spec_for_type_name(
+    column_id: i64,
+    name: &str,
+    ty: &str,
+    nullable: bool,
+) -> Result<ColumnSpec> {
     let mut spec = ColumnSpec {
         column_id,
         name: name.to_string(),
@@ -443,7 +529,10 @@ pub fn spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) 
         nested: None,
     };
     let lower = ty.trim().to_ascii_lowercase();
-    if ["list<", "map<", "struct<"].iter().any(|p| lower.starts_with(p)) {
+    if ["list<", "map<", "struct<"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+    {
         return nested_spec_for_type_name(column_id, name, ty, nullable);
     }
     let (physical, logical) = match lower.as_str() {
@@ -455,25 +544,38 @@ pub fn spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) 
         "string" | "utf8" => (PhysicalType::BYTE_ARRAY, Some(LogicalType::String)),
         "binary" | "bytes" => (PhysicalType::BYTE_ARRAY, None),
         "date" => (PhysicalType::INT32, Some(LogicalType::Date)),
-        "timestamp_ms" => (PhysicalType::INT64, Some(LogicalType::timestamp(true, TimeUnit::MILLIS))),
-        "timestamp_us" | "timestamp" => {
-            (PhysicalType::INT64, Some(LogicalType::timestamp(true, TimeUnit::MICROS)))
-        }
-        "timestamp_ns" => (PhysicalType::INT64, Some(LogicalType::timestamp(true, TimeUnit::NANOS))),
+        "timestamp_ms" => (
+            PhysicalType::INT64,
+            Some(LogicalType::timestamp(true, TimeUnit::MILLIS)),
+        ),
+        "timestamp_us" | "timestamp" => (
+            PhysicalType::INT64,
+            Some(LogicalType::timestamp(true, TimeUnit::MICROS)),
+        ),
+        "timestamp_ns" => (
+            PhysicalType::INT64,
+            Some(LogicalType::timestamp(true, TimeUnit::NANOS)),
+        ),
         s if s.starts_with("decimal(") && s.ends_with(')') => {
             let inner = &s[8..s.len() - 1];
             let mut parts = inner.split(',').map(|p| p.trim().parse::<i32>());
-            let (Some(Ok(p)), Some(Ok(sc)), None) = (parts.next(), parts.next(), parts.next()) else {
+            let (Some(Ok(p)), Some(Ok(sc)), None) = (parts.next(), parts.next(), parts.next())
+            else {
                 return Err(Error::Invalid(format!("bad decimal type '{ty}'")));
             };
             if !(1..=38).contains(&p) || sc < 0 || sc > p {
-                return Err(Error::Invalid(format!("bad decimal precision/scale '{ty}'")));
+                return Err(Error::Invalid(format!(
+                    "bad decimal precision/scale '{ty}'"
+                )));
             }
             spec.precision = p;
             spec.scale = sc;
             spec.converted = ConvertedType::DECIMAL;
             spec.type_length = decimal_flba_len(p);
-            (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::decimal(sc, p)))
+            (
+                PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                Some(LogicalType::decimal(sc, p)),
+            )
         }
         _ => return Err(Error::Invalid(format!("unknown column type '{ty}'"))),
     };
@@ -487,14 +589,23 @@ pub fn spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) 
 
 /// Builds a nested column from `list<T>`, `map<K,V>` or `struct<a:T,b:T!>` (`!` marks a
 /// non-null child; map keys are always non-null). Uses Arrow's standard Parquet layouts.
-fn nested_spec_for_type_name(column_id: i64, name: &str, ty: &str, nullable: bool) -> Result<ColumnSpec> {
+fn nested_spec_for_type_name(
+    column_id: i64,
+    name: &str,
+    ty: &str,
+    nullable: bool,
+) -> Result<ColumnSpec> {
     let mut p = TypeParser { s: ty, pos: 0 };
     let dt = p.ty()?;
     p.skip_ws();
     if p.pos != ty.len() {
-        return Err(Error::Invalid(format!("trailing input in type '{ty}' at {}", p.pos)));
+        return Err(Error::Invalid(format!(
+            "trailing input in type '{ty}' at {}",
+            p.pos
+        )));
     }
-    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(name, dt, nullable)]);
+    let schema =
+        arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(name, dt, nullable)]);
     let tree = parquet::arrow::ArrowSchemaConverter::new().convert(&schema)?;
     ColumnSpec::from_parquet_type(column_id, &tree.root_schema().get_fields()[0])
 }
@@ -512,7 +623,10 @@ impl TypeParser<'_> {
     }
 
     fn err(&self, what: &str) -> Error {
-        Error::Invalid(format!("bad type '{}': expected {what} at {}", self.s, self.pos))
+        Error::Invalid(format!(
+            "bad type '{}': expected {what} at {}",
+            self.s, self.pos
+        ))
     }
 
     fn eat(&mut self, c: char) -> bool {
@@ -526,7 +640,11 @@ impl TypeParser<'_> {
     }
 
     fn expect(&mut self, c: char) -> Result<()> {
-        if self.eat(c) { Ok(()) } else { Err(self.err(&format!("'{c}'"))) }
+        if self.eat(c) {
+            Ok(())
+        } else {
+            Err(self.err(&format!("'{c}'")))
+        }
     }
 
     fn ident(&mut self) -> Result<&str> {
@@ -535,7 +653,11 @@ impl TypeParser<'_> {
         while self.s[self.pos..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             self.pos += 1;
         }
-        if start == self.pos { Err(self.err("a name")) } else { Ok(&self.s[start..self.pos]) }
+        if start == self.pos {
+            Err(self.err("a name"))
+        } else {
+            Ok(&self.s[start..self.pos])
+        }
     }
 
     /// A type followed by an optional `!` (non-null marker).
@@ -561,8 +683,12 @@ impl TypeParser<'_> {
                 self.expect(',')?;
                 let (v, n) = self.child()?;
                 self.expect('>')?;
-                let entries = Fields::from(vec![Field::new("key", k, false), Field::new("value", v, n)]);
-                DataType::Map(Arc::new(Field::new("key_value", DataType::Struct(entries), false)), false)
+                let entries =
+                    Fields::from(vec![Field::new("key", k, false), Field::new("value", v, n)]);
+                DataType::Map(
+                    Arc::new(Field::new("key_value", DataType::Struct(entries), false)),
+                    false,
+                )
             }
             "struct" => {
                 self.expect('<')?;
@@ -588,27 +714,44 @@ impl TypeParser<'_> {
             "binary" | "bytes" => DataType::Binary,
             "date" => DataType::Date32,
             "timestamp_ms" => DataType::Timestamp(AU::Millisecond, Some("UTC".into())),
-            "timestamp_us" | "timestamp" => DataType::Timestamp(AU::Microsecond, Some("UTC".into())),
+            "timestamp_us" | "timestamp" => {
+                DataType::Timestamp(AU::Microsecond, Some("UTC".into()))
+            }
             "timestamp_ns" => DataType::Timestamp(AU::Nanosecond, Some("UTC".into())),
             "decimal" => {
                 self.expect('(')?;
-                let p = self.ident()?.parse::<u8>().map_err(|_| self.err("precision"))?;
+                let p = self
+                    .ident()?
+                    .parse::<u8>()
+                    .map_err(|_| self.err("precision"))?;
                 self.expect(',')?;
                 let sc = self.ident()?.parse::<i8>().map_err(|_| self.err("scale"))?;
                 self.expect(')')?;
                 if !(1..=38).contains(&p) || sc < 0 || sc as u8 > p {
-                    return Err(Error::Invalid(format!("bad decimal precision/scale in '{}'", self.s)));
+                    return Err(Error::Invalid(format!(
+                        "bad decimal precision/scale in '{}'",
+                        self.s
+                    )));
                 }
                 DataType::Decimal128(p, sc)
             }
-            other => return Err(Error::Invalid(format!("unknown type '{other}' in '{}'", self.s))),
+            other => {
+                return Err(Error::Invalid(format!(
+                    "unknown type '{other}' in '{}'",
+                    self.s
+                )));
+            }
         })
     }
 }
 
 /// Splits `name:type[:required|:optional]`, where `type` may contain ':' inside `<...>`.
 pub fn split_column_def(def: &str) -> Result<(&str, &str, bool)> {
-    let bad = || Error::Invalid(format!("column must be name:type[:required|:optional]: '{def}'"));
+    let bad = || {
+        Error::Invalid(format!(
+            "column must be name:type[:required|:optional]: '{def}'"
+        ))
+    };
     let (name, rest) = def.split_once(':').ok_or_else(bad)?;
     let mut depth = 0i32;
     let mut last_top = None;
@@ -625,7 +768,11 @@ pub fn split_column_def(def: &str) -> Result<(&str, &str, bool)> {
         Some(i) => match &rest[i + 1..] {
             "required" => (&rest[..i], true),
             "optional" => (&rest[..i], false),
-            m => return Err(Error::Invalid(format!("bad column modifier '{m}' in '{def}'"))),
+            m => {
+                return Err(Error::Invalid(format!(
+                    "bad column modifier '{m}' in '{def}'"
+                )));
+            }
         },
     };
     if name.is_empty() || ty.is_empty() {

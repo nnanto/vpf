@@ -21,7 +21,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, Scalar, StringArray, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, RecordBatch, Scalar, StringArray, new_null_array,
+};
 use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::comparison::{like, nlike};
@@ -117,15 +119,24 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
                 v.push(c[i]);
                 i += 1;
             }
-            out.push(if q == '\'' { Tok::Str(v) } else { Tok::QIdent(v) });
+            out.push(if q == '\'' {
+                Tok::Str(v)
+            } else {
+                Tok::QIdent(v)
+            });
         } else if ch.is_ascii_digit()
-            || ((ch == '-' || ch == '+' || ch == '.') && c.get(i + 1).is_some_and(|d| d.is_ascii_digit() || *d == '.'))
+            || ((ch == '-' || ch == '+' || ch == '.')
+                && c.get(i + 1)
+                    .is_some_and(|d| d.is_ascii_digit() || *d == '.'))
         {
             let st = i;
             i += 1;
             while i < c.len() {
                 let d = c[i];
-                if d.is_ascii_alphanumeric() || d == '.' || ((d == '-' || d == '+') && matches!(c[i - 1], 'e' | 'E')) {
+                if d.is_ascii_alphanumeric()
+                    || d == '.'
+                    || ((d == '-' || d == '+') && matches!(c[i - 1], 'e' | 'E'))
+                {
                     i += 1;
                 } else {
                     break;
@@ -138,7 +149,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
             while i < c.len()
                 && (c[i].is_alphanumeric()
                     || c[i] == '_'
-                    || (c[i] == '.' && c.get(i + 1).is_some_and(|d| d.is_alphabetic() || *d == '_')))
+                    || (c[i] == '.'
+                        && c.get(i + 1).is_some_and(|d| d.is_alphabetic() || *d == '_')))
             {
                 i += 1;
             }
@@ -183,7 +195,10 @@ impl Parser {
     }
 
     fn err<T>(&self, m: &str) -> Result<T> {
-        Err(Error::Invalid(format!("predicate: {m} at token {}", self.pos + 1)))
+        Err(Error::Invalid(format!(
+            "predicate: {m} at token {}",
+            self.pos + 1
+        )))
     }
 
     fn expect(&mut self, t: Tok) -> Result<()> {
@@ -305,7 +320,11 @@ impl Parser {
             Tok::Ident(s) if s.eq_ignore_ascii_case("NULL") => Operand::Lit(Literal::Null),
             Tok::Ident(s) if s.eq_ignore_ascii_case("TRUE") => Operand::Lit(Literal::Bool(true)),
             Tok::Ident(s) if s.eq_ignore_ascii_case("FALSE") => Operand::Lit(Literal::Bool(false)),
-            Tok::Ident(s) if ["AND", "OR", "NOT", "IS", "IN", "LIKE", "BETWEEN"].iter().any(|k| s.eq_ignore_ascii_case(k)) => {
+            Tok::Ident(s)
+                if ["AND", "OR", "NOT", "IS", "IN", "LIKE", "BETWEEN"]
+                    .iter()
+                    .any(|k| s.eq_ignore_ascii_case(k)) =>
+            {
                 self.pos -= 1;
                 return self.err(&format!("unexpected keyword {s}"));
             }
@@ -380,7 +399,8 @@ impl Expr {
                 let (la, ra) = match (l, r) {
                     (Operand::Column(_), Operand::Column(_)) => {
                         let la = column_or_err(b, l)?;
-                        let ra = cast_with_options(&column_or_err(b, r)?, la.data_type(), &strict())?;
+                        let ra =
+                            cast_with_options(&column_or_err(b, r)?, la.data_type(), &strict())?;
                         return Ok(compare(&la, *op, &ra)?);
                     }
                     (Operand::Column(_), Operand::Lit(x)) => {
@@ -401,7 +421,11 @@ impl Expr {
                         };
                         return Ok(compare(&ra, flipped, &Scalar::new(la))?);
                     }
-                    _ => return Err(Error::Invalid("predicate: comparison needs a column".into())),
+                    _ => {
+                        return Err(Error::Invalid(
+                            "predicate: comparison needs a column".into(),
+                        ));
+                    }
                 };
                 compare(&la, *op, &Scalar::new(ra))?
             }
@@ -415,7 +439,11 @@ impl Expr {
                 if *neg { not(&acc)? } else { acc }
             }
             Expr::Like(o, pat, neg) => {
-                let a = cast_with_options(&column_or_err(b, o)?, &DataType::Utf8, &CastOptions::default())?;
+                let a = cast_with_options(
+                    &column_or_err(b, o)?,
+                    &DataType::Utf8,
+                    &CastOptions::default(),
+                )?;
                 let p = Scalar::new(StringArray::from(vec![pat.as_str()]));
                 if *neg { nlike(&a, &p)? } else { like(&a, &p)? }
             }
@@ -426,7 +454,11 @@ impl Expr {
 /// Resolves a column reference to its top-level column name: the name itself if such a
 /// column exists, otherwise the part before the first `.` (a struct field path).
 pub fn root_column(name: &str, exists: impl Fn(&str) -> bool) -> &str {
-    if exists(name) { name } else { name.split('.').next().unwrap_or(name) }
+    if exists(name) {
+        name
+    } else {
+        name.split('.').next().unwrap_or(name)
+    }
 }
 
 /// Fetches a column or struct field (`s.a.b`); a field is NULL wherever an enclosing
@@ -437,9 +469,15 @@ fn resolve(b: &RecordBatch, name: &str) -> Result<ArrayRef> {
     }
     let not_found = || Error::NotFound(format!("column '{name}'"));
     let mut parts = name.split('.');
-    let mut a = b.column_by_name(parts.next().ok_or_else(not_found)?).ok_or_else(not_found)?.clone();
+    let mut a = b
+        .column_by_name(parts.next().ok_or_else(not_found)?)
+        .ok_or_else(not_found)?
+        .clone();
     for p in parts {
-        let st = a.as_any().downcast_ref::<arrow::array::StructArray>().ok_or_else(not_found)?;
+        let st = a
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .ok_or_else(not_found)?;
         let child = st.column_by_name(p).ok_or_else(not_found)?;
         let nulls = arrow::buffer::NullBuffer::union(st.nulls(), child.nulls());
         a = arrow::array::make_array(child.to_data().into_builder().nulls(nulls).build()?);
@@ -460,24 +498,34 @@ fn column_or_err(b: &RecordBatch, o: &Operand) -> Result<ArrayRef> {
 }
 
 fn strict() -> CastOptions<'static> {
-    CastOptions { safe: false, ..Default::default() }
+    CastOptions {
+        safe: false,
+        ..Default::default()
+    }
 }
 
 /// A single-element array holding `lit` cast to `ty`.
 pub fn literal_array(lit: &Literal, ty: &DataType) -> Result<ArrayRef> {
     if let (DataType::FixedSizeBinary(n), Literal::Str(v)) = (ty, lit) {
         if v.len() != *n as usize {
-            return Err(Error::Invalid(format!("predicate literal {lit:?} is not {n} bytes long")));
+            return Err(Error::Invalid(format!(
+                "predicate literal {lit:?} is not {n} bytes long"
+            )));
         }
-        return Ok(Arc::new(arrow::array::FixedSizeBinaryArray::try_from_iter(std::iter::once(v.as_bytes()))?));
+        return Ok(Arc::new(arrow::array::FixedSizeBinaryArray::try_from_iter(
+            std::iter::once(v.as_bytes()),
+        )?));
     }
     let src: ArrayRef = match lit {
         Literal::Null => return Ok(new_null_array(ty, 1)),
         Literal::Str(s) | Literal::Num(s) => Arc::new(StringArray::from(vec![s.as_str()])),
         Literal::Bool(v) => Arc::new(BooleanArray::from(vec![*v])),
     };
-    cast_with_options(&src, ty, &strict())
-        .map_err(|e| Error::Invalid(format!("predicate literal {lit:?} is not a valid {ty}: {e}")))
+    cast_with_options(&src, ty, &strict()).map_err(|e| {
+        Error::Invalid(format!(
+            "predicate literal {lit:?} is not a valid {ty}: {e}"
+        ))
+    })
 }
 
 fn compare(
@@ -528,7 +576,10 @@ pub fn parse_assignments(s: &str) -> Result<Vec<(String, Literal)>> {
 
 /// Parses a single literal (`'text'`, number, TRUE/FALSE or NULL).
 pub fn parse_literal(s: &str) -> Result<Literal> {
-    let mut p = Parser { toks: tokenize(s)?, pos: 0 };
+    let mut p = Parser {
+        toks: tokenize(s)?,
+        pos: 0,
+    };
     let lit = match p.operand()? {
         Operand::Lit(l) => l,
         Operand::Column(_) => return p.err("expected a literal"),

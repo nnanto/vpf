@@ -7,9 +7,8 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request,
 };
+use vpf::catalog::{Catalog, valid_name};
 use vpf::layout::VirtualFile;
-use vpf::meta;
-use vpf::store::Store;
 
 const ROOT_INO: u64 = 1;
 const FILE_TTL: Duration = Duration::ZERO;
@@ -17,7 +16,7 @@ const ROOT_TTL: Duration = Duration::ZERO;
 const OPEN_FLAGS: u32 = fuser::consts::FOPEN_DIRECT_IO;
 
 pub struct VpfFs {
-    store: Store,
+    catalog: Catalog,
     next_ino: u64,
     file_inos: HashMap<String, u64>,
     ino_files: HashMap<u64, String>,
@@ -26,9 +25,16 @@ pub struct VpfFs {
 }
 
 impl VpfFs {
-    pub fn open(path: impl AsRef<Path>) -> vpf::Result<Self> {
+    /// Serves every `<name>.vpf` file of `dir` as a read-only `<name>.parquet`.
+    pub fn open(dir: impl AsRef<Path>) -> vpf::Result<Self> {
+        if !dir.as_ref().is_dir() {
+            return Err(vpf::Error::Invalid(format!(
+                "{} is not a directory",
+                dir.as_ref().display()
+            )));
+        }
         Ok(Self {
-            store: Store::open(path)?,
+            catalog: Catalog::new(dir),
             next_ino: ROOT_INO + 1,
             file_inos: HashMap::new(),
             ino_files: HashMap::new(),
@@ -49,20 +55,25 @@ impl VpfFs {
     }
 
     fn list_logical_files(&self) -> vpf::Result<Vec<String>> {
-        self.store.read(meta::list_files)
+        self.catalog.list()
     }
 
     fn logical_name_from_path(&self, path_name: &str) -> vpf::Result<Option<String>> {
         let Some(name) = path_name.strip_suffix(".parquet") else {
             return Ok(None);
         };
-        if !is_safe_component(name) {
+        if !valid_name(name) {
             return Ok(None);
         }
         Ok(self
             .list_logical_files()?
             .into_iter()
             .find(|stored| stored == name))
+    }
+
+    fn latest(&self, name: &str) -> vpf::Result<VirtualFile> {
+        let (store, table) = self.catalog.table(name)?;
+        store.open_snapshot(&table, None)
     }
 
     fn open_handle(&mut self, ino: u64, flags: i32) -> Result<u64, i32> {
@@ -75,7 +86,7 @@ impl VpfFs {
             return Err(libc::EROFS);
         }
         let name = self.ino_files.get(&ino).ok_or(libc::ENOENT)?.clone();
-        let file = self.store.open_snapshot(&name, None).map_err(|error| {
+        let file = self.latest(&name).map_err(|error| {
             log_error("opening file snapshot", &error);
             errno_for(&error)
         })?;
@@ -153,8 +164,7 @@ impl VpfFs {
         let size = if let Some(handle) = fh {
             self.handles.get(&handle).ok_or(libc::EBADF)?.size()
         } else {
-            self.store
-                .open_snapshot(name, None)
+            self.latest(name)
                 .map_err(|error| {
                     log_error("getting latest file attributes", &error);
                     errno_for(&error)
@@ -276,7 +286,7 @@ impl Filesystem for VpfFs {
         ];
         match self.list_logical_files() {
             Ok(files) => {
-                for name in files.into_iter().filter(|name| is_safe_component(name)) {
+                for name in files {
                     let ino = self.inode_for(&name);
                     entries.push((ino, FileType::RegularFile, format!("{name}.parquet")));
                 }
@@ -312,15 +322,6 @@ impl Filesystem for VpfFs {
     }
 }
 
-fn is_safe_component(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
-}
-
 fn errno_for(error: &vpf::Error) -> i32 {
     match error {
         vpf::Error::NotFound(_) => libc::ENOENT,
@@ -345,7 +346,7 @@ mod tests {
     use std::sync::Arc;
     use vpf::ops::append::AppendMode;
 
-    fn add_row(store: &Store, value: i64) {
+    fn add_row(store: &vpf::store::Store, value: i64) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -361,7 +362,7 @@ mod tests {
     #[test]
     fn handles_pin_snapshot_and_release_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = vpf::store::Store::open(dir.path().join("sample.vpf")).unwrap();
         store
             .create_from_arrow(
                 "sample",
@@ -401,7 +402,7 @@ mod tests {
     #[test]
     fn reads_eof_invalid_handles_and_write_attempts_explicitly() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = vpf::store::Store::open(dir.path().join("sample.vpf")).unwrap();
         store
             .create_from_arrow(
                 "sample",
@@ -429,11 +430,12 @@ mod tests {
 
     #[test]
     fn unsafe_logical_names_are_not_exposed() {
-        assert!(!is_safe_component(""));
-        assert!(!is_safe_component("../outside"));
-        assert!(!is_safe_component("nested/file"));
-        assert!(!is_safe_component(r"nested\file"));
-        assert!(is_safe_component("ordinary-name"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("../outside"));
+        assert!(!valid_name("nested/file"));
+        assert!(!valid_name(r"nested\file"));
+        assert!(!valid_name(".hidden"));
+        assert!(valid_name("ordinary-name"));
     }
 
     #[test]

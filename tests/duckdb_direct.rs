@@ -16,7 +16,7 @@ fn duckdb_reads_virtual_snapshots_directly() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open(dir.path().join("t.vpf")).unwrap();
     let base = sample_batch(0, 1000);
     let imported = store
         .import(

@@ -4,9 +4,11 @@ use rusqlite::Connection;
 
 use crate::error::{Error, Result};
 use crate::layout::{ByteSource, ChunkLayout, FileProps, PageSrc, RowGroupLayout, VirtualFile};
-use crate::meta::{self, BatchRow, ChunkRow, FileRow, RowGroupRow, Segment, SegmentKind, SnapshotInfo};
-use crate::schema::SchemaVersion;
+use crate::meta::{
+    self, BatchRow, ChunkRow, FileRow, RowGroupRow, Segment, SegmentKind, SnapshotInfo,
+};
 use crate::ops::synth;
+use crate::schema::SchemaVersion;
 use crate::store::Store;
 
 /// Fully-resolved metadata of one snapshot.
@@ -51,7 +53,9 @@ pub fn load_view(conn: &Connection, name: &str, snapshot_id: Option<i64>) -> Res
     let file = meta::load_file(conn, name)?;
     let sid = match snapshot_id {
         Some(s) => s,
-        None => file.current_snapshot_id.ok_or_else(|| Error::NotFound(format!("file '{name}' has no snapshot")))?,
+        None => file
+            .current_snapshot_id
+            .ok_or_else(|| Error::NotFound(format!("file '{name}' has no snapshot")))?,
     };
     let snapshot = meta::load_snapshot(conn, file.file_id, sid)?;
     let schema = meta::load_schema(conn, snapshot.schema_version_id)?;
@@ -65,17 +69,28 @@ pub fn load_view(conn: &Connection, name: &str, snapshot_id: Option<i64>) -> Res
                     .iter()
                     .map(|l| {
                         let id = rg.chunks.get(&(l.column_id, l.leaf)).ok_or_else(|| {
-                            Error::Corrupt(format!("row group {} has no chunk for column {}", rg.rg_id, l.spec.name))
+                            Error::Corrupt(format!(
+                                "row group {} has no chunk for column {}",
+                                rg.rg_id, l.spec.name
+                            ))
                         })?;
                         meta::load_chunk(conn, *id)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 SegmentData::RowGroup { seg, rg, chunks }
             }
-            SegmentKind::Batch => SegmentData::Batch { batch: meta::load_batch(conn, seg.obj_id)?, seg },
+            SegmentKind::Batch => SegmentData::Batch {
+                batch: meta::load_batch(conn, seg.obj_id)?,
+                seg,
+            },
         });
     }
-    Ok(SnapshotView { file, snapshot, schema, segments })
+    Ok(SnapshotView {
+        file,
+        snapshot,
+        schema,
+        segments,
+    })
 }
 
 pub fn chunk_layout(chunk: &ChunkRow) -> Result<ChunkLayout> {
@@ -84,7 +99,9 @@ pub fn chunk_layout(chunk: &ChunkRow) -> Result<ChunkLayout> {
             .pages
             .iter()
             .map(|p| PageSrc {
-                src: ByteSource::Blob { offset: p.blob_offset },
+                src: ByteSource::Blob {
+                    offset: p.blob_offset,
+                },
                 len: p.blob_len,
                 kind: p.kind,
                 num_values: p.num_values,
@@ -95,7 +112,11 @@ pub fn chunk_layout(chunk: &ChunkRow) -> Result<ChunkLayout> {
             .collect(),
         codec: chunk.codec,
         encodings: chunk.encodings.clone(),
-        stats: chunk.stats.as_ref().map(|s| s.to_parquet(chunk.physical)).transpose()?,
+        stats: chunk
+            .stats
+            .as_ref()
+            .map(|s| s.to_parquet(chunk.physical))
+            .transpose()?,
         num_values: chunk.num_values,
     })
 }
@@ -117,7 +138,10 @@ impl Store {
 
     /// Builds the virtual file and, for each of its row groups, the range of `view.segments`
     /// it was assembled from (a stored row group, or a run of buffered batches).
-    pub fn assemble(&self, view: &SnapshotView) -> Result<(VirtualFile, Vec<std::ops::Range<usize>>)> {
+    pub fn assemble(
+        &self,
+        view: &SnapshotView,
+    ) -> Result<(VirtualFile, Vec<std::ops::Range<usize>>)> {
         let mut sources = Vec::new();
         let codec = synth::write_codec(&view.file);
         let runs = synth::batch_runs(&view.segments, |s| match s {
@@ -137,8 +161,13 @@ impl Store {
                         _ => unreachable!(),
                     })
                     .collect();
-                let key = (batches.iter().map(|b| b.batch_id).collect(), view.schema.schema_version_id);
-                let rg = self.synth_cache.get_or_build(key, || synth::synthesize(&view.schema, codec, &batches))?;
+                let key = (
+                    batches.iter().map(|b| b.batch_id).collect(),
+                    view.schema.schema_version_id,
+                );
+                let rg = self
+                    .synth_cache
+                    .get_or_build(key, || synth::synthesize(&view.schema, codec, &batches))?;
                 rgs.push(RowGroupLayout {
                     num_rows: rg.num_rows,
                     chunks: rg
@@ -176,7 +205,12 @@ impl Store {
     }
 
     /// Writes a snapshot as a standalone `.parquet` file.
-    pub fn export(&self, name: &str, snapshot_id: Option<i64>, path: impl AsRef<std::path::Path>) -> Result<u64> {
+    pub fn export(
+        &self,
+        name: &str,
+        snapshot_id: Option<i64>,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<u64> {
         let vf = self.open_snapshot(name, snapshot_id)?;
         let f = std::fs::File::create(path)?;
         let mut w = std::io::BufWriter::new(f);

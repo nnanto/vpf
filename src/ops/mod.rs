@@ -1,11 +1,12 @@
 //! High-level operations on a store.
 
-pub mod import;
-pub mod snapshot;
-pub mod append;
-pub mod synth;
-pub mod delete;
-pub mod rewrite;
-mod pruning;
-pub mod update;
 pub mod alter;
+pub mod append;
+pub mod delete;
+pub mod import;
+mod pruning;
+pub mod rewrite;
+pub mod rows;
+pub mod snapshot;
+pub mod synth;
+pub mod update;

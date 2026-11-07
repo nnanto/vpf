@@ -136,7 +136,12 @@ impl ColumnData {
     /// A flat column: `defs` (0 = null, 1 = present) given iff the column is nullable.
     pub fn flat(values: Values, defs: Option<Vec<i16>>) -> Self {
         let max_def = defs.is_some() as i16;
-        Self { values, defs, reps: None, max_def }
+        Self {
+            values,
+            defs,
+            reps: None,
+            max_def,
+        }
     }
 
     pub fn empty(physical: PhysicalType, nullable: bool) -> Self {
@@ -156,7 +161,9 @@ impl ColumnData {
     /// `n` rows whose top-level field is null/empty (all levels 0).
     pub fn nulls(physical: PhysicalType, max_def: i16, max_rep: i16, n: usize) -> Result<Self> {
         if max_def == 0 {
-            return Err(Error::Invalid("required column needs a non-null value".into()));
+            return Err(Error::Invalid(
+                "required column needs a non-null value".into(),
+            ));
         }
         Ok(Self {
             values: Values::empty(physical),
@@ -235,7 +242,10 @@ impl ColumnData {
                     break;
                 }
             }
-            out.push(RowSpan { levels: (l0, i), values: (v0, v) });
+            out.push(RowSpan {
+                levels: (l0, i),
+                values: (v0, v),
+            });
         }
         out
     }
@@ -273,7 +283,12 @@ impl ColumnData {
 
     /// Keeps rows where `keep[row]` is true.
     pub fn filter(&self, keep: &[bool]) -> ColumnData {
-        let rows: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
+        let rows: Vec<usize> = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k)
+            .map(|(i, _)| i)
+            .collect();
         self.take(&rows)
     }
 
@@ -304,21 +319,28 @@ impl ColumnData {
         match value {
             Some(v) => {
                 if !self.is_flat() {
-                    return Err(Error::Unsupported("assigning a value to a nested column".into()));
+                    return Err(Error::Unsupported(
+                        "assigning a value to a nested column".into(),
+                    ));
                 }
                 if v.len() != 1 || v.physical() != self.values.physical() {
-                    return Err(Error::Invalid("replacement must be a single value of the column type".into()));
+                    return Err(Error::Invalid(
+                        "replacement must be a single value of the column type".into(),
+                    ));
                 }
             }
             None if !self.nullable() => {
-                return Err(Error::Invalid("cannot set NULL in a required column".into()));
+                return Err(Error::Invalid(
+                    "cannot set NULL in a required column".into(),
+                ));
             }
             None => {}
         }
         let spans = self.spans();
         let mut hit = vec![false; spans.len()];
         for &r in rows {
-            *hit.get_mut(r).ok_or_else(|| Error::Invalid("row out of range".into()))? = true;
+            *hit.get_mut(r)
+                .ok_or_else(|| Error::Invalid("row out of range".into()))? = true;
         }
         let mut out = self.with_levels();
         for (r, s) in spans.into_iter().enumerate() {
@@ -345,19 +367,71 @@ impl ColumnData {
         Ok(out)
     }
 
+    /// Replaces row `rows[k]` with row `k` of `with`, which must have the same level
+    /// structure. `rows` must be strictly increasing.
+    pub fn replace_rows(&self, rows: &[usize], with: &ColumnData) -> Result<ColumnData> {
+        if self.defs.is_some() != with.defs.is_some()
+            || self.reps.is_some() != with.reps.is_some()
+            || self.max_def != with.max_def
+            || self.values.physical() != with.values.physical()
+        {
+            return Err(Error::Invalid(
+                "replacement has a different level structure".into(),
+            ));
+        }
+        let spans = self.spans();
+        let new = with.spans();
+        if new.len() != rows.len() {
+            return Err(Error::Invalid("replacement row count mismatch".into()));
+        }
+        if rows.windows(2).any(|w| w[0] >= w[1]) || rows.last().is_some_and(|&r| r >= spans.len()) {
+            return Err(Error::Invalid(
+                "replacement rows must be increasing and in range".into(),
+            ));
+        }
+        let mut out = self.with_levels();
+        let mut idx = Vec::new();
+        let mut src: Vec<bool> = Vec::new();
+        let mut next = rows.iter().enumerate().peekable();
+        for (r, s) in spans.into_iter().enumerate() {
+            let before = idx.len();
+            if let Some((k, _)) = next.next_if(|(_, row)| **row == r) {
+                out.push_span(with, new[k], &mut idx);
+                src.extend(std::iter::repeat_n(true, idx.len() - before));
+            } else {
+                out.push_span(self, s, &mut idx);
+                src.extend(std::iter::repeat_n(false, idx.len() - before));
+            }
+        }
+        for (i, from_new) in idx.into_iter().zip(src) {
+            out.values
+                .push_from(if from_new { &with.values } else { &self.values }, i)?;
+        }
+        Ok(out)
+    }
+
     /// `n` copies of a value (`None` = NULL) for a flat column.
-    pub fn repeat(physical: PhysicalType, nullable: bool, value: Option<&Values>, n: usize) -> Result<ColumnData> {
+    pub fn repeat(
+        physical: PhysicalType,
+        nullable: bool,
+        value: Option<&Values>,
+        n: usize,
+    ) -> Result<ColumnData> {
         let mut out = ColumnData::empty(physical, nullable);
         match value {
             None => {
                 if !nullable {
-                    return Err(Error::Invalid("required column needs a non-null value".into()));
+                    return Err(Error::Invalid(
+                        "required column needs a non-null value".into(),
+                    ));
                 }
                 out.defs = Some(vec![0; n]);
             }
             Some(v) => {
                 if v.len() != 1 || v.physical() != physical {
-                    return Err(Error::Invalid("default must be a single value of the column type".into()));
+                    return Err(Error::Invalid(
+                        "default must be a single value of the column type".into(),
+                    ));
                 }
                 for _ in 0..n {
                     out.values.push_from(v, 0)?;
@@ -374,11 +448,23 @@ impl ColumnData {
     pub fn widen(&self, to: PhysicalType) -> Result<ColumnData> {
         let values = match (&self.values, to) {
             (v, t) if v.physical() == t => v.clone(),
-            (Values::I32(v), PhysicalType::INT64) => Values::I64(v.iter().map(|&x| x as i64).collect()),
-            (Values::F32(v), PhysicalType::DOUBLE) => Values::F64(v.iter().map(|&x| x as f64).collect()),
-            (v, t) => return Err(Error::Unsupported(format!("converting {} to {t}", v.physical()))),
+            (Values::I32(v), PhysicalType::INT64) => {
+                Values::I64(v.iter().map(|&x| x as i64).collect())
+            }
+            (Values::F32(v), PhysicalType::DOUBLE) => {
+                Values::F64(v.iter().map(|&x| x as f64).collect())
+            }
+            (v, t) => {
+                return Err(Error::Unsupported(format!(
+                    "converting {} to {t}",
+                    v.physical()
+                )));
+            }
         };
-        Ok(ColumnData { values, ..self.clone() })
+        Ok(ColumnData {
+            values,
+            ..self.clone()
+        })
     }
 
     /// Adds one definition level above everything (the top-level field became optional).
@@ -387,20 +473,31 @@ impl ColumnData {
             Some(d) => d.iter().map(|&x| x + 1).collect(),
             None => vec![1; self.num_levels()],
         };
-        ColumnData { defs: Some(defs), max_def: self.max_def + 1, ..self.clone() }
+        ColumnData {
+            defs: Some(defs),
+            max_def: self.max_def + 1,
+            ..self.clone()
+        }
     }
 
     /// Adapts nullability of a flat column: required -> optional adds levels;
     /// optional -> required succeeds only if there are no nulls.
     pub fn with_nullability(&self, nullable: bool) -> Result<ColumnData> {
         if !self.is_flat() {
-            return Err(Error::Unsupported("changing nullability of a nested leaf".into()));
+            return Err(Error::Unsupported(
+                "changing nullability of a nested leaf".into(),
+            ));
         }
         match (&self.defs, nullable) {
-            (None, true) => Ok(ColumnData::flat(self.values.clone(), Some(vec![1; self.values.len()]))),
+            (None, true) => Ok(ColumnData::flat(
+                self.values.clone(),
+                Some(vec![1; self.values.len()]),
+            )),
             (Some(d), false) => {
                 if d.iter().any(|&l| l == 0) {
-                    return Err(Error::Invalid("column contains NULLs but target is required".into()));
+                    return Err(Error::Invalid(
+                        "column contains NULLs but target is required".into(),
+                    ));
                 }
                 Ok(ColumnData::flat(self.values.clone(), None))
             }
@@ -489,11 +586,23 @@ fn write_values(w: &mut W, v: &Values) {
     w.u64(v.len() as u64);
     match v {
         Values::Bool(x) => x.iter().for_each(|&b| w.u8(b as u8)),
-        Values::I32(x) => x.iter().for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
-        Values::I64(x) => x.iter().for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
-        Values::I96(x) => x.iter().for_each(|i| i.data().iter().for_each(|p| w.0.extend_from_slice(&p.to_le_bytes()))),
-        Values::F32(x) => x.iter().for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
-        Values::F64(x) => x.iter().for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
+        Values::I32(x) => x
+            .iter()
+            .for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
+        Values::I64(x) => x
+            .iter()
+            .for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
+        Values::I96(x) => x.iter().for_each(|i| {
+            i.data()
+                .iter()
+                .for_each(|p| w.0.extend_from_slice(&p.to_le_bytes()))
+        }),
+        Values::F32(x) => x
+            .iter()
+            .for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
+        Values::F64(x) => x
+            .iter()
+            .for_each(|i| w.0.extend_from_slice(&i.to_le_bytes())),
         Values::Bytes(x) => x.iter().for_each(|b| w.bytes(b.data())),
         Values::Fixed(x) => x.iter().for_each(|b| w.bytes(b.data())),
     }
@@ -509,7 +618,11 @@ fn read_values(r: &mut R) -> Result<Values> {
     macro_rules! fixed {
         ($ty:ty, $w:expr, $variant:ident) => {{
             let raw = r.take(n * $w)?;
-            Values::$variant(raw.chunks_exact($w).map(|c| <$ty>::from_le_bytes(c.try_into().unwrap())).collect())
+            Values::$variant(
+                raw.chunks_exact($w)
+                    .map(|c| <$ty>::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            )
         }};
     }
     Ok(match phys {
@@ -523,7 +636,8 @@ fn read_values(r: &mut R) -> Result<Values> {
             Values::I96(
                 raw.chunks_exact(12)
                     .map(|c| {
-                        let w = |i: usize| u32::from_le_bytes(c[i * 4..i * 4 + 4].try_into().unwrap());
+                        let w =
+                            |i: usize| u32::from_le_bytes(c[i * 4..i * 4 + 4].try_into().unwrap());
                         let mut v = Int96::new();
                         v.set_data(w(0), w(1), w(2));
                         v
@@ -531,12 +645,17 @@ fn read_values(r: &mut R) -> Result<Values> {
                     .collect(),
             )
         }
-        PhysicalType::BYTE_ARRAY => {
-            Values::Bytes((0..n).map(|_| r.bytes().map(|b| ByteArray::from(b.to_vec()))).collect::<Result<_>>()?)
-        }
+        PhysicalType::BYTE_ARRAY => Values::Bytes(
+            (0..n)
+                .map(|_| r.bytes().map(|b| ByteArray::from(b.to_vec())))
+                .collect::<Result<_>>()?,
+        ),
         PhysicalType::FIXED_LEN_BYTE_ARRAY => Values::Fixed(
             (0..n)
-                .map(|_| r.bytes().map(|b| FixedLenByteArray::from(ByteArray::from(b.to_vec()))))
+                .map(|_| {
+                    r.bytes()
+                        .map(|b| FixedLenByteArray::from(ByteArray::from(b.to_vec())))
+                })
                 .collect::<Result<_>>()?,
         ),
     })
@@ -548,7 +667,8 @@ fn write_levels(w: &mut W, l: &Option<Vec<i16>>) {
         Some(d) => {
             w.u8(1);
             w.u64(d.len() as u64);
-            d.iter().for_each(|&x| w.0.extend_from_slice(&x.to_le_bytes()));
+            d.iter()
+                .for_each(|&x| w.0.extend_from_slice(&x.to_le_bytes()));
         }
     }
 }
@@ -558,8 +678,15 @@ fn read_levels(r: &mut R) -> Result<Option<Vec<i16>>> {
         0 => None,
         1 => {
             let n = r.len()?;
-            let raw = r.take(n.checked_mul(2).ok_or_else(|| Error::Corrupt("level count".into()))?)?;
-            Some(raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+            let raw = r.take(
+                n.checked_mul(2)
+                    .ok_or_else(|| Error::Corrupt("level count".into()))?,
+            )?;
+            Some(
+                raw.chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            )
         }
         _ => return Err(Error::Corrupt("bad level flag".into())),
     })
@@ -577,7 +704,12 @@ fn read_column(r: &mut R) -> Result<ColumnData> {
     let max_def = i16::from_le_bytes([t[0], t[1]]);
     let defs = read_levels(r)?;
     let reps = read_levels(r)?;
-    let c = ColumnData { values: read_values(r)?, defs, reps, max_def };
+    let c = ColumnData {
+        values: read_values(r)?,
+        defs,
+        reps,
+        max_def,
+    };
     c.validate()?;
     Ok(c)
 }
@@ -593,7 +725,9 @@ pub fn encode_batch(num_rows: usize, columns: &[(LeafKey, ColumnData)]) -> Resul
     w.u64(columns.len() as u64);
     for ((id, leaf), c) in columns {
         if c.num_rows() != num_rows {
-            return Err(Error::Invalid("column length differs from batch row count".into()));
+            return Err(Error::Invalid(
+                "column length differs from batch row count".into(),
+            ));
         }
         w.u64(*id as u64);
         w.u64(*leaf as u64);

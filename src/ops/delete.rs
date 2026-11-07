@@ -1,12 +1,15 @@
 //! Physical row deletion by predicate with page-level copy-on-write.
 
+use parquet::basic::Compression;
+
 use crate::error::Result;
 use crate::meta::SegmentKind;
 use crate::ops::rewrite::{PageCounts, rewrite_chunk};
-use crate::ops::snapshot::{SegmentData, load_view};
+use crate::ops::snapshot::{SegmentData, SnapshotView, load_view};
 use crate::ops::synth::write_codec;
 use crate::predicate::Expr;
-use crate::store::Store;
+use crate::schema::Leaf;
+use crate::store::{Store, Txn};
 use crate::values::{decode_batch, encode_batch};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,54 +35,7 @@ impl Store {
             let codec = write_codec(&view.file);
             let leaves = view.schema.leaves()?;
             self.for_each_matching_segment(&view, &expr, |si, mask| {
-                let seg = &view.segments[si];
-                let n_del = mask.iter().filter(|x| **x).count();
-                let sid = match s.snapshot_id {
-                    Some(sid) => sid,
-                    None => {
-                        let sid = t.new_snapshot(file_id, view.schema.schema_version_id, "delete", None)?;
-                        s.snapshot_id = Some(sid);
-                        sid
-                    }
-                };
-                s.rows_deleted += n_del as i64;
-                let seg_row = seg.segment();
-                if n_del == mask.len() {
-                    t.remove_segment(seg_row.segment_id, sid)?;
-                    s.segments_removed += 1;
-                    return Ok(());
-                }
-                s.segments_rewritten += 1;
-                let keep: Vec<bool> = mask.iter().map(|m| !m).collect();
-                let remaining = (mask.len() - n_del) as i64;
-                match seg {
-                    SegmentData::RowGroup { chunks, .. } => {
-                        let mut ids = Vec::with_capacity(chunks.len());
-                        for (leaf, chunk) in leaves.iter().zip(chunks) {
-                            let id = rewrite_chunk(
-                                t,
-                                leaf,
-                                chunk,
-                                codec,
-                                &|r| mask[r].iter().any(|x| *x),
-                                &|data, r| Ok(data.filter(&keep[r])),
-                                chunk.stats.as_ref().map(|st| st.after_row_removal()),
-                                &mut s.pages,
-                            )?;
-                            ids.push(((leaf.column_id, leaf.leaf), id));
-                        }
-                        let rg = t.put_row_group(remaining, &ids)?;
-                        t.replace_segment(file_id, seg_row, SegmentKind::RowGroup, rg, sid)?;
-                    }
-                    SegmentData::Batch { batch, .. } => {
-                        let (_, cols) = decode_batch(&batch.payload)?;
-                        let cols: Vec<_> = cols.into_iter().map(|(id, c)| (id, c.filter(&keep))).collect();
-                        let payload = encode_batch(remaining as usize, &cols)?;
-                        let b = t.put_batch(batch.schema_version_id, remaining, &payload)?;
-                        t.replace_segment(file_id, seg_row, SegmentKind::Batch, b, sid)?;
-                    }
-                }
-                Ok(())
+                delete_in_segment(t, &view, &leaves, codec, &mut s, si, mask)
             })?;
             if let Some(sid) = s.snapshot_id {
                 t.conn().execute(
@@ -91,4 +47,72 @@ impl Store {
             Ok(s)
         })
     }
+}
+
+/// Removes the rows flagged in `mask` from segment `si` of `view`, creating the delete
+/// snapshot on first use.
+pub(crate) fn delete_in_segment(
+    t: &mut Txn,
+    view: &SnapshotView,
+    leaves: &[Leaf],
+    codec: Compression,
+    s: &mut DeleteSummary,
+    si: usize,
+    mask: &[bool],
+) -> Result<()> {
+    let file_id = view.file.file_id;
+    let seg = &view.segments[si];
+    let n_del = mask.iter().filter(|x| **x).count();
+    if n_del == 0 {
+        return Ok(());
+    }
+    let sid = match s.snapshot_id {
+        Some(sid) => sid,
+        None => {
+            let sid = t.new_snapshot(file_id, view.schema.schema_version_id, "delete", None)?;
+            s.snapshot_id = Some(sid);
+            sid
+        }
+    };
+    s.rows_deleted += n_del as i64;
+    let seg_row = seg.segment();
+    if n_del == mask.len() {
+        t.remove_segment(seg_row.segment_id, sid)?;
+        s.segments_removed += 1;
+        return Ok(());
+    }
+    s.segments_rewritten += 1;
+    let keep: Vec<bool> = mask.iter().map(|m| !m).collect();
+    let remaining = (mask.len() - n_del) as i64;
+    match seg {
+        SegmentData::RowGroup { chunks, .. } => {
+            let mut ids = Vec::with_capacity(chunks.len());
+            for (leaf, chunk) in leaves.iter().zip(chunks) {
+                let id = rewrite_chunk(
+                    t,
+                    leaf,
+                    chunk,
+                    codec,
+                    &|r| mask[r].iter().any(|x| *x),
+                    &|data, r| Ok(data.filter(&keep[r])),
+                    chunk.stats.as_ref().map(|st| st.after_row_removal()),
+                    &mut s.pages,
+                )?;
+                ids.push(((leaf.column_id, leaf.leaf), id));
+            }
+            let rg = t.put_row_group(remaining, &ids)?;
+            t.replace_segment(file_id, seg_row, SegmentKind::RowGroup, rg, sid)?;
+        }
+        SegmentData::Batch { batch, .. } => {
+            let (_, cols) = decode_batch(&batch.payload)?;
+            let cols: Vec<_> = cols
+                .into_iter()
+                .map(|(id, c)| (id, c.filter(&keep)))
+                .collect();
+            let payload = encode_batch(remaining as usize, &cols)?;
+            let b = t.put_batch(batch.schema_version_id, remaining, &payload)?;
+            t.replace_segment(file_id, seg_row, SegmentKind::Batch, b, sid)?;
+        }
+    }
+    Ok(())
 }

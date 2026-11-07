@@ -6,7 +6,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel, GzipLevel, BrotliLevel};
+use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
 
 /// A flat batch with a wide spread of physical/logical types and nulls.
@@ -30,16 +30,43 @@ pub fn sample_batch(start: i64, n: usize) -> RecordBatch {
         schema,
         vec![
             Arc::new(Int64Array::from(ids.clone())),
-            Arc::new(Int32Array::from_iter(ids.iter().map(|&i| opt(i, 7).then_some((i * 3) as i32)))),
-            Arc::new(StringArray::from_iter(ids.iter().map(|&i| opt(i, 5).then(|| format!("name-{}", i % 97))))),
-            Arc::new(Float64Array::from_iter(ids.iter().map(|&i| opt(i, 11).then_some(i as f64 * 1.5)))),
-            Arc::new(Float32Array::from_iter(ids.iter().map(|&i| opt(i, 13).then_some(i as f32 / 4.0)))),
-            Arc::new(BooleanArray::from_iter(ids.iter().map(|&i| opt(i, 3).then_some(i % 2 == 0)))),
-            Arc::new(Date32Array::from_iter(ids.iter().map(|&i| opt(i, 17).then_some(18000 + (i % 1000) as i32)))),
-            Arc::new(TimestampMicrosecondArray::from_iter(ids.iter().map(|&i| opt(i, 19).then_some(1_600_000_000_000_000 + i * 1000)))),
-            Arc::new(Decimal128Array::from_iter(ids.iter().map(|&i| opt(i, 23).then_some(i as i128 * 101))).with_precision_and_scale(12, 2).unwrap()),
-            Arc::new(BinaryArray::from_iter(ids.iter().map(|&i| opt(i, 29).then(|| vec![(i % 256) as u8; (i % 5) as usize])))),
-            Arc::new(UInt16Array::from_iter(ids.iter().map(|&i| opt(i, 31).then_some((i % 65000) as u16 + 500)))),
+            Arc::new(Int32Array::from_iter(
+                ids.iter().map(|&i| opt(i, 7).then_some((i * 3) as i32)),
+            )),
+            Arc::new(StringArray::from_iter(
+                ids.iter()
+                    .map(|&i| opt(i, 5).then(|| format!("name-{}", i % 97))),
+            )),
+            Arc::new(Float64Array::from_iter(
+                ids.iter().map(|&i| opt(i, 11).then_some(i as f64 * 1.5)),
+            )),
+            Arc::new(Float32Array::from_iter(
+                ids.iter().map(|&i| opt(i, 13).then_some(i as f32 / 4.0)),
+            )),
+            Arc::new(BooleanArray::from_iter(
+                ids.iter().map(|&i| opt(i, 3).then_some(i % 2 == 0)),
+            )),
+            Arc::new(Date32Array::from_iter(
+                ids.iter()
+                    .map(|&i| opt(i, 17).then_some(18000 + (i % 1000) as i32)),
+            )),
+            Arc::new(TimestampMicrosecondArray::from_iter(ids.iter().map(|&i| {
+                opt(i, 19).then_some(1_600_000_000_000_000 + i * 1000)
+            }))),
+            Arc::new(
+                Decimal128Array::from_iter(
+                    ids.iter().map(|&i| opt(i, 23).then_some(i as i128 * 101)),
+                )
+                .with_precision_and_scale(12, 2)
+                .unwrap(),
+            ),
+            Arc::new(BinaryArray::from_iter(ids.iter().map(|&i| {
+                opt(i, 29).then(|| vec![(i % 256) as u8; (i % 5) as usize])
+            }))),
+            Arc::new(UInt16Array::from_iter(
+                ids.iter()
+                    .map(|&i| opt(i, 31).then_some((i % 65000) as u16 + 500)),
+            )),
         ],
     )
     .unwrap()
@@ -56,10 +83,20 @@ pub fn codecs() -> Vec<Compression> {
     ]
 }
 
-pub fn props(codec: Compression, v2: bool, dict: bool, page_rows: usize, rg_rows: usize) -> WriterProperties {
+pub fn props(
+    codec: Compression,
+    v2: bool,
+    dict: bool,
+    page_rows: usize,
+    rg_rows: usize,
+) -> WriterProperties {
     WriterProperties::builder()
         .set_compression(codec)
-        .set_writer_version(if v2 { WriterVersion::PARQUET_2_0 } else { WriterVersion::PARQUET_1_0 })
+        .set_writer_version(if v2 {
+            WriterVersion::PARQUET_2_0
+        } else {
+            WriterVersion::PARQUET_1_0
+        })
         .set_dictionary_enabled(dict)
         .set_data_page_row_count_limit(page_rows)
         .set_write_batch_size(page_rows.min(1024))
@@ -113,12 +150,13 @@ pub fn py_script(name: &str) -> String {
 
 /// Reads all rows of a virtual file with the arrow reader.
 pub fn read_virtual(vf: &vpf::layout::VirtualFile) -> RecordBatch {
-    let batches: Vec<RecordBatch> = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf.clone())
-        .unwrap()
-        .build()
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let batches: Vec<RecordBatch> =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf.clone())
+            .unwrap()
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
     let schema = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(vf.clone())
         .unwrap()
         .schema()
@@ -135,15 +173,22 @@ pub fn alter_model(b: &RecordBatch, op: &vpf::ops::alter::AlterOp) -> RecordBatc
         vpf::ops::alter::AlterOp::AddColumn { spec, default } => {
             let ty = match (spec.physical, spec.logical.as_ref()) {
                 _ if spec.is_nested() => {
-                    let d = vpf::schema::build_descriptor("schema", std::slice::from_ref(spec)).unwrap();
-                    parquet::arrow::parquet_to_arrow_schema(&d, None).unwrap().field(0).data_type().clone()
+                    let d = vpf::schema::build_descriptor("schema", std::slice::from_ref(spec))
+                        .unwrap();
+                    parquet::arrow::parquet_to_arrow_schema(&d, None)
+                        .unwrap()
+                        .field(0)
+                        .data_type()
+                        .clone()
                 }
                 (parquet::basic::Type::INT64, None) => DataType::Int64,
                 (parquet::basic::Type::INT32, None) => DataType::Int32,
                 (parquet::basic::Type::DOUBLE, None) => DataType::Float64,
                 (parquet::basic::Type::BOOLEAN, None) => DataType::Boolean,
                 (parquet::basic::Type::BYTE_ARRAY, Some(_)) => DataType::Utf8,
-                (parquet::basic::Type::INT64, Some(_)) => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                (parquet::basic::Type::INT64, Some(_)) => {
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+                }
                 (parquet::basic::Type::FIXED_LEN_BYTE_ARRAY, Some(_)) => {
                     DataType::Decimal128(spec.precision as u8, spec.scale as i8)
                 }
@@ -173,7 +218,11 @@ pub fn alter_model(b: &RecordBatch, op: &vpf::ops::alter::AlterOp) -> RecordBatc
         }
         vpf::ops::alter::AlterOp::Widen { column, to } => {
             let i = s.index_of(column).unwrap();
-            let ty = if *to == parquet::basic::Type::INT64 { DataType::Int64 } else { DataType::Float64 };
+            let ty = if *to == parquet::basic::Type::INT64 {
+                DataType::Int64
+            } else {
+                DataType::Float64
+            };
             cols[i] = arrow::compute::cast(&cols[i], &ty).unwrap();
             fields[i] = fields[i].clone().with_data_type(ty);
         }
@@ -184,4 +233,3 @@ pub fn alter_model(b: &RecordBatch, op: &vpf::ops::alter::AlterOp) -> RecordBatc
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
 }
-

@@ -6,8 +6,8 @@ use parquet::file::reader::ChunkReader;
 
 use crate::codec::{RawPage, chunk_page_rows, decode_pages, encode_column};
 use crate::error::{Error, Result};
-use crate::ops::append::store_chunk;
 use crate::meta::{self, SegmentKind};
+use crate::ops::append::store_chunk;
 use crate::schema::{ColumnSpec, Leaf, build_descriptor};
 use crate::stats::{PageStats, StatOrder, StoredStats, merge_pages};
 use crate::store::{NewChunk, Store};
@@ -23,7 +23,11 @@ pub struct ImportSummary {
 
 impl Store {
     /// Imports a Parquet file from a path as a new virtual file `name`.
-    pub fn import_file(&self, name: &str, path: impl AsRef<std::path::Path>) -> Result<ImportSummary> {
+    pub fn import_file(
+        &self,
+        name: &str,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ImportSummary> {
         let f = std::fs::File::open(path)?;
         self.import(name, &f)
     }
@@ -52,9 +56,18 @@ impl Store {
                 .map(|(i, f)| ColumnSpec::from_parquet_type(first_id + i as i64, f))
                 .collect::<Result<Vec<_>>>()?;
             if build_descriptor(root.name(), &specs)?.root_schema() != root {
-                return Err(Error::Unsupported("schema cannot be represented exactly".into()));
+                return Err(Error::Unsupported(
+                    "schema cannot be represented exactly".into(),
+                ));
             }
-            let svid = meta::insert_schema(t.conn(), file_id, None, root.name(), &specs, fmd.key_value_metadata().map(|v| v.as_slice()))?;
+            let svid = meta::insert_schema(
+                t.conn(),
+                file_id,
+                None,
+                root.name(),
+                &specs,
+                fmd.key_value_metadata().map(|v| v.as_slice()),
+            )?;
             let leaves = meta::load_schema(t.conn(), svid)?.leaves()?;
             if leaves.len() != descr.num_columns() {
                 return Err(Error::Corrupt("leaf count mismatch".into()));
@@ -76,7 +89,12 @@ impl Store {
                     let pages: Vec<RawPage> = split_pages(&bytes)?
                         .into_iter()
                         .filter(|p| p.header.kind != PageKind::Index)
-                        .map(|p| RawPage::from_header(bytes.slice(p.offset..p.offset + p.header.total_len()), &p.header))
+                        .map(|p| {
+                            RawPage::from_header(
+                                bytes.slice(p.offset..p.offset + p.header.total_len()),
+                                &p.header,
+                            )
+                        })
                         .collect();
                     let headers: Vec<_> = split_pages(&bytes)?
                         .into_iter()
@@ -84,7 +102,18 @@ impl Store {
                         .map(|p| p.header)
                         .collect();
                     let page_rows = if leaf.max_rep == 0 {
-                        Some(headers.iter().map(|h| if h.kind.is_data() { h.num_rows.unwrap_or(h.num_values) } else { 0 }).collect())
+                        Some(
+                            headers
+                                .iter()
+                                .map(|h| {
+                                    if h.kind.is_data() {
+                                        h.num_rows.unwrap_or(h.num_values)
+                                    } else {
+                                        0
+                                    }
+                                })
+                                .collect(),
+                        )
                     } else {
                         chunk_page_rows(leaf, col.compression(), &pages)?
                     };
@@ -99,9 +128,12 @@ impl Store {
                                 )));
                             }
                             let stat_type = leaf.stat_type()?;
-                            let page_stats = import_page_stats(leaf, col.compression(), &pages, &page_rows)?;
+                            let page_stats =
+                                import_page_stats(leaf, col.compression(), &pages, &page_rows)?;
                             let mut page_ids = Vec::with_capacity(pages.len());
-                            for (((p, h), r), st) in pages.iter().zip(&headers).zip(&page_rows).zip(&page_stats) {
+                            for (((p, h), r), st) in
+                                pages.iter().zip(&headers).zip(&page_rows).zip(&page_stats)
+                            {
                                 page_ids.push(t.put_page_rows(&p.bytes, h, *r, st.as_ref())?);
                             }
                             let merged = page_stats
@@ -147,7 +179,12 @@ impl Store {
                 rgs += 1;
             }
             let num_rows = t.finish_snapshot(file_id, sid)?;
-            Ok(ImportSummary { snapshot_id: sid, num_rows, row_groups: rgs, pages: pages_total })
+            Ok(ImportSummary {
+                snapshot_id: sid,
+                num_rows,
+                row_groups: rgs,
+                pages: pages_total,
+            })
         })
     }
 }

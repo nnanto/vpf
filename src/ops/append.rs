@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowSchemaConverter, encode_arrow_schema};
-use parquet::file::metadata::KeyValue;
 use parquet::basic::Compression;
+use parquet::file::metadata::KeyValue;
 
 use crate::convert::{batch_for_arrow_append, batch_to_columns};
 use crate::error::{Error, Result};
@@ -54,23 +54,41 @@ impl Store {
         key_value: Option<Vec<KeyValue>>,
     ) -> Result<i64> {
         self.write(|t| {
-            let file_id = t.create_file(name, codec, Some(concat!("vpf version ", env!("CARGO_PKG_VERSION"))), 1)?;
+            let file_id = t.create_file(
+                name,
+                codec,
+                Some(concat!("vpf version ", env!("CARGO_PKG_VERSION"))),
+                1,
+            )?;
             let first = t.alloc_column_ids(file_id, columns.len() as i64)?;
             let specs: Vec<ColumnSpec> = columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| ColumnSpec { column_id: first + i as i64, ..c.clone() })
+                .map(|(i, c)| ColumnSpec {
+                    column_id: first + i as i64,
+                    ..c.clone()
+                })
                 .collect();
             for s in &specs {
                 if s.is_nested() && s.default_value.is_some() {
-                    return Err(Error::Unsupported(format!("default value for nested column '{}'", s.name)));
+                    return Err(Error::Unsupported(format!(
+                        "default value for nested column '{}'",
+                        s.name
+                    )));
                 }
                 if let Some(d) = &s.default_value {
                     let v = crate::values::decode_value(d)?;
                     ColumnData::repeat(s.physical, s.nullable, Some(&v), 1)?;
                 }
             }
-            let svid = meta::insert_schema(t.conn(), file_id, None, "schema", &specs, key_value.as_deref())?;
+            let svid = meta::insert_schema(
+                t.conn(),
+                file_id,
+                None,
+                "schema",
+                &specs,
+                key_value.as_deref(),
+            )?;
             let sid = t.new_snapshot(file_id, svid, "create", None)?;
             t.finish_snapshot(file_id, sid)?;
             Ok(sid)
@@ -79,7 +97,12 @@ impl Store {
 
     /// Creates an empty file from an Arrow schema. The Arrow schema is embedded (as Arrow's
     /// writer does) so readers see the original Arrow types and field names.
-    pub fn create_from_arrow(&self, name: &str, schema: &Schema, codec: Compression) -> Result<i64> {
+    pub fn create_from_arrow(
+        &self,
+        name: &str,
+        schema: &Schema,
+        codec: Compression,
+    ) -> Result<i64> {
         let descr = ArrowSchemaConverter::new().convert(schema)?;
         let specs = descr
             .root_schema()
@@ -87,12 +110,20 @@ impl Store {
             .iter()
             .map(|f| ColumnSpec::from_parquet_type(0, f))
             .collect::<Result<Vec<_>>>()?;
-        let kv = vec![KeyValue::new(ARROW_SCHEMA_META_KEY.to_string(), encode_arrow_schema(schema))];
+        let kv = vec![KeyValue::new(
+            ARROW_SCHEMA_META_KEY.to_string(),
+            encode_arrow_schema(schema),
+        )];
         self.create_with_metadata(name, &specs, codec, Some(kv))
     }
 
     /// Appends rows, creating a new snapshot in which they are immediately visible.
-    pub fn append(&self, name: &str, batch: &RecordBatch, mode: AppendMode) -> Result<AppendSummary> {
+    pub fn append(
+        &self,
+        name: &str,
+        batch: &RecordBatch,
+        mode: AppendMode,
+    ) -> Result<AppendSummary> {
         if batch.num_rows() == 0 {
             return Err(Error::Invalid("cannot append an empty batch".into()));
         }
@@ -121,12 +152,18 @@ impl Store {
                 while start < n {
                     let len = MAX_ROW_GROUP_ROWS.min(n - start);
                     let rg = match &input {
-                        Input::Arrow(batch) => synth::encode_arrow_row_group(&view.schema, codec, &batch.slice(start, len))?,
+                        Input::Arrow(batch) => synth::encode_arrow_row_group(
+                            &view.schema,
+                            codec,
+                            &batch.slice(start, len),
+                        )?,
                         Input::Physical(cols) => {
                             let part = if len == n {
                                 Cow::Borrowed(cols.as_slice())
                             } else {
-                                Cow::Owned(cols.iter().map(|c| c.slice(start, len)).collect::<Vec<_>>())
+                                Cow::Owned(
+                                    cols.iter().map(|c| c.slice(start, len)).collect::<Vec<_>>(),
+                                )
                             };
                             synth::encode_row_group(&view.schema, codec, &part)?
                         }
@@ -137,14 +174,23 @@ impl Store {
                 }
             } else {
                 let cols = batch_to_columns(&view.schema, batch)?;
-                let keyed: Vec<((i64, i64), ColumnData)> =
-                    view.schema.leaves()?.iter().map(|l| (l.column_id, l.leaf)).zip(cols).collect();
+                let keyed: Vec<((i64, i64), ColumnData)> = view
+                    .schema
+                    .leaves()?
+                    .iter()
+                    .map(|l| (l.column_id, l.leaf))
+                    .zip(cols)
+                    .collect();
                 let payload = encode_batch(n, &keyed)?;
                 let bid = t.put_batch(svid, n as i64, &payload)?;
                 t.append_segment(file_id, SegmentKind::Batch, bid, sid)?;
             }
             t.finish_snapshot(file_id, sid)?;
-            Ok(AppendSummary { snapshot_id: sid, num_rows: n as i64, buffered: !direct })
+            Ok(AppendSummary {
+                snapshot_id: sid,
+                num_rows: n as i64,
+                buffered: !direct,
+            })
         })
     }
 
@@ -174,7 +220,13 @@ impl Store {
                     .collect();
                 let rg = synth::synthesize(&view.schema, codec, &batches)?;
                 let rg_id = store_row_group(t, &view.schema, &rg)?;
-                t.replace_segment(file_id, segs[0].segment(), SegmentKind::RowGroup, rg_id, sid)?;
+                t.replace_segment(
+                    file_id,
+                    segs[0].segment(),
+                    SegmentKind::RowGroup,
+                    rg_id,
+                    sid,
+                )?;
                 for s in &segs[1..] {
                     t.remove_segment(s.segment().segment_id, sid)?;
                 }
@@ -186,7 +238,11 @@ impl Store {
 }
 
 /// Persists encoded chunks as pages, chunks and a row group object.
-pub(crate) fn store_row_group(t: &mut Txn, schema: &SchemaVersion, rg: &SynthRowGroup) -> Result<i64> {
+pub(crate) fn store_row_group(
+    t: &mut Txn,
+    schema: &SchemaVersion,
+    rg: &SynthRowGroup,
+) -> Result<i64> {
     let leaves = schema.leaves()?;
     if leaves.len() != rg.chunks.len() {
         return Err(Error::Corrupt("leaf count mismatch".into()));
@@ -198,7 +254,11 @@ pub(crate) fn store_row_group(t: &mut Txn, schema: &SchemaVersion, rg: &SynthRow
     t.put_row_group(rg.num_rows, &chunk_ids)
 }
 
-pub(crate) fn store_chunk(t: &mut Txn, leaf: &Leaf, chunk: &crate::codec::EncodedChunk) -> Result<i64> {
+pub(crate) fn store_chunk(
+    t: &mut Txn,
+    leaf: &Leaf,
+    chunk: &crate::codec::EncodedChunk,
+) -> Result<i64> {
     if chunk.page_rows.len() != chunk.pages.len() {
         return Err(Error::Corrupt("page row counts missing".into()));
     }

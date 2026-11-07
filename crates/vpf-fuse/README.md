@@ -1,7 +1,7 @@
 # vpf-fuse
 
-`vpf-fuse` mounts a VPF store as a read-only filesystem. Every eligible logical
-file is exposed at the mount root as `<logical-name>.parquet`.
+`vpf-fuse` mounts a directory of `.vpf` files as a read-only filesystem. Each
+`<name>.vpf` file is exposed at the mount root as `<name>.parquet`.
 
 ## Prerequisites
 
@@ -25,7 +25,7 @@ Create a mount point, then run:
 
 ```sh
 mkdir -p ./vpf-mount
-cargo run -p vpf-fuse -- ./path/to/store ./vpf-mount
+cargo run -p vpf-fuse -- ./path/to/tables ./vpf-mount
 ```
 
 The process stays in the foreground. In another terminal, read a file as usual:
@@ -41,8 +41,8 @@ on macOS.
 
 ## Semantics and limitations
 
-The filesystem is read-only. Files with path separators or other unsafe
-components in their logical VPF names are omitted. Only the current snapshot is
+The filesystem is read-only. Only file stems made of ASCII letters, digits,
+`_`, `-` and `.` (not starting with `.`) are exposed. Only the current snapshot is
 exposed; immutable snapshot-specific paths are not currently provided.
 
 Opening a file pins its current immutable `VirtualFile`: reads and handle-based

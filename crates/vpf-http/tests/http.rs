@@ -16,7 +16,7 @@ use vpf::store::Store;
 
 fn fixture() -> (tempfile::TempDir, Arc<Store>, i64) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store = Arc::new(Store::open(dir.path().join("f.vpf")).unwrap());
     let imported = store
         .import(
             "f",
@@ -35,7 +35,7 @@ async fn http_ranges_and_snapshot_consistency() {
     let path = format!("/files/f/snapshots/{id}.parquet");
     let file = store.open_snapshot("f", Some(id)).unwrap();
     let expected = file.to_bytes().unwrap();
-    let app = vpf_http::router(store.clone());
+    let app = vpf_http::router(Arc::new(vpf::catalog::Catalog::new(_dir.path())));
     let response = app
         .clone()
         .oneshot(
@@ -207,17 +207,19 @@ async fn duckdb_reads_http_snapshots_without_export() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let range_requests = Arc::new(AtomicUsize::new(0));
     let counts = range_requests.clone();
-    let app = vpf_http::router(store.clone()).layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let counts = counts.clone();
-            async move {
-                if request.headers().contains_key("range") {
-                    counts.fetch_add(1, Ordering::Relaxed);
+    let app = vpf_http::router(Arc::new(vpf::catalog::Catalog::new(dir.path()))).layer(
+        axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let counts = counts.clone();
+                async move {
+                    if request.headers().contains_key("range") {
+                        counts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    next.run(request).await
                 }
-                next.run(request).await
-            }
-        },
-    ));
+            },
+        ),
+    );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let result = tokio::task::spawn_blocking(move || {
         let mut child = Command::new(python)
