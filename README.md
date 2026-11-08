@@ -54,6 +54,11 @@ persists each new snapshot's serialized footer and virtual-offset mapping in
 mode, including after reopen; uncached older snapshots remain readable on demand.
 Changing the mode affects subsequent writes and does not backfill history.
 
+Appends load only the current snapshot header and schema, derive the new row count
+from the parent snapshot, and use an indexed lookup for the next segment position.
+In lazy mode, existing row groups, page metadata and buffered payloads are not loaded
+on the append path. Eager mode still assembles the full snapshot layout before commit.
+
 Eager shifts whole-snapshot metadata assembly onto writes and retains a layout for
 each prepared snapshot, increasing write CPU and storage. Buffered snapshots also
 persist their synthesized Parquet pages in the layout, so eager can be especially
@@ -288,11 +293,31 @@ cargo bench --bench parquet_io
 cargo bench --bench parquet_io -- read/          # only reader comparisons
 cargo bench --bench parquet_io -- write/         # only write comparisons
 cargo bench --bench parquet_io -- append_stages/ # direct-append CPU breakdown
+cargo bench --bench parquet_io -- append_scaling/ # one-row append vs segment count
 cargo bench --bench parquet_io -- update/        # small update vs full rewrite
 cargo bench --bench parquet_io -- --test         # correctness/smoke run, without timing
 VPF_LARGE_BENCH=1 cargo bench --bench large_mutations -- --test # 1 GiB correctness/smoke run
 VPF_LARGE_BENCH=1 cargo bench --bench large_mutations -- --noplot
 ```
+
+`append_scaling` compares header-only buffered appends with a benchmark-only
+whole-snapshot baseline at 1, 100 and 10,000 existing buffered segments. Each timed
+append runs in an explicit transaction and rolls back afterward, keeping the fixture
+fixed; timings include rollback but exclude transaction start and durable commit.
+The baseline uses the same new position index, isolating the cost of loading the
+whole snapshot and recounting its rows.
+
+Example warm-cache release measurements (one row, 11 flat columns, lazy metadata):
+
+| Existing buffered segments | Whole-snapshot baseline | Header-only append |
+|---|---|---|
+| 1 | 309 us | 242 us |
+| 100 | 769 us | 271 us |
+| 10,000 | 26.6 ms | 249 us |
+
+The header-only path stays approximately flat in this fixture; the 10,000-segment
+case is about 107 times faster. These are transaction-path timings, not durable
+commit throughput, and will vary with hardware and workload.
 
 The separate `large_mutations` suite generates an **at least 1 GiB on-disk Snappy
 file**, using streamed 65,536-row groups and deterministic, incompressible 256-byte

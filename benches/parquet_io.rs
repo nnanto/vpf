@@ -8,7 +8,7 @@ use std::time::Duration;
 use arrow::array::{BooleanArray, RecordBatch, RecordBatchReader, Scalar, StringArray};
 use arrow::compute::kernels::zip::zip;
 use bytes::Bytes;
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
@@ -143,6 +143,97 @@ fn physical_append(store: &Store, batch: &RecordBatch) {
             Ok(())
         })
         .unwrap();
+}
+
+fn whole_snapshot_buffered_append(store: &Store, batch: &RecordBatch) {
+    store
+        .write(|t| {
+            let view = vpf::ops::snapshot::load_view(t.conn(), "data", None)?;
+            let cols = vpf::convert::batch_to_columns(&view.schema, batch)?;
+            let keyed: Vec<_> = view
+                .schema
+                .leaves()?
+                .iter()
+                .map(|leaf| (leaf.column_id, leaf.leaf))
+                .zip(cols)
+                .collect();
+            let payload = vpf::values::encode_batch(batch.num_rows(), &keyed)?;
+            let sid = t.new_snapshot(
+                view.file.file_id,
+                view.schema.schema_version_id,
+                "append",
+                Some(&format!("{} rows", batch.num_rows())),
+            )?;
+            let bid = t.put_batch(
+                view.schema.schema_version_id,
+                batch.num_rows() as i64,
+                &payload,
+            )?;
+            t.append_segment(view.file.file_id, SegmentKind::Batch, bid, sid)?;
+            t.finish_snapshot(view.file.file_id, sid)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn append_scaling(c: &mut Criterion) {
+    let batch = common::sample_batch(0, 1);
+    let mut group = c.benchmark_group("append_scaling");
+    group.throughput(Throughput::Elements(1));
+    for segments in [1, 100, 10_000] {
+        let (_dir, store) = empty_store(&batch, Compression::SNAPPY);
+        store.begin().unwrap();
+        for _ in 0..segments {
+            store.append("data", &batch, AppendMode::Buffered).unwrap();
+        }
+        store.commit().unwrap();
+        for whole_snapshot in [false, true] {
+            let append = || {
+                if whole_snapshot {
+                    whole_snapshot_buffered_append(&store, &batch);
+                } else {
+                    store.append("data", &batch, AppendMode::Buffered).unwrap();
+                }
+            };
+            store.begin().unwrap();
+            append();
+            assert_eq!(
+                store.snapshot_info("data", None).unwrap().num_rows,
+                segments + 1
+            );
+            store.rollback().unwrap();
+            assert_eq!(
+                store
+                    .open_snapshot("data", None)
+                    .unwrap()
+                    .metadata()
+                    .file_metadata()
+                    .num_rows(),
+                segments
+            );
+            group.bench_function(
+                BenchmarkId::new(
+                    if whole_snapshot {
+                        "whole_snapshot"
+                    } else {
+                        "header_only"
+                    },
+                    segments,
+                ),
+                |b| {
+                    b.iter_batched(
+                        || store.begin().unwrap(),
+                        |()| {
+                            append();
+                            store.rollback().unwrap();
+                        },
+                        BatchSize::PerIteration,
+                    )
+                },
+            );
+        }
+    }
+    group.finish();
 }
 
 fn update_batch(batch: &RecordBatch, predicate: &Expr) -> (RecordBatch, usize) {
@@ -432,6 +523,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = parquet_io
+    targets = parquet_io, append_scaling
 }
 criterion_main!(benches);

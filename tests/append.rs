@@ -29,6 +29,148 @@ fn kinds(store: &Store, name: &str) -> String {
 }
 
 #[test]
+fn lazy_appends_do_not_load_existing_page_metadata_or_batch_payloads() {
+    let d = tempfile::tempdir().unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
+    store
+        .create_from_arrow("f", &sample_batch(0, 1).schema(), Compression::SNAPPY)
+        .unwrap();
+    store
+        .append("f", &sample_batch(0, 3), AppendMode::Direct)
+        .unwrap();
+    store
+        .append("f", &sample_batch(3, 2), AppendMode::Buffered)
+        .unwrap();
+
+    // Make existing metadata unreadable temporarily to detect accidental full-view loads.
+    store.begin().unwrap();
+    store
+        .write(|t| {
+            t.conn()
+                .execute("UPDATE chunks SET stats = 'invalid JSON'", [])?;
+            t.conn()
+                .execute("UPDATE batches SET payload = 'not a BLOB'", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(store.view("f", None).is_err());
+    for mode in [AppendMode::Buffered, AppendMode::Direct] {
+        let summary = store.append("f", &sample_batch(5, 1), mode).unwrap();
+        assert_eq!(summary.num_rows, 1);
+    }
+    assert_eq!(store.snapshot_info("f", None).unwrap().num_rows, 7);
+    store.rollback().unwrap();
+    assert_eq!(rows_of(&store, "f", None), sample_batch(0, 5));
+}
+
+#[test]
+fn append_counts_and_positions_survive_deletes_flushes_and_reopen() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.vpf");
+    let store = Store::open(&path).unwrap();
+    store
+        .create_from_arrow("f", &sample_batch(0, 1).schema(), Compression::SNAPPY)
+        .unwrap();
+    let mut snapshots = Vec::new();
+    for (start, mode) in [
+        (0, AppendMode::Direct),
+        (3, AppendMode::Buffered),
+        (6, AppendMode::Buffered),
+    ] {
+        let summary = store.append("f", &sample_batch(start, 3), mode).unwrap();
+        snapshots.push((summary.snapshot_id, start + 3));
+    }
+    let flushed = store.flush("f").unwrap().unwrap();
+    snapshots.push((flushed, 9));
+    let deleted = store.delete_where("f", "id >= 2").unwrap();
+    snapshots.push((deleted.snapshot_id.unwrap(), 2));
+    let highest_position = store
+        .read(|c| Ok(c.query_row("SELECT MAX(pos) FROM segments", [], |r| r.get::<_, i64>(0))?))
+        .unwrap();
+    drop(store);
+
+    let store = Store::open(&path).unwrap();
+    let other = Store::open(&path).unwrap();
+    for (writer, start, mode, count) in [
+        (&store, 9, AppendMode::Buffered, 5),
+        (&other, 12, AppendMode::Direct, 8),
+    ] {
+        let summary = writer.append("f", &sample_batch(start, 3), mode).unwrap();
+        snapshots.push((summary.snapshot_id, count));
+    }
+    let view = store.view("f", None).unwrap();
+    assert_eq!(view.snapshot.num_rows, 8);
+    assert_eq!(
+        view.segments[view.segments.len() - 2].segment().pos,
+        highest_position + 1
+    );
+    assert_eq!(
+        view.segments.last().unwrap().segment().pos,
+        highest_position + 2
+    );
+    assert_eq!(
+        rows_of(&store, "f", None),
+        concat(&[sample_batch(0, 2), sample_batch(9, 6)])
+    );
+    for (sid, count) in snapshots {
+        let view = store.view("f", Some(sid)).unwrap();
+        assert_eq!(view.snapshot.num_rows, count);
+        assert_eq!(
+            view.segments.iter().map(SegmentData::num_rows).sum::<i64>(),
+            count
+        );
+    }
+    store.delete_where("f", "id >= 0").unwrap();
+    assert_eq!(store.snapshot_info("f", None).unwrap().num_rows, 0);
+    other
+        .append("f", &sample_batch(20, 1), AppendMode::Buffered)
+        .unwrap();
+    let view = store.view("f", None).unwrap();
+    assert_eq!(view.snapshot.num_rows, 1);
+    assert_eq!(view.segments[0].segment().pos, highest_position + 3);
+    assert_eq!(rows_of(&store, "f", None), sample_batch(20, 1));
+}
+
+#[test]
+fn append_row_count_overflow_leaves_no_snapshot_or_data() {
+    let d = tempfile::tempdir().unwrap();
+    let store = Store::open(d.path().join("t.vpf")).unwrap();
+    let batch = sample_batch(0, 1);
+    let sid = store
+        .create_from_arrow("f", &batch.schema(), Compression::SNAPPY)
+        .unwrap();
+    store
+        .write(|t| {
+            t.conn().execute(
+                "UPDATE snapshots SET num_rows = ?1 WHERE snapshot_id = ?2",
+                rusqlite::params![i64::MAX, sid],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    for mode in [AppendMode::Buffered, AppendMode::Direct] {
+        assert!(
+            store
+                .append("f", &batch, mode)
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot row count exceeds i64")
+        );
+    }
+    assert_eq!(store.snapshot_info("f", None).unwrap().snapshot_id, sid);
+    store
+        .read(|c| {
+            for table in ["snapshots", "batches", "row_groups", "segments", "blobs"] {
+                let count: i64 =
+                    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+                assert_eq!(count, i64::from(table == "snapshots"));
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn buffered_and_direct_appends_are_visible_with_time_travel() {
     let d = tempfile::tempdir().unwrap();
     for (fi, codec) in codecs().into_iter().enumerate() {

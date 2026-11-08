@@ -341,3 +341,41 @@ fn write_txn_is_atomic_and_blobs_are_stable() {
         Some(s2)
     );
 }
+
+#[test]
+fn segment_position_lookup_is_bounded_and_added_to_older_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.vpf");
+    let store = Store::open(&path).unwrap();
+    store
+        .write(|t| {
+            let fid = t.create_file("f", Compression::SNAPPY, None, 1)?;
+            let mut insert = t.conn().prepare(
+                "INSERT INTO segments (file_id, pos, kind, obj_id, added_in, removed_in)
+                 VALUES (?1, ?2, 0, 1, 1, 2)",
+            )?;
+            for pos in 0..10_000 {
+                insert.execute(rusqlite::params![fid, pos])?;
+            }
+            t.conn().execute_batch("DROP INDEX idx_segments_pos")?;
+            Ok(())
+        })
+        .unwrap();
+    drop(store);
+
+    let store = Store::open(&path).unwrap();
+    store
+        .read(|c| {
+            let mut statement =
+                c.prepare("SELECT COALESCE(MAX(pos), -1) + 1 FROM segments WHERE file_id = ?1")?;
+            let pos: i64 = statement.query_row([1], |r| r.get(0))?;
+            assert_eq!(
+                pos, 10_000,
+                "removed segments still reserve their positions"
+            );
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 50, "position lookup executed {steps} VM steps");
+            Ok(())
+        })
+        .unwrap();
+}

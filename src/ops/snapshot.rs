@@ -50,7 +50,7 @@ impl SegmentData {
     }
 }
 
-fn load_header(
+pub(crate) fn load_header(
     conn: &Connection,
     name: &str,
     snapshot_id: Option<i64>,

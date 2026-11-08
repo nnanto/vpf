@@ -11,7 +11,7 @@ use parquet::file::metadata::KeyValue;
 use crate::convert::{batch_for_arrow_append, batch_to_columns};
 use crate::error::{Error, Result};
 use crate::meta::{self, SegmentKind};
-use crate::ops::snapshot::{SegmentData, load_view};
+use crate::ops::snapshot::{SegmentData, load_header, load_view};
 use crate::ops::synth::{self, SynthRowGroup};
 use crate::schema::{ColumnSpec, Leaf, SchemaVersion};
 use crate::store::{NewChunk, Store, Txn};
@@ -128,35 +128,40 @@ impl Store {
             return Err(Error::Invalid("cannot append an empty batch".into()));
         }
         self.write(|t| {
-            let view = load_view(t.conn(), name, None)?;
+            let (file, parent) = load_header(t.conn(), name, None)?;
+            let schema = meta::load_schema(t.conn(), parent.schema_version_id)?;
             let n = batch.num_rows();
+            let added_rows = i64::try_from(n)
+                .map_err(|_| Error::Invalid("append row count exceeds i64".into()))?;
+            let num_rows = parent
+                .num_rows
+                .checked_add(added_rows)
+                .ok_or_else(|| Error::Invalid("snapshot row count exceeds i64".into()))?;
             let direct = match mode {
                 AppendMode::Auto => n >= DIRECT_APPEND_ROWS,
                 AppendMode::Buffered => false,
                 AppendMode::Direct => true,
             };
-            let file_id = view.file.file_id;
-            let svid = view.schema.schema_version_id;
+            let file_id = file.file_id;
+            let svid = schema.schema_version_id;
             let sid = t.new_snapshot(file_id, svid, "append", Some(&format!("{n} rows")))?;
             if direct {
                 enum Input {
                     Arrow(RecordBatch),
                     Physical(Vec<ColumnData>),
                 }
-                let codec = synth::write_codec(&view.file);
-                let input = match batch_for_arrow_append(&view.schema, batch)? {
+                let codec = synth::write_codec(&file);
+                let input = match batch_for_arrow_append(&schema, batch)? {
                     Some(batch) => Input::Arrow(batch),
-                    None => Input::Physical(batch_to_columns(&view.schema, batch)?),
+                    None => Input::Physical(batch_to_columns(&schema, batch)?),
                 };
                 let mut start = 0;
                 while start < n {
                     let len = MAX_ROW_GROUP_ROWS.min(n - start);
                     let rg = match &input {
-                        Input::Arrow(batch) => synth::encode_arrow_row_group(
-                            &view.schema,
-                            codec,
-                            &batch.slice(start, len),
-                        )?,
+                        Input::Arrow(batch) => {
+                            synth::encode_arrow_row_group(&schema, codec, &batch.slice(start, len))?
+                        }
                         Input::Physical(cols) => {
                             let part = if len == n {
                                 Cow::Borrowed(cols.as_slice())
@@ -165,30 +170,32 @@ impl Store {
                                     cols.iter().map(|c| c.slice(start, len)).collect::<Vec<_>>(),
                                 )
                             };
-                            synth::encode_row_group(&view.schema, codec, &part)?
+                            synth::encode_row_group(&schema, codec, &part)?
                         }
                     };
-                    let rg_id = store_row_group(t, &view.schema, &rg)?;
+                    let rg_id = store_row_group(t, &schema, &rg)?;
                     t.append_segment(file_id, SegmentKind::RowGroup, rg_id, sid)?;
                     start += len;
                 }
             } else {
-                let cols = batch_to_columns(&view.schema, batch)?;
-                let keyed: Vec<((i64, i64), ColumnData)> = view
-                    .schema
+                let cols = batch_to_columns(&schema, batch)?;
+                let keyed: Vec<((i64, i64), ColumnData)> = schema
                     .leaves()?
                     .iter()
                     .map(|l| (l.column_id, l.leaf))
                     .zip(cols)
                     .collect();
                 let payload = encode_batch(n, &keyed)?;
-                let bid = t.put_batch(svid, n as i64, &payload)?;
+                let bid = t.put_batch(svid, added_rows, &payload)?;
                 t.append_segment(file_id, SegmentKind::Batch, bid, sid)?;
             }
-            t.finish_snapshot(file_id, sid)?;
+            t.conn().execute(
+                "UPDATE snapshots SET num_rows = ?1 WHERE snapshot_id = ?2",
+                rusqlite::params![num_rows, sid],
+            )?;
             Ok(AppendSummary {
                 snapshot_id: sid,
-                num_rows: n as i64,
+                num_rows: added_rows,
                 buffered: !direct,
             })
         })

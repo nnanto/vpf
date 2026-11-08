@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS segments (
     removed_in INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_segments_vis ON segments(file_id, added_in, removed_in);
+CREATE INDEX IF NOT EXISTS idx_segments_pos ON segments(file_id, pos);
 "#;
 
 pub fn codec_to_code(c: Compression) -> Result<i64> {
