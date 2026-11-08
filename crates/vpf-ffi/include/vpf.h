@@ -82,10 +82,13 @@ struct ArrowArrayStream {
 #define VPF_GE 6
 #define VPF_IS_NULL 7
 #define VPF_IS_NOT_NULL 8
+#define VPF_AND 9
+#define VPF_OR 10
 
 /* `column <op> value` on a table column. For comparisons, `value` is a one-row struct
  * array with one field (e.g. an exported one-column batch) described by `schema`; both
- * are NULL for VPF_IS_NULL / VPF_IS_NOT_NULL. vpf_scan takes ownership of `value`. */
+ * are NULL for VPF_IS_NULL / VPF_IS_NOT_NULL. Both scan functions take ownership
+ * of `value`. */
 typedef struct vpf_filter {
 	int64_t column;
 	int32_t op;
@@ -132,6 +135,14 @@ int vpf_create(vpf_file *file, const char *name, const struct ArrowSchema *schem
  * fail the filters, so apply them to the result. Row ids remain snapshot positions. */
 int vpf_scan(vpf_file *file, int64_t snapshot_id, const int64_t *columns, size_t n_columns,
              const vpf_filter *filters, size_t n_filters, size_t batch_rows, struct ArrowArrayStream *out);
+
+/* Like vpf_scan, but `filters` is a postfix expression: each comparison/null check
+ * pushes a predicate; VPF_AND / VPF_OR combine the preceding two predicates.
+ * Boolean operators ignore `column` and require NULL `schema` and `value`.
+ * A nonempty expression must leave exactly one predicate. NULL or zero filters
+ * means no pruning. Unknown statistics conservatively retain candidate rows. */
+int vpf_scan_expr(vpf_file *file, int64_t snapshot_id, const int64_t *columns, size_t n_columns,
+                  const vpf_filter *filters, size_t n_filters, size_t batch_rows, struct ArrowArrayStream *out);
 
 /* Appends rows. `arrays` are struct arrays (one per batch) matching `schema`, whose
  * columns map to the table's columns by position and are cast to the table's types.

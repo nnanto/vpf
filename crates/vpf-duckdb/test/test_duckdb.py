@@ -228,11 +228,24 @@ def test_filter_pushdown(tmp):
         "m = 1234.56", "m > 2999.98", "m BETWEEN 1.00 AND 1.02",
         "b = true AND id < 4", "NOT b AND id > 299996",
         "id > 100 AND id < 105 AND s IS NOT NULL",
+        "(id = 5 OR id = 250000) AND s IS NOT NULL",
+        "id = 5 OR id = 123456 OR id = 250000",
+        "(id BETWEEN 1000 AND 1010) OR (id > 299990 AND b = true)",
+        "(id = 5 AND s IS NOT NULL) OR s = 'zz'",
+        "id = 123456 OR s IS NULL",
+        "x = 'nan'::DOUBLE OR id = 5", "x IS NULL OR id = 250000",
+        "id = 5 OR id % 7 = 3",
+        "id = 5 OR s LIKE 'name029999%'",
+        "(id = 5 OR id % 7 = 3) AND id < 10",
+        "(id = 5 AND id % 7 = 3) OR id = 250000",
+        "NOT (id = 5 OR id = 250000)",
+        "id = NULL OR id = 250000",
     ]
     for p in predicates:
         check(p)
     check("id = ?", [77777])
     check("s = ? AND id > ?", ["name0000005", 1])
+    check("id = ? OR id = ?", [5, 250000])
 
     # Point and range lookups read about a page, not the table.
     assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 123456") <= 25000
@@ -241,8 +254,19 @@ def test_filter_pushdown(tmp):
     assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = ?", [42]) <= 25000
     assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 400000") <= 2
     assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id % 7 = 3") == 300002
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 123456 OR id = 123458") <= 25000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 5 OR id = 250000") <= 50000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 5 OR id = 123456 OR id = 250000") <= 75000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = ? OR id = ?", [5, 250000]) <= 50000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 400000 OR id = 500000") <= 2
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 5 OR id % 7 = 3") == 300002
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 5 OR s LIKE 'name029999%'") == 300002
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE (id = 5 OR id % 7 = 3) AND id < 10") <= 25000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE (id = 5 AND id % 7 = 3) OR id = 250000") <= 50000
     plan = rows(con, "EXPLAIN SELECT * FROM db.t WHERE id = 5")[0][1]
     assert "VPF Pruning" in plan and "id = 5" in plan, plan
+    plan = rows(con, "EXPLAIN SELECT * FROM db.t WHERE id = 5 OR id = 250000")[0][1]
+    assert "VPF Pruning" in plan and " OR " in plan, plan
 
     # Writes through pruned scans touch exactly the matching rows.
     for sql in [
@@ -250,6 +274,7 @@ def test_filter_pushdown(tmp):
         "DELETE FROM {}.t WHERE id = 150000 OR id = 299999",
         "DELETE FROM {}.t WHERE x = 'nan'::DOUBLE AND id > 250000",
         "UPDATE {}.t SET x = 1e9 WHERE s = 'name0000010'",
+        "UPDATE {}.t SET s = 'upd' WHERE id = 5 OR id = 250000",
     ]:
         assert rows(con, sql.format("db")) == rows(con, sql.format("mem")), sql
     for p in predicates + ["s = 'upd'", "x = 1e9"]:

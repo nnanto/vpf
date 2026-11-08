@@ -33,6 +33,40 @@ pub struct Filter {
     pub value: Option<ArrayRef>,
 }
 
+pub enum Step {
+    Filter(usize),
+    And,
+    Or,
+}
+
+/// Evaluates a validated postfix expression over conservative candidate ranges.
+pub fn expression_ranges(
+    md: &ParquetMetaData,
+    schema: &Schema,
+    filters: &[Filter],
+    steps: &[Step],
+) -> Vec<Range<u64>> {
+    // Keep the existing batched pruning path for conjunction-only scans.
+    if !steps.iter().any(|s| matches!(s, Step::Or)) {
+        return ranges(md, schema, filters);
+    }
+    let mut stack = Vec::new();
+    for step in steps {
+        match step {
+            Step::Filter(i) => stack.push(ranges(md, schema, &filters[*i..=*i])),
+            Step::And | Step::Or => {
+                let b = stack.pop().expect("validated expression");
+                let a = stack.pop().expect("validated expression");
+                stack.push(match step {
+                    Step::And => intersect(&a, &b),
+                    _ => union(&a, &b),
+                });
+            }
+        }
+    }
+    stack.pop().expect("validated expression")
+}
+
 /// Statistics of a set of row groups or pages, one entry each.
 struct Stats {
     mins: ArrayRef,
@@ -255,6 +289,27 @@ fn intersect(a: &[Range<u64>], b: &[Range<u64>]) -> Vec<Range<u64>> {
     out
 }
 
+fn union(a: &[Range<u64>], b: &[Range<u64>]) -> Vec<Range<u64>> {
+    let (mut i, mut j, mut out) = (0, 0, Vec::<Range<u64>>::new());
+    while i < a.len() || j < b.len() {
+        let r = if j == b.len() || (i < a.len() && a[i].start <= b[j].start) {
+            let r = a[i].clone();
+            i += 1;
+            r
+        } else {
+            let r = b[j].clone();
+            j += 1;
+            r
+        };
+        if let Some(last) = out.last_mut().filter(|last| last.end >= r.start) {
+            last.end = last.end.max(r.end);
+        } else {
+            push(&mut out, r);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +319,74 @@ mod tests {
         assert_eq!(intersect(&[0..10, 20..30], &[5..25]), vec![5..10, 20..25]);
         assert_eq!(intersect(&[0..10], &[10..20]), vec![]);
         assert_eq!(intersect(&[0..10], &[0..3, 3..10]), vec![0..10]);
+    }
+
+    #[test]
+    fn union_ranges() {
+        assert_eq!(union(&[0..10, 20..30], &[5..25]), vec![0..30]);
+        assert_eq!(union(&[0..10], &[10..20]), vec![0..20]);
+        assert_eq!(union(&[0..30], &[5..10, 20..25]), vec![0..30]);
+        assert_eq!(union(&[0..10], &[20..30]), vec![0..10, 20..30]);
+        assert_eq!(union(&[], &[5..10]), vec![5..10]);
+        assert_eq!(union(&[], &[]), vec![]);
+    }
+
+    #[test]
+    fn unknown_statistics_keep_or_branch() {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::Field;
+        use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("unknown", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..1000)),
+                Arc::new(StringArray::from(vec!["x"; 1000])),
+            ],
+        )
+        .unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_column_statistics_enabled("unknown".into(), EnabledStatistics::None)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file.try_clone().unwrap(), schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let filters = [
+            Filter {
+                column: 0,
+                op: Op::Eq,
+                value: Some(Arc::new(Int64Array::from(vec![5]))),
+            },
+            Filter {
+                column: 1,
+                op: Op::Eq,
+                value: Some(Arc::new(StringArray::from(vec!["x"]))),
+            },
+        ];
+        assert_eq!(
+            ranges(reader.metadata(), &schema, &filters[..1]),
+            vec![0..100]
+        );
+        assert_eq!(
+            expression_ranges(
+                reader.metadata(),
+                &schema,
+                &filters,
+                &[Step::Filter(0), Step::Filter(1), Step::Or]
+            ),
+            vec![0..1000],
+        );
     }
 }

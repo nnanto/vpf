@@ -31,6 +31,8 @@ pub const VPF_CONFLICT: c_int = 2;
 pub const VPF_ROWID: i64 = -1;
 pub const VPF_METADATA_LAZY: c_int = 0;
 pub const VPF_METADATA_EAGER: c_int = 1;
+pub const VPF_AND: i32 = 9;
+pub const VPF_OR: i32 = 10;
 
 mod prune;
 
@@ -463,6 +465,61 @@ pub unsafe extern "C" fn vpf_scan(
     batch_rows: usize,
     out_stream: *mut FFI_ArrowArrayStream,
 ) -> c_int {
+    unsafe {
+        scan_impl(
+            f,
+            snapshot_id,
+            columns,
+            n_columns,
+            filters,
+            n_filters,
+            batch_rows,
+            out_stream,
+            false,
+        )
+    }
+}
+
+/// # Safety
+/// The pointer and ownership requirements are identical to `vpf_scan`. Nonempty filters
+/// form a postfix expression, with `VPF_AND` / `VPF_OR` combining two preceding predicates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vpf_scan_expr(
+    f: *mut VpfFile,
+    snapshot_id: i64,
+    columns: *const i64,
+    n_columns: usize,
+    filters: *const VpfFilter,
+    n_filters: usize,
+    batch_rows: usize,
+    out_stream: *mut FFI_ArrowArrayStream,
+) -> c_int {
+    unsafe {
+        scan_impl(
+            f,
+            snapshot_id,
+            columns,
+            n_columns,
+            filters,
+            n_filters,
+            batch_rows,
+            out_stream,
+            true,
+        )
+    }
+}
+
+unsafe fn scan_impl(
+    f: *mut VpfFile,
+    snapshot_id: i64,
+    columns: *const i64,
+    n_columns: usize,
+    filters: *const VpfFilter,
+    n_filters: usize,
+    batch_rows: usize,
+    out_stream: *mut FFI_ArrowArrayStream,
+    expression: bool,
+) -> c_int {
     // Take the filter values first so they are released on every path.
     let raw: Vec<(i64, i32, *const FFI_ArrowSchema, FFI_ArrowArray)> = if filters.is_null() {
         Vec::new()
@@ -520,15 +577,44 @@ pub unsafe extern "C" fn vpf_scan(
             .map(|&c| (c != VPF_ROWID).then(|| wanted.binary_search(&(c as usize)).unwrap()))
             .collect();
         let batch_rows = if batch_rows == 0 { 2048 } else { batch_rows };
-        let filters = raw
-            .into_iter()
-            .map(|(c, op, schema, value)| unsafe { filter(&table, c, op, schema, value) })
-            .collect::<Result<Vec<_>>>()?;
+        let mut filters = Vec::new();
+        let mut steps = Vec::new();
+        let mut depth = 0usize;
+        for (c, op, schema, value) in raw {
+            if expression && matches!(op, VPF_AND | VPF_OR) {
+                if !schema.is_null() || !value.is_released() {
+                    return Err(invalid(
+                        "boolean filter operator must not have a value or schema",
+                    ));
+                }
+                if depth < 2 {
+                    return Err(invalid(
+                        "filter expression needs two operands for a boolean operator",
+                    ));
+                }
+                depth -= 1;
+                steps.push(if op == VPF_AND {
+                    prune::Step::And
+                } else {
+                    prune::Step::Or
+                });
+            } else {
+                let f = unsafe { filter(&table, c, op, schema, value) }?;
+                steps.push(prune::Step::Filter(filters.len()));
+                filters.push(f);
+                depth += 1;
+            }
+        }
+        if expression && !steps.is_empty() && depth != 1 {
+            return Err(invalid(
+                "filter expression must leave exactly one predicate",
+            ));
+        }
         let total = vf.metadata().file_metadata().num_rows() as u64;
         let ranges = if filters.is_empty() {
             vec![0..total]
         } else {
-            prune::ranges(vf.metadata(), &table, &filters)
+            prune::expression_ranges(vf.metadata(), &table, &filters, &steps)
         };
         let inner = if wanted.is_empty() {
             None

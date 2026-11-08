@@ -286,6 +286,15 @@ fn scan_filtered(
     columns: &[i64],
     filters: &[(i64, i32, Option<ArrayRef>)],
 ) -> RecordBatch {
+    scan_filters(f, columns, filters, false)
+}
+
+fn scan_filters(
+    f: *mut VpfFile,
+    columns: &[i64],
+    filters: &[(i64, i32, Option<ArrayRef>)],
+    expression: bool,
+) -> RecordBatch {
     let mut owned: Vec<(FFI_ArrowSchema, FFI_ArrowArray)> = filters
         .iter()
         .map(|(_, _, v)| match v {
@@ -315,8 +324,9 @@ fn scan_filtered(
         })
         .collect();
     let mut stream = FFI_ArrowArrayStream::empty();
+    let scan = if expression { vpf_scan_expr } else { vpf_scan };
     ok(unsafe {
-        vpf_scan(
+        scan(
             f,
             -1,
             columns.as_ptr(),
@@ -363,7 +373,17 @@ fn check_superset(
     filters: &[(i64, i32, Option<ArrayRef>)],
     matches: impl Fn(usize) -> bool,
 ) -> usize {
-    let got = scan_filtered(f, &[VPF_ROWID, 0, 1], filters);
+    check_expression_superset(f, all, filters, matches, false)
+}
+
+fn check_expression_superset(
+    f: *mut VpfFile,
+    all: &RecordBatch,
+    filters: &[(i64, i32, Option<ArrayRef>)],
+    matches: impl Fn(usize) -> bool,
+    expression: bool,
+) -> usize {
+    let got = scan_filters(f, &[VPF_ROWID, 0, 1], filters, expression);
     let ids = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     let returned: Vec<usize> = ids.values().iter().map(|&r| r as usize).collect();
     assert!(returned.windows(2).all(|w| w[0] < w[1]), "row ids sorted");
@@ -493,6 +513,77 @@ fn filtered_scans_prune_and_keep_matches() {
         (60_000..80_000).contains(&id.value(r))
     });
     assert!(n < 70_000, "range scanned {n} rows");
+
+    let eq = |v| (0, 1, Some(Arc::new(Int64Array::from(vec![v])) as ArrayRef));
+    let or = (0, VPF_OR, None);
+    let and = (0, VPF_AND, None);
+    for (a, b, limit) in [
+        (100_005, 100_007, 25_000),
+        (5, 200_001, 50_000),
+        (-1, 400_000, 3),
+    ] {
+        let n = check_expression_superset(
+            f,
+            &all,
+            &[eq(a), eq(b), or.clone()],
+            |r| id.value(r) == a || id.value(r) == b,
+            true,
+        );
+        assert!(n <= limit, "OR scanned {n} rows");
+    }
+    let expr = [
+        eq(5),
+        eq(100_005),
+        or.clone(),
+        (
+            0,
+            6,
+            Some(Arc::new(Int64Array::from(vec![100_000])) as ArrayRef),
+        ),
+        and.clone(),
+    ];
+    let n = check_expression_superset(
+        f,
+        &all,
+        &expr,
+        |r| (id.value(r) == 5 || id.value(r) == 100_005) && id.value(r) >= 100_000,
+        true,
+    );
+    assert!(n <= 25_000);
+    let expr = [
+        eq(5),
+        (1, 8, None),
+        and,
+        (
+            1,
+            1,
+            Some(Arc::new(StringArray::from(vec!["zz"])) as ArrayRef),
+        ),
+        or.clone(),
+    ];
+    check_expression_superset(
+        f,
+        &all,
+        &expr,
+        |r| name.is_valid(r) && (id.value(r) == 5 || name.value(r) == "zz"),
+        true,
+    );
+    // An OR with a broad null branch must not lose rows outside the equality's pages.
+    check_expression_superset(
+        f,
+        &all,
+        &[eq(100_005), (1, 7, None), or.clone()],
+        |r| id.value(r) == 100_005 || name.is_null(r),
+        true,
+    );
+    let got = scan_filters(f, &[VPF_ROWID], &[eq(5), eq(200_001), or.clone()], true);
+    let with_data = scan_filters(f, &[VPF_ROWID, 0], &[eq(5), eq(200_001), or], true);
+    assert_eq!(got.column(0), with_data.column(0));
+    assert_eq!(
+        scan_filters(f, &[VPF_ROWID, 0], &[], true),
+        scan_filtered(f, &[VPF_ROWID, 0], &[]),
+    );
+
     // Values of another type are cast to the column type.
     let v: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![5]));
     check_superset(f, &all, &[(0, 1, Some(v))], |r| id.value(r) == 5);
@@ -523,6 +614,53 @@ fn filtered_scans_prune_and_keep_matches() {
     assert_eq!(
         unsafe { vpf_scan(f, -1, cols.as_ptr(), 1, bad.as_ptr(), 1, 0, &mut stream) },
         VPF_ERROR
+    );
+    assert!(a.is_released());
+
+    for ops in [
+        vec![VPF_OR],
+        vec![7, VPF_AND],
+        vec![7, 8],
+        vec![7, 8, VPF_OR, VPF_AND],
+    ] {
+        let bad: Vec<_> = ops
+            .into_iter()
+            .map(|op| VpfFilter {
+                column: 0,
+                op,
+                schema: ptr::null(),
+                value: ptr::null_mut(),
+            })
+            .collect();
+        assert_eq!(
+            unsafe {
+                vpf_scan_expr(
+                    f,
+                    -1,
+                    cols.as_ptr(),
+                    1,
+                    bad.as_ptr(),
+                    bad.len(),
+                    0,
+                    &mut stream,
+                )
+            },
+            VPF_ERROR,
+        );
+    }
+    let (s, mut a) = arrays(
+        Schema::new(vec![Field::new("v", DataType::Int64, true)]),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    );
+    let bad = [VpfFilter {
+        column: 0,
+        op: VPF_OR,
+        schema: &s,
+        value: &mut a,
+    }];
+    assert_eq!(
+        unsafe { vpf_scan_expr(f, -1, cols.as_ptr(), 1, bad.as_ptr(), 1, 0, &mut stream) },
+        VPF_ERROR,
     );
     assert!(a.is_released());
     unsafe { vpf_close(f) };
@@ -596,5 +734,25 @@ fn float_filters_follow_sql_semantics() {
         |r| x.is_valid(r) && x.value(r) == 0.0,
     );
     assert!(n <= 70_000 + 25_000, "zero lookup scanned {n} rows");
+    let filters = [
+        (
+            0,
+            1,
+            Some(Arc::new(Float64Array::from(vec![-0.0])) as ArrayRef),
+        ),
+        (
+            0,
+            1,
+            Some(Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef),
+        ),
+        (0, VPF_OR, None),
+    ];
+    check_expression_superset(
+        f,
+        &all,
+        &filters,
+        |r| x.is_valid(r) && (x.value(r) == 0.0 || x.value(r).is_nan()),
+        true,
+    );
     unsafe { vpf_close(f) };
 }

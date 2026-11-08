@@ -1,6 +1,62 @@
 # VPF benchmark results
 
-## Latest: SQL reads and durable writes
+## Latest: OR-aware pruning
+
+The DuckDB extension now passes conservative AND/OR expressions to VPF: AND
+intersects candidate row ranges, OR unions them, and DuckDB still evaluates the
+exact predicate. Conjunction-only scans retain the original batched pruning
+path. Unsupported OR branches disable pruning of that disjunction, not of
+independent supported AND terms.
+
+Rebuilt baseline **`d27b97a`** and the modified extension, then ran the unchanged
+read/write harness sequentially in before/after eager and after/before lazy
+order on **2026-11-08**. Both variants used the same release CLI, one DuckDB
+thread, two read warm-ups/seven samples and one write warm-up/five samples.
+All 14 read queries and four durable write workloads ran at every size, with
+the harness's full-fixture, result and write verification.
+[Samples, plans, binary hashes and environment](benches/results/or-pruning.json)
+retain both the original observations and the follow-up measurements.
+
+OR medians in milliseconds; other-read change excludes both `count` and `or_filter`:
+
+| Rows | OR lazy before | OR lazy after | OR eager before | OR eager after | Other-read score change, lazy / eager |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 | 1.929 | 1.994 | 1.652 | 1.733 | +3.5% / +6.4% |
+| 100,000 | 3.836 | 3.265 | 3.409 | 2.722 | +2.3% / -1.8% |
+| 1,000,000 | 21.269 | 5.430 | 19.417 | 3.274 | -0.8% / -0.7% |
+| 10,000,000 | 198.780 | 26.176 | 188.768 | 5.231 | +1.3% / +0.01% |
+
+At 10M rows, OR is **7.6x faster in lazy mode and 36.1x faster in eager mode**;
+eager is comparable to the same-run Parquet median of **5.399 ms**. Tiny tables
+show no gain. The other-read score stayed within **-1.8% to +6.4%** across
+all sizes/modes, without a material individual read slowdown (more than both
+10% and 1 ms).
+
+Two size/mode combinations exceeded that write slowdown threshold: all four eager
+100K writes and the lazy 10M update. The eager 100K run also had large SQLite
+and Parquet spikes. Repeating the affected cases in both before/after orders,
+with two warm-ups and 11 samples per variant, did not reproduce those slowdowns:
+the eager 100K write changes ranged from **-2.8% to +4.3%**.
+The first lazy 10M update pair measured **59.828 ms before / 59.418 ms after**.
+The reverse-order pair measured **332.214 ms before / 60.267 ms after**, with
+renewed baseline spikes. These shared-environment timings show no reproducible
+write regression, not a guaranteed latency bound. The original noisy samples
+are retained rather than discarded.
+
+Integration tests additionally verify same-page OR scans produce at most
+25K candidate rows, distant two-branch scans at most 50K, and three branches
+at most 75K on a 300K-row table. Nested AND/OR, unsupported branches, prepared
+parameters, NULL/NaN, missing statistics, row IDs and mutations remain correct.
+
+Reproduce each primary run with the existing harness, choosing the matching
+baseline or modified `vpf.duckdb_extension` and metadata mode:
+
+```sh
+python benches/analytical.py --metadata-mode eager --writes \
+  --extension /path/to/vpf.duckdb_extension --output /path/to/report.json
+```
+
+## SQL reads and durable writes baseline
 
 The expanded [`benches/analytical.py`](benches/analytical.py) suite compares
 **10K, 100K, 1M and 10M identical orders rows** across native SQLite, DuckDB on
@@ -34,8 +90,8 @@ At 10M rows, eager's score is **8.2x faster than unindexed SQLite** and
 **1.9x slower than Parquet**. Eager's full-row point lookup takes **7.694 ms**
 versus **5.391 ms Parquet** and **29.879 ms lazy VPF**. String prefix filtering
 still takes **227.454 ms versus 87.130 ms Parquet**, and the two-ID `OR` takes
-**180.460 ms versus 4.788 ms**. The extension does not currently push pruning
-hints for `LIKE` or `OR`; these remain important gaps.
+**180.460 ms versus 4.788 ms**. That baseline did not push pruning hints for
+`LIKE` or `OR`; OR is addressed by the follow-up above, while LIKE remains a gap.
 
 Durable write medians:
 

@@ -306,7 +306,7 @@ optional_ptr<VpfTableEntry> VpfTransaction::GetTable() {
 //===--------------------------------------------------------------------===//
 // Scan
 //===--------------------------------------------------------------------===//
-//! `column <op> value`, used by VPF to skip row groups and pages (see vpf_scan).
+//! A postfix pruning expression: comparisons/null checks followed by AND/OR operators.
 struct VpfFilter {
 	idx_t column;
 	int32_t op;
@@ -425,33 +425,47 @@ static void AddComparison(const LogicalGet &get, VpfScanData &data, const Expres
 	data.filters.push_back({col.GetIndex(), op, value, get.names[col.GetIndex()].GetIdentifierName()});
 }
 
-static void CollectFilter(const LogicalGet &get, VpfScanData &data, const Expression &expr) {
+static bool CollectFilter(const LogicalGet &get, VpfScanData &data, const Expression &expr) {
+	auto start = data.filters.size();
 	auto type = expr.GetExpressionType();
-	if (type == ExpressionType::CONJUNCTION_AND) {
+	if (type == ExpressionType::CONJUNCTION_AND || type == ExpressionType::CONJUNCTION_OR) {
+		auto op = type == ExpressionType::CONJUNCTION_AND ? VPF_AND : VPF_OR;
+		bool collected = false;
 		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
-			CollectFilter(get, data, *child);
+			if (!CollectFilter(get, data, *child)) {
+				// An unsupported OR branch may match anywhere; pruning the other branch is unsafe.
+				if (op == VPF_OR) {
+					data.filters.resize(start);
+					return false;
+				}
+				continue;
+			}
+			if (collected) {
+				data.filters.push_back({0, op, Value(), ""});
+			}
+			collected = true;
 		}
-		return;
+		return collected;
 	}
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION &&
 	    expr.GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
-		return;
+		return false;
 	}
 	if (type == ExpressionType::OPERATOR_IS_NULL || type == ExpressionType::OPERATOR_IS_NOT_NULL) {
 		auto &children = expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION
 		                     ? expr.Cast<BoundFunctionExpression>().GetChildren()
 		                     : expr.Cast<BoundOperatorExpression>().GetChildren();
 		if (children.size() != 1) {
-			return;
+			return false;
 		}
 		auto col = FilterColumn(get, data, *children[0]);
 		if (col.IsValid()) {
 			data.filters.push_back({col.GetIndex(), VpfOp(type), Value(), get.names[col.GetIndex()].GetIdentifierName()});
 		}
-		return;
+		return data.filters.size() > start;
 	}
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-		return;
+		return false;
 	}
 	auto &func = expr.Cast<BoundFunctionExpression>();
 	if (type == ExpressionType::COMPARE_BETWEEN) {
@@ -460,19 +474,23 @@ static void CollectFilter(const LogicalGet &get, VpfScanData &data, const Expres
 		              BoundBetweenExpression::LowerBound(func));
 		AddComparison(get, data, input, BoundBetweenExpression::UpperComparisonType(func),
 		              BoundBetweenExpression::UpperBound(func));
-		return;
+		if (data.filters.size() == start + 2) {
+			data.filters.push_back({0, VPF_AND, Value(), ""});
+		}
+		return data.filters.size() > start;
 	}
 	if (VpfOp(type) == 0 || func.GetChildren().size() != 2) {
-		return;
+		return false;
 	}
 	ExpressionType comparison;
 	auto constant = ExpressionFilter::TryGetColumnConstantComparison(func, comparison);
 	if (!constant) {
-		return;
+		return false;
 	}
 	auto &children = func.GetChildren();
 	auto &column = children[0].get() == static_cast<const Expression *>(constant.get()) ? *children[1] : *children[0];
 	AddComparison(get, data, column, comparison, *constant);
+	return data.filters.size() > start;
 }
 
 static void VpfPushdownFilters(ClientContext &, LogicalGet &get, FunctionData *bind_data,
@@ -480,7 +498,10 @@ static void VpfPushdownFilters(ClientContext &, LogicalGet &get, FunctionData *b
 	// Filters stay in `filters`, so DuckDB keeps evaluating them on the pruned rows.
 	auto &data = bind_data->Cast<VpfScanData>();
 	for (auto &filter : filters) {
-		CollectFilter(get, data, *filter);
+		bool collected = !data.filters.empty();
+		if (CollectFilter(get, data, *filter) && collected) {
+			data.filters.push_back({0, VPF_AND, Value(), ""});
+		}
 	}
 }
 
@@ -489,12 +510,20 @@ static InsertionOrderPreservingMap<string> VpfScanToString(TableFunctionToString
 	auto &data = input.bind_data->Cast<VpfScanData>();
 	result["Table"] = data.table.name.GetIdentifierName();
 	if (!data.filters.empty()) {
-		string text;
+		vector<string> stack;
 		for (auto &f : data.filters) {
-			text += (text.empty() ? "" : "\n") + f.name + " " + VpfOpName(f.op) +
-			        (f.value.IsNull() ? "" : " " + f.value.ToSQLString());
+			if (f.op == VPF_AND || f.op == VPF_OR) {
+				auto right = std::move(stack.back());
+				stack.pop_back();
+				auto left = std::move(stack.back());
+				stack.pop_back();
+				stack.push_back("(" + left + (f.op == VPF_AND ? " AND " : " OR ") + right + ")");
+			} else {
+				stack.push_back(f.name + " " + VpfOpName(f.op) +
+				                (f.value.IsNull() ? "" : " " + f.value.ToSQLString()));
+			}
 		}
-		result["VPF Pruning"] = text;
+		result["VPF Pruning"] = stack.back();
 	}
 	return result;
 }
@@ -530,7 +559,7 @@ static unique_ptr<GlobalTableFunctionState> VpfScanInitGlobal(ClientContext &con
 	}
 	auto result = make_uniq<VpfScanGlobal>();
 	auto snapshot = transaction.Snapshot();
-	Check(vpf_scan(transaction.File(), snapshot, columns.data(), columns.size(), filters.data(), filters.size(),
+	Check(vpf_scan_expr(transaction.File(), snapshot, columns.data(), columns.size(), filters.data(), filters.size(),
 	               STANDARD_VECTOR_SIZE, &result->stream.arrow_array_stream),
 	      "scan");
 	return std::move(result);
