@@ -1,6 +1,65 @@
 # VPF benchmark results
 
-## Latest: analytical SQL across SQLite, Parquet and VPF
+## Latest: configurable snapshot metadata preparation
+
+Recorded on **2026-11-08**, using **`962146f`**, after the original analytical
+baseline. Snapshot identity/row-count and schema lookups now avoid loading page
+metadata. The C API caches one resolved snapshot per handle with invalidation at
+write and transaction boundaries. **Lazy (default)** resolves layouts on demand;
+**eager** additionally persists each new snapshot's footer and offset mapping
+atomically on writes. Both modes can read existing persisted layouts after reopen.
+
+The SQL, data, sizes, one-thread settings, warm-ups, repetition count and equality
+checks match the baseline below. Lazy and eager were measured in separate sequential
+runs; these shared-environment medians are not a controlled stage profile or
+confidence intervals. Small timing differences can reflect run-to-run noise.
+
+Summed medians of the seven non-`COUNT(*)` queries, in milliseconds:
+
+| Rows | Previous VPF | Optimized lazy | Optimized eager | Eager reduction |
+|---:|---:|---:|---:|---:|
+| 10,000 | 20.717 | 14.918 | 12.845 | 38.0% |
+| 100,000 | 35.664 | 28.215 | 25.585 | 28.3% |
+| 1,000,000 | 199.769 | 155.766 | 138.075 | 30.9% |
+| 10,000,000 | 1,799.336 | 1,349.484 | 1,237.958 | 31.2% |
+
+At 10M rows, the 100-row ID range improves from **95.067 ms** to **25.405 ms
+lazy / 6.462 ms eager** (3.7x / 14.7x faster). `COUNT(*)` improves from **96.463 ms**
+to **33.597 ms / 12.472 ms**, without introducing count-aggregate pushdown.
+Eager's same-run workload score is **10.7x faster than unindexed SQLite** and
+**1.77x slower than DuckDB on Parquet**. Native Parquet remains faster overall.
+
+The eager 10M fixture occupies **110.266 MiB**, versus **110.078 MiB** for lazy.
+Observed fixture imports took **1.30 s lazy / 1.68 s eager**, including CLI startup.
+Those are single setup observations, not repeated write measurements; they should
+not be treated as a stable write-overhead estimate. Eager prepares whole-snapshot
+metadata on writes, and buffered snapshots additionally persist synthesized
+Parquet pages, so frequent small appends can have a larger CPU/storage cost.
+
+Full per-query results, plans, samples, storage and environment:
+[lazy tables](benches/results/analytical-lazy.md),
+[lazy JSON](benches/results/analytical-lazy.json),
+[eager tables](benches/results/analytical-eager.md),
+[eager JSON](benches/results/analytical-eager.json).
+The original [baseline JSON](benches/results/analytical.json) remains unchanged.
+
+```bash
+# Build for the exact installed DuckDB version, as described below.
+DUCKDB_VERSION=v2.0.0 crates/vpf-duckdb/build.sh
+cargo build --release --bin vpf
+/tmp/vpf-analytics-venv/bin/python benches/analytical.py \
+  --metadata-mode lazy --output benches/results/analytical-lazy.json
+/tmp/vpf-analytics-venv/bin/python benches/analytical.py \
+  --metadata-mode eager --output benches/results/analytical-eager.json
+```
+
+`--metadata-mode` configures the fixture's writer and DuckDB attachment. The
+attachment setting is a write policy: even a lazy attachment reads a persisted
+layout if one exists. The benchmark therefore builds separate fixtures for each
+mode. The handle-local cache is not shared across DuckDB autocommit transactions;
+persisted eager layouts avoid reconstruction across those transactions and reopens.
+
+## Earlier: analytical SQL across SQLite, Parquet and VPF
 
 The analytical suite runs on **`f931b1f` (latest main fetched for this run)**,
 including the DuckDB filter-pushdown implementation. It compares **10,000,
@@ -81,6 +140,9 @@ cargo build --release --bin vpf
   --sizes 1000 10000 --repeats 2 --warmups 1 --output /tmp/analytical-smoke.json
 ```
 
+The original harness was committed in `7123f79`, whose runtime code matches
+`f931b1f`; use that revision to reproduce this archived baseline. Current builds
+also support `--metadata-mode` and should use separate output names as above.
 `--sizes`, `--repeats`, `--warmups`, `--extension` and `--vpf-bin` allow explicit
 overrides. Fixtures are built and removed one size at a time. Results are saved
 after each completed size, with Markdown tables beside the JSON output.
