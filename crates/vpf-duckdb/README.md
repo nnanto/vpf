@@ -112,3 +112,7 @@ the CLI (`VPF_BIN`).
 DuckDB reading Parquet and native SQLite on identical orders tables at multiple
 sizes. See [`BENCHMARKS.md`](../../BENCHMARKS.md) for results, methodology and
 reproduction commands.
+Pass `--writes` to also measure durable fresh writes, appends, updates and deletes.
+The read suite includes point/range lookups and simple equality, NULL, LIKE and OR
+filters in addition to analytical queries. `--metadata-mode lazy|eager` compares
+the two snapshot-preparation policies.

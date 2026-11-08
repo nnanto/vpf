@@ -400,9 +400,22 @@ string/binary buffers, and borrows whole row groups when possible. Both append p
 retain the existing maximum of 1,048,576 rows per row group.
 
 The separate [`benches/analytical.py`](benches/analytical.py) suite runs identical
-analytical SQL against native SQLite, DuckDB reading Parquet and the DuckDB VPF
-extension at 10K, 100K, 1M and 10M rows. It covers aggregations, filters, grouping,
-top-N and distinct counts, with full-table equality checks before timing. This is
-a single-threaded, warm-cache, unindexed SQLite comparison; it is not ClickBench.
+SQL against native SQLite, DuckDB reading Parquet and the DuckDB VPF extension
+at 10K, 100K, 1M and 10M rows. Reads cover point/range lookups, equality, NULL,
+LIKE and OR filters, aggregations, grouping, top-N and distinct counts.
+`--writes` adds repeated fresh writes, 1% appends and clustered 100-row
+updates/deletes, including checkpoint/file-sync work. Each write sample uses a fresh
+destination or independently copied seed; copying and verification are excluded.
+Parquet mutations rewrite the complete file. Both metadata modes are supported:
+
+```bash
+python benches/analytical.py --writes --metadata-mode lazy --output /tmp/read-write-lazy.json
+python benches/analytical.py --writes --metadata-mode eager --output /tmp/read-write-eager.json
+```
+
+Full-table equality is checked before timing reads and before collecting write
+samples. This is a single-threaded, warm-cache, unindexed SQLite comparison,
+not ClickBench. See [BENCHMARKS.md](BENCHMARKS.md) for timing boundaries and
+native-writer differences.
 
 Recorded measurements and reproduction commands are in [BENCHMARKS.md](BENCHMARKS.md).

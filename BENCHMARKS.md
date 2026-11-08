@@ -1,6 +1,165 @@
 # VPF benchmark results
 
-## Latest: configurable snapshot metadata preparation
+## Latest: SQL reads and durable writes
+
+The expanded [`benches/analytical.py`](benches/analytical.py) suite compares
+**10K, 100K, 1M and 10M identical orders rows** across native SQLite, DuckDB on
+Parquet, and DuckDB on VPF, in separate sequential lazy/eager runs.
+The runtime is rebuilt from **`7f6cd4a`**, including the header-only append
+optimization that avoids loading existing pages/buffers in lazy mode.
+Full reports retain medians, raw samples, exact SQL, read plans, verification
+counts, output sizes and environment, including the harness SHA-256:
+[lazy tables](benches/results/read-write-lazy.md),
+[lazy JSON](benches/results/read-write-lazy.json),
+[eager tables](benches/results/read-write-eager.md),
+[eager JSON](benches/results/read-write-eager.json).
+
+### Results across sizes
+
+Recorded on **2026-11-08**. Times are milliseconds, lower is better.
+SQLite and Parquet columns below come from the eager run; each VPF column comes
+from its own mode's run. Each linked report includes its same-run baselines.
+The modes ran sequentially, so differences are not controlled stage attribution.
+
+Read score: sum of the **13 non-count query medians**:
+
+| Rows | SQLite, unindexed | Parquet / DuckDB | VPF lazy | VPF eager |
+|---:|---:|---:|---:|---:|
+| 10,000 | 13.223 | 14.275 | 27.744 | 24.110 |
+| 100,000 | 110.116 | 27.118 | 52.275 | 45.595 |
+| 1,000,000 | 1,205.770 | 116.934 | 249.466 | 212.921 |
+| 10,000,000 | 15,380.458 | 992.305 | 2,205.224 | 1,876.973 |
+
+At 10M rows, eager's score is **8.2x faster than unindexed SQLite** and
+**1.9x slower than Parquet**. Eager's full-row point lookup takes **7.694 ms**
+versus **5.391 ms Parquet** and **29.879 ms lazy VPF**. String prefix filtering
+still takes **227.454 ms versus 87.130 ms Parquet**, and the two-ID `OR` takes
+**180.460 ms versus 4.788 ms**. The extension does not currently push pruning
+hints for `LIKE` or `OR`; these remain important gaps.
+
+Durable write medians:
+
+| Seed rows | Write | SQLite | Parquet / DuckDB | VPF lazy | VPF eager |
+|---:|---|---:|---:|---:|---:|
+| 10,000 | fresh | 5.340 | 4.373 | 14.077 | 17.433 |
+| 10,000 | append | 2.390 | 5.656 | 5.771 | 6.363 |
+| 10,000 | update | 2.831 | 5.328 | 9.646 | 8.599 |
+| 10,000 | delete | 2.894 | 5.400 | 11.366 | 11.863 |
+| 100,000 | fresh | 23.153 | 21.729 | 43.314 | 43.568 |
+| 100,000 | append | 3.453 | 23.348 | 6.472 | 8.303 |
+| 100,000 | update | 6.484 | 22.994 | 16.707 | 17.010 |
+| 100,000 | delete | 6.571 | 23.823 | 36.344 | 35.906 |
+| 1,000,000 | fresh | 211.787 | 145.397 | 256.636 | 288.759 |
+| 1,000,000 | append | 8.405 | 154.508 | 13.936 | 23.303 |
+| 1,000,000 | update | 56.030 | 149.573 | 21.261 | 25.751 |
+| 1,000,000 | delete | 46.851 | 155.379 | 43.386 | 47.360 |
+| 10,000,000 | fresh | 2,020.046 | 1,339.083 | 1,892.237 | 2,064.484 |
+| 10,000,000 | append | 28.319 | 1,360.402 | 67.766 | 90.070 |
+| 10,000,000 | update | 398.745 | 1,354.599 | 60.494 | 63.731 |
+| 10,000,000 | delete | 385.282 | 1,437.278 | 83.573 | 86.121 |
+
+At 10M rows, eager VPF's append/update/delete medians are **15.1x / 21.3x /
+16.7x faster than complete Parquet rewrites**, but fresh VPF writes are **1.54x
+slower**. Unindexed SQLite remains faster for appends; VPF's clustered
+updates/deletes avoid SQLite's full predicate scan. Eager improves the read
+score by about **15% relative to lazy** in these runs, but its 100K-row append
+costs **90.070 ms versus 67.766 ms lazy**. This demonstrates the configurable
+read/write tradeoff, not a universal winning mode.
+
+### Read workloads
+
+**Version 2 has 14 queries:** the eight analytical queries described below plus
+a full-row midpoint ID lookup, an ordered full-row 100-ID range, numeric equality
+(`product_id = 17`), `IS NULL`, string prefix `LIKE 'r1%'`, and a two-ID `OR`.
+The score now sums **13 non-count query medians**, so it must not be compared
+directly with the historical seven-query scores. Individual unchanged queries
+remain comparable, subject to run-to-run noise.
+
+The original deterministic seven-column data, unindexed SQLite table, imported
+VPF read pages, one-thread configuration and warm-cache methodology are retained.
+Reads have two warm-ups and seven measured repetitions; complete fixture equality
+is checked before timing, and every query result is checked after execution.
+In particular, these point lookups do **not** compare against indexed SQLite.
+
+### Write workloads and timing boundaries
+
+| Write | Logical operation |
+|---|---|
+| Fresh | Write all N rows into a new destination/table |
+| Append | Add `max(1, N // 100)` rows, with IDs starting at N |
+| Update | Set `revenue_cents = 12345` for up to 100 clustered midpoint IDs |
+| Delete | Remove the same clustered midpoint ID range |
+
+Each case has one warm-up and five measured repetitions, with reproducibly
+shuffled workload/engine order. Every iteration receives a new destination or
+an independent copy of a checkpointed seed. Input generation, copying/syncing
+the seed, connection/extension/attachment setup, verification and cleanup are
+excluded. Table creation, native SQL execution/commit and explicit durability
+work are included.
+
+SQLite uses native `INSERT SELECT` from a prebuilt SQLite input table, not timed
+Python row ingestion. Parquet and VPF consume canonical Parquet input through
+DuckDB. These are **engine-native workflows with identical logical data**, not
+identical physical input formats or encoder-only measurements. SQLite uses
+WAL/NORMAL; both SQLite and VPF finish each sample with a WAL checkpoint/TRUNCATE,
+file fsync and directory fsync. Parquet writes a complete new file for append,
+update and delete, then fsyncs it, atomically replaces the destination and fsyncs
+the directory. This measures a single-file Parquet workflow, not partitioned
+append or an external table format.
+
+The JSON includes separate SQL and explicit durability stage samples.
+**SQL time may already contain engine-internal sync**, so it is not CPU-only.
+Stage samples sum to the total for each iteration; independently computed
+stage medians need not sum to the total median. These boundaries provide an
+explicit synced endpoint, not a crash-recovery test or identical internal
+durability protocols.
+
+The first warm-up verifies every output row against the expected canonical SQL,
+checking ID bounds and comparing ordered 8,192-ID windows outside timing.
+This avoids a global DuckDB verification sort and does not assume physical row order.
+SQLite's unindexed output is instead sorted once and streamed through those
+windows, avoiding a complete table scan per window.
+Every iteration checks affected/emitted counts
+and final row count. Output sizes include any WAL/SHM sidecars; VPF retains its
+original snapshot after a mutation, unlike SQLite and a replaced Parquet file.
+
+All Parquet/VPF writes explicitly use **Snappy**. Parquet COPY targets 65,536-row
+groups; VPF CTAS uses the production auto-append policy, buffering batches below
+65,536 rows and directly encoding larger batches. Thus fresh VPF outputs can
+have different row-group/buffer layouts from the imported read seeds. We do not
+force a flush or otherwise change production behavior to match Parquet's layout.
+Eager mode prepares metadata on writes and reads persisted seed layouts;
+lazy mode resolves seed layouts on demand.
+
+These are shared-environment warm-cache elapsed-time medians, not confidence
+intervals. They do not cover cold I/O, concurrent writers, joins, indexed
+SQLite, multithreaded DuckDB, peak memory or production data distributions.
+
+### Reproduction
+
+Build/install the matching DuckDB extension and release CLI as described below,
+then use separate output paths to preserve the historical read-only archives:
+
+```bash
+/tmp/vpf-analytics-venv/bin/python benches/analytical.py \
+  --writes --metadata-mode lazy --output benches/results/read-write-lazy.json
+/tmp/vpf-analytics-venv/bin/python benches/analytical.py \
+  --writes --metadata-mode eager --output benches/results/read-write-eager.json
+
+# Small correctness/reporting run:
+/tmp/vpf-analytics-venv/bin/python benches/analytical.py \
+  --sizes 1 70000 --repeats 1 --warmups 1 --writes --write-repeats 1 \
+  --metadata-mode eager --output /tmp/read-write-smoke.json
+
+# Focused tests, including independent multi-row-group writes in both modes:
+/tmp/vpf-analytics-venv/bin/python -m unittest discover \
+  -s benches -p test_analytical.py -q
+```
+
+`--write-repeats` and `--write-warmups` control write sampling independently of
+the read options. Omitting `--writes` runs only the expanded read suite.
+
+## Earlier: configurable snapshot metadata preparation
 
 Recorded on **2026-11-08**, using **`962146f`**, after the original analytical
 baseline. Snapshot identity/row-count and schema lookups now avoid loading page
@@ -44,6 +203,8 @@ Full per-query results, plans, samples, storage and environment:
 The original [baseline JSON](benches/results/analytical.json) remains unchanged.
 
 ```bash
+# These archived eight-query runs require the harness from aef8d37.
+# The current harness adds six reads; use new output paths for current results.
 # Build for the exact installed DuckDB version, as described below.
 DUCKDB_VERSION=v2.0.0 crates/vpf-duckdb/build.sh
 cargo build --release --bin vpf
