@@ -41,6 +41,31 @@ one writer can use a file at a time.
 * **Columns have stable ids**. Rename, reorder and drop only change metadata, and a chunk
   keeps belonging to its column across schema versions.
 
+### Snapshot metadata policy
+
+Choose the policy per writer with `--metadata-mode lazy|eager`, the library's
+`Store::set_metadata_mode(SnapshotMetadataMode::Eager)`, or DuckDB
+`ATTACH 'sales.vpf' AS sales (TYPE vpf, METADATA_MODE 'eager')`.
+
+**Lazy (default)** preserves the existing write costs and resolves virtual layouts
+on demand. The C API caches one resolved snapshot per handle. **Eager** additionally
+persists each new snapshot's serialized footer and virtual-offset mapping in
+`snapshot_layouts`, atomically with the write. Reads use persisted layouts in either
+mode, including after reopen; uncached older snapshots remain readable on demand.
+Changing the mode affects subsequent writes and does not backfill history.
+
+Eager shifts whole-snapshot metadata assembly onto writes and retains a layout for
+each prepared snapshot, increasing write CPU and storage. Buffered snapshots also
+persist their synthesized Parquet pages in the layout, so eager can be especially
+expensive for frequent small appends. Stored page BLOBs remain immutable and are
+referenced, not duplicated. Footer/layout failures abort the write; transaction
+rollback discards uncommitted layouts alongside the corresponding data.
+
+Snapshot ID/row-count and schema lookups do not load row groups or build footers in
+either mode. Handle-local resolved-snapshot caches are cleared at write and
+transaction boundaries, and current reads resolve the latest committed snapshot
+before using a cached entry.
+
 ### Operations
 
 | Operation | What is written |
@@ -149,6 +174,7 @@ cargo build --release
 
 # vpf FILE COMMAND ...   (`create` and `import` create FILE; the table is named after its stem)
 vpf sales.vpf import data.parquet
+vpf sales.vpf import data.parquet --metadata-mode eager # prepare footer/layout on writes
 vpf events.vpf create id:int64:required name:string at:timestamp_us amount:decimal(12,2) --codec zstd
 vpf docs.vpf create id:int64:required tags:list<string> attrs:map<string,int64> 'pt:struct<x:double!,y:list<int32>>'
 vpf sales.vpf append --parquet more.parquet           # --mode auto|buffered|direct

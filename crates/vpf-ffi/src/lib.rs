@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, StructArray};
 use arrow::compute::{CastOptions, cast_with_options, concat_batches};
@@ -22,13 +22,15 @@ use parquet::arrow::arrow_reader::{
 };
 use vpf::layout::VirtualFile;
 use vpf::ops::append::AppendMode;
-use vpf::store::Store;
+use vpf::store::{SnapshotMetadataMode, Store};
 use vpf::{Error, Result};
 
 pub const VPF_OK: c_int = 0;
 pub const VPF_ERROR: c_int = 1;
 pub const VPF_CONFLICT: c_int = 2;
 pub const VPF_ROWID: i64 = -1;
+pub const VPF_METADATA_LAZY: c_int = 0;
+pub const VPF_METADATA_EAGER: c_int = 1;
 
 mod prune;
 
@@ -44,6 +46,13 @@ pub struct VpfFilter {
 /// An open `.vpf` file.
 pub struct VpfFile {
     store: Store,
+    snapshot_cache: Mutex<Option<CachedSnapshot>>,
+}
+
+struct CachedSnapshot {
+    id: i64,
+    file: VirtualFile,
+    metadata: ArrowReaderMetadata,
 }
 
 thread_local! {
@@ -122,16 +131,35 @@ impl VpfFile {
 
     fn snapshot(&self, id: i64) -> Result<(String, VirtualFile, ArrowReaderMetadata)> {
         let name = self.table()?;
-        let vf = self.store.open_snapshot(&name, (id >= 0).then_some(id))?;
+        let info = self.store.snapshot_info(&name, (id >= 0).then_some(id))?;
+        let mut cache = self.snapshot_cache.lock().unwrap();
+        if let Some(cached) = cache.as_ref().filter(|c| c.id == info.snapshot_id) {
+            return Ok((name, cached.file.clone(), cached.metadata.clone()));
+        }
+        let vf = self.store.open_snapshot(&name, Some(info.snapshot_id))?;
         let md =
             ArrowReaderMetadata::try_new(vf.metadata().clone(), ArrowReaderOptions::default())?;
+        *cache = Some(CachedSnapshot {
+            id: info.snapshot_id,
+            file: vf.clone(),
+            metadata: md.clone(),
+        });
         Ok((name, vf, md))
+    }
+
+    fn clear_snapshot_cache(&self) {
+        *self.snapshot_cache.lock().unwrap() = None;
+    }
+
+    fn schema_at(&self, id: i64) -> Result<(String, SchemaRef)> {
+        let name = self.table()?;
+        let schema = self.store.snapshot_schema(&name, (id >= 0).then_some(id))?;
+        Ok((name, Arc::new(vpf::convert::arrow_schema(&schema)?)))
     }
 
     /// The table's Arrow schema, as scans produce it.
     fn schema(&self) -> Result<(String, SchemaRef)> {
-        let (name, _, md) = self.snapshot(-1)?;
-        Ok((name, md.schema().clone()))
+        self.schema_at(-1)
     }
 }
 
@@ -308,7 +336,28 @@ pub unsafe extern "C" fn vpf_open(path: *const c_char, out_file: *mut *mut VpfFi
             return Err(invalid("null out pointer"));
         }
         let store = Store::open(path)?;
-        out(out_file, Box::into_raw(Box::new(VpfFile { store })));
+        out(
+            out_file,
+            Box::into_raw(Box::new(VpfFile {
+                store,
+                snapshot_cache: Mutex::new(None),
+            })),
+        );
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `f` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vpf_set_metadata_mode(f: *mut VpfFile, mode: c_int) -> c_int {
+    guard(|| {
+        let mode = match mode {
+            VPF_METADATA_LAZY => SnapshotMetadataMode::Lazy,
+            VPF_METADATA_EAGER => SnapshotMetadataMode::Eager,
+            _ => return Err(invalid(&format!("unknown metadata mode {mode}"))),
+        };
+        unsafe { file(f) }?.store.set_metadata_mode(mode);
         Ok(())
     })
 }
@@ -346,9 +395,9 @@ pub unsafe extern "C" fn vpf_table_name(f: *mut VpfFile, name: *mut *mut c_char)
 pub unsafe extern "C" fn vpf_snapshot(f: *mut VpfFile, id: *mut i64, num_rows: *mut i64) -> c_int {
     guard(|| {
         let f = unsafe { file(f) }?;
-        let v = f.store.view(&f.table()?, None)?;
-        out(id, v.snapshot.snapshot_id);
-        out(num_rows, v.snapshot.num_rows);
+        let info = f.store.snapshot_info(&f.table()?, None)?;
+        out(id, info.snapshot_id);
+        out(num_rows, info.num_rows);
         Ok(())
     })
 }
@@ -366,8 +415,8 @@ pub unsafe extern "C" fn vpf_schema(
         if out_schema.is_null() {
             return Err(invalid("null out pointer"));
         }
-        let (_, _, md) = f.snapshot(snapshot_id)?;
-        let s = FFI_ArrowSchema::try_from(md.schema().as_ref())?;
+        let (_, schema) = f.schema_at(snapshot_id)?;
+        let s = FFI_ArrowSchema::try_from(schema.as_ref())?;
         out(out_schema, s);
         Ok(())
     })
@@ -392,6 +441,7 @@ pub unsafe extern "C" fn vpf_create(
         } else {
             unsafe { str_arg(codec, "codec") }?
         };
+        f.clear_snapshot_cache();
         f.store
             .create_from_arrow(name, &schema, vpf::meta::parse_codec(codec)?)?;
         Ok(())
@@ -605,6 +655,7 @@ pub unsafe extern "C" fn vpf_append(
             )));
         }
         let batch = conform(&batches, table.fields())?;
+        f.clear_snapshot_cache();
         f.store.append(&name, &batch, AppendMode::Auto)?;
         out(rows_appended, batch.num_rows() as u64);
         Ok(())
@@ -624,6 +675,7 @@ pub unsafe extern "C" fn vpf_delete_rows(
     guard(|| {
         let f = unsafe { file(f) }?;
         let rows = row_ids(unsafe { slice(rows, n_rows) }?)?;
+        f.clear_snapshot_cache();
         let s = f.store.delete_rows(&f.table()?, base, &rows)?;
         out(rows_deleted, s.rows_deleted as u64);
         Ok(())
@@ -667,6 +719,7 @@ pub unsafe extern "C" fn vpf_update_rows(
             })
             .collect::<Result<Vec<_>>>()?;
         let values = conform(&batches, &fields)?;
+        f.clear_snapshot_cache();
         let s = f.store.update_rows(&name, base, &rows, &values)?;
         out(rows_updated, s.rows_updated as u64);
         Ok(())
@@ -677,19 +730,63 @@ pub unsafe extern "C" fn vpf_update_rows(
 /// `f` must be a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vpf_begin(f: *mut VpfFile) -> c_int {
-    guard(|| unsafe { file(f) }?.store.begin())
+    guard(|| {
+        let f = unsafe { file(f) }?;
+        f.clear_snapshot_cache();
+        f.store.begin()
+    })
 }
 
 /// # Safety
 /// `f` must be a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vpf_commit(f: *mut VpfFile) -> c_int {
-    guard(|| unsafe { file(f) }?.store.commit())
+    guard(|| {
+        let f = unsafe { file(f) }?;
+        f.clear_snapshot_cache();
+        f.store.commit()
+    })
 }
 
 /// # Safety
 /// `f` must be a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vpf_rollback(f: *mut VpfFile) -> c_int {
-    guard(|| unsafe { file(f) }?.store.rollback())
+    guard(|| {
+        let f = unsafe { file(f) }?;
+        f.clear_snapshot_cache();
+        f.store.rollback()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_scans_reuse_resolved_snapshot_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = VpfFile {
+            store: Store::open(dir.path().join("t.vpf")).unwrap(),
+            snapshot_cache: Mutex::new(None),
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        file.store
+            .create_from_arrow("t", &schema, parquet::basic::Compression::SNAPPY)
+            .unwrap();
+        let id = file.store.snapshot_info("t", None).unwrap().snapshot_id;
+        let (_, first, _) = file.snapshot(id).unwrap();
+        let (_, second, _) = file.snapshot(-1).unwrap();
+        assert!(Arc::ptr_eq(first.metadata(), second.metadata()));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        file.store.append("t", &batch, AppendMode::Auto).unwrap();
+        let (_, current, _) = file.snapshot(-1).unwrap();
+        assert!(!Arc::ptr_eq(first.metadata(), current.metadata()));
+        assert_eq!(current.metadata().file_metadata().num_rows(), 1);
+        let (_, old, _) = file.snapshot(id).unwrap();
+        assert_eq!(old.metadata().file_metadata().num_rows(), 0);
+        file.clear_snapshot_cache();
+        assert!(file.snapshot_cache.lock().unwrap().is_none());
+    }
 }

@@ -8,6 +8,7 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -269,6 +270,39 @@ def test_cli_interop(tmp):
     con.close()
     subprocess.run([VPF_BIN, f"{tmp}/cli.vpf", "export", f"{tmp}/out.parquet"], check=True)
     assert rows(connect(), f"SELECT count(*), min(id) FROM '{tmp}/out.parquet'") == [(500, 1)]
+
+def test_metadata_modes(tmp):
+    for mode in ("lazy", "eager"):
+        path = f"{tmp}/{mode}.vpf"
+        con = connect()
+        con.execute(f"ATTACH '{path}' AS db (TYPE vpf, METADATA_MODE '{mode}')")
+        con.execute("""
+            CREATE TABLE db.t AS SELECT i AS id, 'n' || i AS name,
+            [i, NULL] AS items, {'x': i, 's': 'v'} AS details
+            FROM range(140000) r(i)
+        """)
+        assert rows(con, "SELECT COUNT(*), SUM(id) FROM db.t WHERE id BETWEEN 70000 AND 70099") == [(100, 7004950)]
+        assert "VPF Pruning" in str(rows(con, "EXPLAIN SELECT * FROM db.t WHERE id = 70001"))
+        before = rows(con, "SELECT id, name, items, details FROM db.t WHERE id = 70001")
+        con.execute("BEGIN")
+        con.execute("UPDATE db.t SET name = 'changed' WHERE id = 70001")
+        assert rows(con, "SELECT name FROM db.t WHERE id = 70001") == [("changed",)]
+        con.execute("ROLLBACK")
+        assert rows(con, "SELECT id, name, items, details FROM db.t WHERE id = 70001") == before
+        con.execute("DELETE FROM db.t WHERE id >= 139990")
+        assert rows(con, "SELECT COUNT(*) FROM db.t") == [(139990,)]
+        con.close()
+        with sqlite3.connect(path) as metadata:
+            count = metadata.execute("SELECT COUNT(*) FROM snapshot_layouts").fetchone()[0]
+            assert (count > 0) == (mode == "eager")
+        con = connect()
+        con.execute(f"ATTACH '{path}' AS db (TYPE vpf, READ_ONLY, METADATA_MODE 'lazy')")
+        assert rows(con, "SELECT COUNT(*) FROM db.t") == [(139990,)]
+        con.close()
+    expect_error(
+        lambda: connect().execute(f"ATTACH '{tmp}/bad.vpf' (TYPE vpf, METADATA_MODE 'bad')"),
+        "must be",
+    )
 
 
 def main():

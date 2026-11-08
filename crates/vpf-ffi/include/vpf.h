@@ -67,6 +67,8 @@ struct ArrowArrayStream {
 #define VPF_OK 0
 #define VPF_ERROR 1
 #define VPF_CONFLICT 2
+#define VPF_METADATA_LAZY 0
+#define VPF_METADATA_EAGER 1
 
 /* Column index that selects the row id (int64) in vpf_scan. */
 #define VPF_ROWID (-1)
@@ -100,6 +102,11 @@ void vpf_free_string(char *s);
 /* Opens a .vpf file, creating an empty one if it does not exist. */
 int vpf_open(const char *path, vpf_file **out);
 void vpf_close(vpf_file *file);
+
+/* Per-handle write policy (default LAZY). EAGER persists each new snapshot's footer
+ * and offset mapping atomically with its data. Either mode reads existing layouts.
+ * Changing the mode applies to subsequent writes, not existing snapshots. */
+int vpf_set_metadata_mode(vpf_file *file, int mode);
 
 /* The table's name (free with vpf_free_string), or NULL if no table was created yet. */
 int vpf_table_name(vpf_file *file, char **out);

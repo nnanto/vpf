@@ -179,6 +179,41 @@ fn full_workflow() {
 }
 
 #[test]
+fn metadata_mode_is_configurable_and_rejects_unknown_values() {
+    let d = tempfile::tempdir().unwrap();
+    for mode in ["lazy", "eager"] {
+        let path = d.path().join(format!("{mode}.vpf"));
+        ok(
+            &path,
+            &["create", "id:int64:required", "--metadata-mode", mode],
+        );
+        let output = vpf(
+            &path,
+            &["append", "--json", "-", "--metadata-mode", mode],
+            Some("{\"id\": 7}\n"),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(ok(&path, &["cat", "--format", "json"]).contains('7'));
+        let store = vpf::store::Store::open(&path).unwrap();
+        let layouts: i64 = store
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM snapshot_layouts", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(layouts, if mode == "eager" { 2 } else { 0 });
+    }
+    assert!(
+        err(
+            &d.path().join("bad.vpf"),
+            &["create", "id:int64", "--metadata-mode", "bad"]
+        )
+        .contains("invalid value")
+    );
+}
+
+#[test]
 fn create_and_errors() {
     let d = tempfile::tempdir().unwrap();
     let st = &d.path().join("e.vpf");

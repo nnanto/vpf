@@ -1,6 +1,7 @@
 //! Loading a snapshot's metadata and assembling its virtual Parquet file.
 
-use rusqlite::Connection;
+use bytes::Bytes;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::layout::{ByteSource, ChunkLayout, FileProps, PageSrc, RowGroupLayout, VirtualFile};
@@ -49,7 +50,11 @@ impl SegmentData {
     }
 }
 
-pub fn load_view(conn: &Connection, name: &str, snapshot_id: Option<i64>) -> Result<SnapshotView> {
+fn load_header(
+    conn: &Connection,
+    name: &str,
+    snapshot_id: Option<i64>,
+) -> Result<(FileRow, SnapshotInfo)> {
     let file = meta::load_file(conn, name)?;
     let sid = match snapshot_id {
         Some(s) => s,
@@ -58,10 +63,15 @@ pub fn load_view(conn: &Connection, name: &str, snapshot_id: Option<i64>) -> Res
             .ok_or_else(|| Error::NotFound(format!("file '{name}' has no snapshot")))?,
     };
     let snapshot = meta::load_snapshot(conn, file.file_id, sid)?;
+    Ok((file, snapshot))
+}
+
+pub fn load_view(conn: &Connection, name: &str, snapshot_id: Option<i64>) -> Result<SnapshotView> {
+    let (file, snapshot) = load_header(conn, name, snapshot_id)?;
     let schema = meta::load_schema(conn, snapshot.schema_version_id)?;
     let leaves = schema.leaves()?;
     let mut segments = Vec::new();
-    for seg in meta::visible_segments(conn, file.file_id, sid)? {
+    for seg in meta::visible_segments(conn, file.file_id, snapshot.snapshot_id)? {
         segments.push(match seg.kind {
             SegmentKind::RowGroup => {
                 let rg = meta::load_row_group(conn, seg.obj_id)?;
@@ -122,14 +132,65 @@ pub fn chunk_layout(chunk: &ChunkRow) -> Result<ChunkLayout> {
 }
 
 impl Store {
+    /// Snapshot identity and row count, without loading row groups or pages.
+    pub fn snapshot_info(&self, name: &str, snapshot_id: Option<i64>) -> Result<SnapshotInfo> {
+        self.read(|c| Ok(load_header(c, name, snapshot_id)?.1))
+    }
+
+    /// A snapshot's schema, without assembling its virtual file.
+    pub fn snapshot_schema(&self, name: &str, snapshot_id: Option<i64>) -> Result<SchemaVersion> {
+        self.read(|c| {
+            let (_, snapshot) = load_header(c, name, snapshot_id)?;
+            meta::load_schema(c, snapshot.schema_version_id)
+        })
+    }
+
     pub fn view(&self, name: &str, snapshot_id: Option<i64>) -> Result<SnapshotView> {
         self.read(|c| load_view(c, name, snapshot_id))
     }
 
     /// Opens a frozen, consistent virtual Parquet file for a snapshot (default: current).
     pub fn open_snapshot(&self, name: &str, snapshot_id: Option<i64>) -> Result<VirtualFile> {
-        let view = self.view(name, snapshot_id)?;
-        self.build_virtual_file(&view)
+        self.read(|c| {
+            let (_, snapshot) = load_header(c, name, snapshot_id)?;
+            let layout: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT layout FROM snapshot_layouts WHERE snapshot_id = ?1",
+                    [snapshot.snapshot_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(layout) = layout {
+                let vf =
+                    VirtualFile::from_cached_layout(Bytes::from(layout), self.blobs().clone())?;
+                if vf.metadata().file_metadata().num_rows() != snapshot.num_rows {
+                    return Err(Error::Corrupt("cached snapshot row count mismatch".into()));
+                }
+                return Ok(vf);
+            }
+            self.build_virtual_file(&load_view(c, name, Some(snapshot.snapshot_id))?)
+        })
+    }
+
+    pub(crate) fn persist_snapshot_layout(&self, conn: &Connection) -> Result<()> {
+        for name in meta::list_files(conn)? {
+            let file = meta::load_file(conn, &name)?;
+            let Some(sid) = file.current_snapshot_id else {
+                continue;
+            };
+            if conn
+                .prepare_cached("SELECT 1 FROM snapshot_layouts WHERE snapshot_id = ?1")?
+                .exists([sid])?
+            {
+                continue;
+            }
+            let vf = self.build_virtual_file(&load_view(conn, &name, Some(sid))?)?;
+            conn.execute(
+                "INSERT INTO snapshot_layouts (snapshot_id, layout) VALUES (?1, ?2)",
+                rusqlite::params![sid, vf.cached_layout()?],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn build_virtual_file(&self, view: &SnapshotView) -> Result<VirtualFile> {

@@ -220,6 +220,66 @@ fn transactions_and_errors() {
 
 const OPS: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
+#[test]
+fn metadata_modes_keep_cached_scans_fresh_and_existing_streams_pinned() {
+    for mode in [VPF_METADATA_LAZY, VPF_METADATA_EAGER] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.vpf");
+        let f = open(&path);
+        ok(unsafe { vpf_set_metadata_mode(f, mode) });
+        assert_eq!(unsafe { vpf_set_metadata_mode(f, 42) }, VPF_ERROR);
+        create(f, "t");
+        ok(append(f, vec![1], vec![Some("a")]));
+        let base = snapshot(f).0;
+        assert_eq!(rows(f), vec![(0, 1, Some("a".into()))]);
+        let g = open(&path);
+        ok(unsafe { vpf_set_metadata_mode(g, mode) });
+
+        let mut stream = FFI_ArrowArrayStream::empty();
+        ok(unsafe { vpf_scan(f, base, ptr::null(), 0, ptr::null(), 0, 1, &mut stream) });
+        let mut schema = FFI_ArrowSchema::empty();
+        ok(unsafe { vpf_schema(f, base, &mut schema) });
+        let reader = RecordBatchStreamReader::try_new(stream).unwrap();
+        assert_eq!(
+            DataType::try_from(&schema).unwrap(),
+            DataType::Struct(reader.schema().fields().clone())
+        );
+        ok(append(g, vec![2], vec![Some("b")]));
+        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 1);
+        assert_eq!(
+            rows(f).len(),
+            2,
+            "current scans see another handle's commit"
+        );
+
+        ok(unsafe { vpf_begin(f) });
+        ok(append(f, vec![3], vec![Some("rolled-back")]));
+        let uncommitted = snapshot(f).0;
+        assert_eq!(rows(f).last().unwrap().1, 3);
+        assert_eq!(rows(g).len(), 2);
+        ok(unsafe { vpf_rollback(f) });
+        ok(append(f, vec![4], vec![Some("committed")]));
+        assert_eq!(
+            snapshot(f).0,
+            uncommitted,
+            "SQLite reuses rolled-back snapshot ids"
+        );
+        assert_eq!(rows(f).last().unwrap(), &(2, 4, Some("committed".into())));
+        assert_eq!(rows(g), rows(f));
+        assert_eq!(
+            scan(f, base, &[0])
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>(),
+            1
+        );
+        unsafe {
+            vpf_close(g);
+            vpf_close(f);
+        }
+    }
+}
+
 /// Scans `columns` with filters `(column, op, value)`.
 fn scan_filtered(
     f: *mut VpfFile,

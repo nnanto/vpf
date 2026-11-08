@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS snapshots (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_file ON snapshots(file_id, snapshot_id);
+CREATE TABLE IF NOT EXISTS snapshot_layouts (
+    snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(snapshot_id),
+    layout BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pages (
     page_id INTEGER PRIMARY KEY,
     blob_offset INTEGER NOT NULL,

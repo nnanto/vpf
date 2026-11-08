@@ -109,13 +109,15 @@ private:
 //===--------------------------------------------------------------------===//
 class VpfCatalog : public Catalog {
 public:
-	VpfCatalog(AttachedDatabase &db, string path, string codec, bool read_only)
-	    : Catalog(db), path(std::move(path)), codec(std::move(codec)), read_only(read_only) {
+	VpfCatalog(AttachedDatabase &db, string path, string codec, bool read_only, int metadata_mode)
+	    : Catalog(db), path(std::move(path)), codec(std::move(codec)), read_only(read_only),
+	      metadata_mode(metadata_mode) {
 	}
 
 	string path;
 	string codec;
 	bool read_only;
+	int metadata_mode;
 
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override {
@@ -217,6 +219,7 @@ VpfTransaction::~VpfTransaction() {
 vpf_file *VpfTransaction::File() {
 	if (!file) {
 		Check(vpf_open(catalog.path.c_str(), &file), "open");
+		Check(vpf_set_metadata_mode(file, catalog.metadata_mode), "metadata mode");
 	}
 	return file;
 }
@@ -1122,9 +1125,19 @@ private:
 static unique_ptr<Catalog> VpfAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context, AttachedDatabase &db,
                                      const string &name, AttachInfo &info, AttachOptions &options) {
 	string codec;
+	int metadata_mode = VPF_METADATA_LAZY;
 	for (auto &entry : options.options) {
 		if (StringUtil::CIEquals(entry.first, "codec")) {
 			codec = entry.second.ToString();
+		} else if (StringUtil::CIEquals(entry.first, "metadata_mode")) {
+			auto mode = entry.second.ToString();
+			if (StringUtil::CIEquals(mode, "lazy")) {
+				metadata_mode = VPF_METADATA_LAZY;
+			} else if (StringUtil::CIEquals(mode, "eager")) {
+				metadata_mode = VPF_METADATA_EAGER;
+			} else {
+				throw BinderException("VPF METADATA_MODE must be 'lazy' or 'eager'");
+			}
 		} else {
 			throw NotImplementedException("Unsupported option for VPF ATTACH: %s", entry.first);
 		}
@@ -1136,7 +1149,7 @@ static unique_ptr<Catalog> VpfAttach(optional_ptr<StorageExtensionInfo>, ClientC
 		Check(vpf_open(info.path.c_str(), &file), "open");
 		vpf_close(file);
 	}
-	return make_uniq<VpfCatalog>(db, info.path, codec, read_only);
+	return make_uniq<VpfCatalog>(db, info.path, codec, read_only, metadata_mode);
 }
 
 static unique_ptr<TransactionManager> VpfCreateTransactionManager(optional_ptr<StorageExtensionInfo>,

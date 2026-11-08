@@ -110,6 +110,15 @@ pub struct Store {
     conn: Writer,
     blobs: Arc<BlobStore>,
     pub(crate) synth_cache: crate::ops::synth::SynthCache,
+    eager_metadata: AtomicBool,
+}
+
+/// Whether writes prepare persistent snapshot layouts or readers assemble them on demand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SnapshotMetadataMode {
+    #[default]
+    Lazy,
+    Eager,
 }
 
 impl Store {
@@ -157,7 +166,14 @@ impl Store {
             conn,
             blobs,
             synth_cache: Default::default(),
+            eager_metadata: AtomicBool::new(false),
         })
+    }
+
+    /// Configures this handle's writes; existing persisted layouts are usable in either mode.
+    pub fn set_metadata_mode(&self, mode: SnapshotMetadataMode) {
+        self.eager_metadata
+            .store(mode == SnapshotMetadataMode::Eager, Ordering::Release);
     }
 
     pub fn path(&self) -> &Path {
@@ -195,7 +211,12 @@ impl Store {
         } else {
             "BEGIN IMMEDIATE"
         })?;
-        let out = f(&mut Txn { tx: &conn });
+        let out = f(&mut Txn { tx: &conn }).and_then(|value| {
+            if self.eager_metadata.load(Ordering::Acquire) {
+                self.persist_snapshot_layout(&conn)?;
+            }
+            Ok(value)
+        });
         let end = match (&out, nested) {
             (Ok(_), true) => "RELEASE vpf_write",
             (Ok(_), false) => "COMMIT",

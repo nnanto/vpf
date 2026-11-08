@@ -22,7 +22,20 @@ TIMESTAMPTZ, LIST, STRUCT and MAP. Files written by the extension, the `vpf` CLI
 Rust library are interchangeable.
 
 Options: `ATTACH 'f.vpf' (TYPE vpf, READ_ONLY)` and `(TYPE vpf, CODEC 'zstd')` (codec for
-new tables; default snappy).
+new tables; default snappy). `METADATA_MODE 'lazy'` (default) resolves snapshot
+layouts on demand; `METADATA_MODE 'eager'` persists each newly written snapshot's
+footer and offset mapping in the same transaction:
+
+```sql
+ATTACH 'sales.vpf' AS sales (TYPE vpf, METADATA_MODE 'eager');
+```
+
+This is a per-attachment write policy, not a permanent file setting. Existing
+persisted layouts are read in either mode; older uncached snapshots remain readable.
+Eager trades extra write CPU/storage for cheaper read setup and retains each prepared
+snapshot for time travel. Buffered snapshots also persist synthesized Parquet pages.
+Schema/row-count lookups avoid full snapshot assembly in both modes, and each C API
+handle caches one resolved snapshot with invalidation at write/transaction boundaries.
 
 ## How it works
 

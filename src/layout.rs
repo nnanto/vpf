@@ -8,13 +8,15 @@ use bytes::Bytes;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::metadata::{
     ColumnChunkMetaData, ColumnIndexBuilder, FileMetaData, KeyValue, OffsetIndexBuilder,
-    ParquetMetaData, ParquetMetaDataWriter, RowGroupMetaData, page_index::PageIndexBuilder,
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, ParquetMetaDataWriter,
+    RowGroupMetaData, page_index::PageIndexBuilder,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
 use parquet::file::writer::TrackedWrite;
 use parquet::schema::types::SchemaDescPtr;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::stats::{PageStats, StatType, boundary_order};
@@ -22,6 +24,62 @@ use crate::store::{BlobRead, BlobStore};
 use crate::thrift::PageKind;
 
 const MAGIC: &[u8; 4] = b"PAR1";
+const CACHE_MAGIC: &[u8; 8] = b"VPFMETA1";
+
+#[derive(Serialize, Deserialize)]
+enum CachedSource {
+    Blob(u64),
+    Inline(usize),
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedLayout {
+    size: u64,
+    footer_len: u64,
+    extents: Vec<(u64, u64, CachedSource)>,
+}
+
+struct FooterReader {
+    bytes: Bytes,
+    start: u64,
+    size: u64,
+}
+
+impl Length for FooterReader {
+    fn len(&self) -> u64 {
+        self.size
+    }
+}
+
+impl ChunkReader for FooterReader {
+    type T = std::io::Cursor<Bytes>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        let length = self.size.checked_sub(start).ok_or_else(|| {
+            parquet::errors::ParquetError::General("cached footer offset out of bounds".into())
+        })?;
+        let length = usize::try_from(length).map_err(|_| {
+            parquet::errors::ParquetError::General("cached footer length out of bounds".into())
+        })?;
+        Ok(std::io::Cursor::new(self.get_bytes(start, length)?))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        let within = start
+            .checked_sub(self.start)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                parquet::errors::ParquetError::General("read outside cached footer".into())
+            })?;
+        let end = within
+            .checked_add(length)
+            .filter(|&n| n <= self.bytes.len())
+            .ok_or_else(|| {
+                parquet::errors::ParquetError::General("read outside cached footer".into())
+            })?;
+        Ok(self.bytes.slice(within..end))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ByteSource {
@@ -266,6 +324,115 @@ impl VirtualFile {
 
     pub fn size(&self) -> u64 {
         self.inner.size
+    }
+
+    pub(crate) fn cached_layout(&self) -> Result<Vec<u8>> {
+        let mut inline = Vec::new();
+        let extents = self
+            .inner
+            .extents
+            .iter()
+            .map(|e| {
+                let source = match &e.src {
+                    ByteSource::Blob { offset } => CachedSource::Blob(*offset),
+                    ByteSource::Mem(bytes) => {
+                        let start = inline.len();
+                        inline.extend_from_slice(bytes);
+                        CachedSource::Inline(start)
+                    }
+                };
+                (e.voff, e.len, source)
+            })
+            .collect();
+        let header = serde_json::to_vec(&CachedLayout {
+            size: self.inner.size,
+            footer_len: self.inner.footer_len,
+            extents,
+        })?;
+        let mut bytes = Vec::with_capacity(16 + header.len() + inline.len());
+        bytes.extend_from_slice(CACHE_MAGIC);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&inline);
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_cached_layout(bytes: Bytes, blobs: Arc<BlobStore>) -> Result<Self> {
+        let corrupt = || Error::Corrupt("invalid cached snapshot layout".into());
+        if bytes.get(..8) != Some(CACHE_MAGIC.as_slice()) {
+            return Err(corrupt());
+        }
+        let length = u64::from_le_bytes(
+            bytes
+                .get(8..16)
+                .ok_or_else(corrupt)?
+                .try_into()
+                .map_err(|_| corrupt())?,
+        );
+        let end = usize::try_from(length)
+            .ok()
+            .and_then(|n| n.checked_add(16))
+            .filter(|&n| n <= bytes.len())
+            .ok_or_else(corrupt)?;
+        let header: CachedLayout = serde_json::from_slice(&bytes[16..end])
+            .map_err(|e| Error::Corrupt(format!("invalid cached snapshot layout: {e}")))?;
+        let inline = bytes.slice(end..);
+        let mut extents = Vec::with_capacity(header.extents.len());
+        let mut position = 0;
+        for (voff, len, source) in header.extents {
+            if voff != position || len == 0 {
+                return Err(corrupt());
+            }
+            position = position.checked_add(len).ok_or_else(corrupt)?;
+            let src = match source {
+                CachedSource::Blob(offset) => ByteSource::Blob { offset },
+                CachedSource::Inline(start) => {
+                    let end = usize::try_from(len)
+                        .ok()
+                        .and_then(|n| start.checked_add(n))
+                        .filter(|&n| n <= inline.len())
+                        .ok_or_else(corrupt)?;
+                    ByteSource::Mem(inline.slice(start..end))
+                }
+            };
+            extents.push(Extent { voff, len, src });
+        }
+        if position != header.size || header.size < 12 || header.footer_len < 8 {
+            return Err(corrupt());
+        }
+        if !matches!(extents.first(), Some(Extent {
+            voff: 0, len: 4, src: ByteSource::Mem(bytes),
+        }) if bytes.as_ref() == MAGIC)
+        {
+            return Err(corrupt());
+        }
+        let footer_start = header
+            .size
+            .checked_sub(header.footer_len)
+            .ok_or_else(corrupt)?;
+        let footer = extents.last().ok_or_else(corrupt)?;
+        let ByteSource::Mem(footer_bytes) = &footer.src else {
+            return Err(corrupt());
+        };
+        if footer.voff != footer_start || footer.len != header.footer_len {
+            return Err(corrupt());
+        }
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Optional)
+            .parse_and_finish(&FooterReader {
+                bytes: footer_bytes.clone(),
+                start: footer_start,
+                size: header.size,
+            })?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                size: header.size,
+                extents,
+                metadata: Arc::new(metadata),
+                footer_len: header.footer_len,
+                blobs: Some(blobs),
+            }),
+        })
     }
 
     /// Metadata describing this virtual file, including its page index. The page index

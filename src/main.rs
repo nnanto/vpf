@@ -17,7 +17,7 @@ use vpf::ops::append::AppendMode;
 use vpf::ops::snapshot::SegmentData;
 use vpf::predicate::parse_literal;
 use vpf::schema::spec_for_type_name;
-use vpf::store::Store;
+use vpf::store::{SnapshotMetadataMode, Store};
 
 /// Mutable Parquet files with page-level copy-on-write and time travel.
 #[derive(Parser)]
@@ -25,8 +25,17 @@ use vpf::store::Store;
 struct Cli {
     /// The `.vpf` file; it holds exactly one table. `create` and `import` create it.
     file: PathBuf,
+    /// Build snapshot layouts on demand (lazy) or persist them on each write (eager).
+    #[arg(long, value_enum, default_value = "lazy", global = true)]
+    metadata_mode: MetadataModeArg,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MetadataModeArg {
+    Lazy,
+    Eager,
 }
 
 #[derive(Subcommand)]
@@ -221,7 +230,7 @@ fn read_json(store: &Store, name: &str, path: &PathBuf) -> Result<RecordBatch> {
             .with_context(|| format!("line {} is not an object", i + 1))?;
         keys.extend(obj.keys().cloned());
     }
-    let full = arrow_schema(&store.view(name, None)?.schema)?;
+    let full = arrow_schema(&store.snapshot_schema(name, None)?)?;
     if let Some(k) = keys.iter().find(|k| full.field_with_name(k).is_err()) {
         bail!("unknown column '{k}'");
     }
@@ -249,6 +258,10 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
     let store = Store::open(path).with_context(|| format!("opening {}", path.display()))?;
+    store.set_metadata_mode(match cli.metadata_mode {
+        MetadataModeArg::Lazy => SnapshotMetadataMode::Lazy,
+        MetadataModeArg::Eager => SnapshotMetadataMode::Eager,
+    });
     let default_name = || -> Result<String> {
         Ok(path
             .file_stem()
@@ -289,11 +302,11 @@ fn run(cli: Cli) -> Result<()> {
             writeln!(out, "created {name} (snapshot {sid})")?;
         }
         Cmd::Info => {
-            let v = store.view(&name, None)?;
+            let info = store.snapshot_info(&name, None)?;
             writeln!(
                 out,
                 "{name}\t{} rows\tsnapshot {}",
-                v.snapshot.num_rows, v.snapshot.snapshot_id
+                info.num_rows, info.snapshot_id
             )?;
         }
         Cmd::Snapshots => {
@@ -320,10 +333,10 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Schema { at } => {
-            let v = store.view(&name, at)?;
-            let a = arrow_schema(&v.schema)?;
-            writeln!(out, "schema version {}", v.schema.schema_version_id)?;
-            for (c, f) in v.schema.columns.iter().zip(a.fields()) {
+            let schema = store.snapshot_schema(&name, at)?;
+            let a = arrow_schema(&schema)?;
+            writeln!(out, "schema version {}", schema.schema_version_id)?;
+            for (c, f) in schema.columns.iter().zip(a.fields()) {
                 let default = match &c.default_value {
                     Some(d) => format!(" default={:?}", vpf::values::decode_value(d)?),
                     None => String::new(),

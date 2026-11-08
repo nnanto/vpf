@@ -91,7 +91,7 @@ def file_bytes(path):
     )
 
 
-def prepare(directory, rows, extension, vpf_bin, stack):
+def prepare(directory, rows, extension, vpf_bin, metadata_mode, stack):
     parquet = directory / "orders.parquet"
     sqlite = directory / "orders.sqlite"
     vpf = directory / "orders.vpf"
@@ -124,16 +124,22 @@ def prepare(directory, rows, extension, vpf_bin, stack):
             sqlite_con.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
     sqlite_con.close()
 
+    import_start = time.perf_counter_ns()
     subprocess.run(
-        [str(vpf_bin), str(vpf), "import", str(parquet), "--name", "orders"],
+        [str(vpf_bin), str(vpf), "import", str(parquet), "--name", "orders",
+         "--metadata-mode", metadata_mode],
         check=True, stdout=subprocess.DEVNULL,
     )
+    import_ms = (time.perf_counter_ns() - import_start) / 1_000_000
     sqlite_con = sqlite3.connect(sqlite.as_uri() + "?mode=ro", uri=True)
     stack.callback(sqlite_con.close)
     sqlite_con.execute("PRAGMA cache_size = -65536")
     sqlite_con.execute("PRAGMA mmap_size = 0")
     vpf_con = stack.enter_context(connect(extension))
-    vpf_con.execute(f"ATTACH {literal(vpf)} AS data (TYPE vpf, READ_ONLY)")
+    vpf_con.execute(
+        f"ATTACH {literal(vpf)} AS data "
+        f"(TYPE vpf, READ_ONLY, METADATA_MODE {literal(metadata_mode)})"
+    )
     vpf_con.execute("CREATE VIEW orders AS SELECT * FROM data.orders")
 
     # Single-threaded scans retain imported row order; SQLite's rowid is insertion order.
@@ -156,14 +162,15 @@ def prepare(directory, rows, extension, vpf_bin, stack):
         dict(zip(ENGINES, (sqlite_con, parquet_con, vpf_con))),
         {name: file_bytes(path) for name, path in zip(ENGINES, (sqlite, parquet, vpf))},
         verified,
+        import_ms,
     )
 
 
 def benchmark_size(directory, rows, args):
     print(f"Preparing and verifying {rows:,} rows...", flush=True)
     with ExitStack() as stack:
-        connections, sizes, verified = prepare(
-            directory, rows, args.extension, args.vpf_bin, stack,
+        connections, sizes, verified, import_ms = prepare(
+            directory, rows, args.extension, args.vpf_bin, args.metadata_mode, stack,
         )
         workload = queries(rows)
         expected = {}
@@ -207,6 +214,7 @@ def benchmark_size(directory, rows, args):
         return {
             "rows": rows,
             "verified_rows": verified,
+            "vpf_import_ms": import_ms,
             "file_bytes": sizes,
             "sql": workload,
             "results": expected,
@@ -224,6 +232,7 @@ def markdown(report):
         f"`{report['environment']['commit']}`.",
         "",
         "Median warm-cache query latency in milliseconds (lower is better).",
+        f"VPF metadata mode: `{report['environment']['metadata_mode']}`.",
         "",
         "| Rows | Query | SQLite | Parquet / DuckDB | VPF / DuckDB |",
         "|---:|---|---:|---:|---:|",
@@ -263,6 +272,16 @@ def markdown(report):
             f"| {size['rows']:,} | {sizes['sqlite'] / 2**20:.2f} | "
             f"{sizes['parquet'] / 2**20:.2f} | {sizes['vpf'] / 2**20:.2f} |"
         )
+    lines += [
+        "",
+        "VPF fixture import elapsed time includes CLI process startup; one setup "
+        "observation per size, not repeated write measurements.",
+        "",
+        "| Rows | Import (ms) |",
+        "|---:|---:|",
+    ]
+    for size in report["sizes"]:
+        lines.append(f"| {size['rows']:,} | {size['vpf_import_ms']:.3f} |")
     return "\n".join(lines) + "\n"
 
 
@@ -271,6 +290,7 @@ def main():
     parser.add_argument("--sizes", nargs="+", type=positive_int, default=[10000, 100000, 1000000, 10000000])
     parser.add_argument("--repeats", type=positive_int, default=7)
     parser.add_argument("--warmups", type=positive_int, default=2)
+    parser.add_argument("--metadata-mode", choices=("lazy", "eager"), default="lazy")
     parser.add_argument("--extension", type=Path, default=ROOT / "crates/vpf-duckdb/build/vpf.duckdb_extension")
     parser.add_argument("--vpf-bin", type=Path, default=ROOT / "target/release/vpf")
     parser.add_argument("--output", type=Path, required=True, help="JSON samples and adjacent Markdown tables")
@@ -298,6 +318,7 @@ def main():
             "sqlite_indexes": [],
             "parquet_codec": "SNAPPY",
             "parquet_row_group_rows": ROW_GROUP_ROWS,
+            "metadata_mode": args.metadata_mode,
             "extension": str(args.extension),
             "vpf_bin": str(args.vpf_bin),
         },
