@@ -348,4 +348,10 @@ physical path. That path uses direct primitive conversion and shared Arrow
 string/binary buffers, and borrows whole row groups when possible. Both append paths
 retain the existing maximum of 1,048,576 rows per row group.
 
+The separate [`benches/analytical.py`](benches/analytical.py) suite runs identical
+analytical SQL against native SQLite, DuckDB reading Parquet and the DuckDB VPF
+extension at 10K, 100K, 1M and 10M rows. It covers aggregations, filters, grouping,
+top-N and distinct counts, with full-table equality checks before timing. This is
+a single-threaded, warm-cache, unindexed SQLite comparison; it is not ClickBench.
+
 Recorded measurements and reproduction commands are in [BENCHMARKS.md](BENCHMARKS.md).

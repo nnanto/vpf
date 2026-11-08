@@ -92,3 +92,10 @@ Covers CRUD on flat and nested columns, NOT NULL, reopen and read-only attach,
 transactions and isolation between connections, `UPDATE ... FROM`, COPY, CTAS, a type
 round trip against an in-memory DuckDB table, concurrent writers, and files shared with
 the CLI (`VPF_BIN`).
+
+## Analytical benchmark
+
+[`benches/analytical.py`](../../benches/analytical.py) compares this extension with
+DuckDB reading Parquet and native SQLite on identical orders tables at multiple
+sizes. See [`BENCHMARKS.md`](../../BENCHMARKS.md) for results, methodology and
+reproduction commands.

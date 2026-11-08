@@ -1,6 +1,91 @@
-# Parquet I/O benchmark results
+# VPF benchmark results
 
-## Latest: 1 GiB multi-row-group mutations
+## Latest: analytical SQL across SQLite, Parquet and VPF
+
+The analytical suite runs on **`f931b1f` (latest main fetched for this run)**,
+including the DuckDB filter-pushdown implementation. It compares **10,000,
+100,000, 1,000,000 and 10,000,000 identical rows** in an ordinary SQLite table,
+a Snappy Parquet file and a VPF file imported from that same Parquet file.
+
+See [the per-query, size and storage summary](benches/results/analytical.md)
+and [raw samples, exact SQL, results, query plans and environment](benches/results/analytical.json).
+Earlier benchmarks below measure decoding or mutations, not analytical SQL.
+
+Across the seven non-count workloads, VPF's summed median latency is **20.7 ms,
+35.7 ms, 199.8 ms and 1,799.3 ms** at the four sizes. VPF is about **2.1x slower
+than SQLite at 10K rows**, then **2.5x, 5.0x and 7.1x faster** at 100K, 1M and
+10M rows. DuckDB on Parquet is faster than VPF at every size, by **2.2-2.6x** on
+this workload score. At 10M rows, storage is **283.32 MiB for SQLite, 105.37 MiB
+for Parquet and 110.06 MiB for VPF**.
+
+Selective lookup and count remain notable gaps: the 100-row ID range takes
+**95.1 ms on VPF versus 5.5 ms on Parquet** at 10M rows, despite confirmed VPF
+pruning. `COUNT(*)` takes **96.5 ms versus 2.8 ms**. These measurements do not
+establish the cause of that overhead.
+
+### Workload and methodology
+
+The deterministic orders table has seven columns: sorted `id`, interleaved string
+`region` (32 values), `product_id` (4,096 values), integer `day` (365 values),
+`quantity`, `revenue_cents` and nullable `discount_cents`. All numeric values are
+integers, so sums and result comparisons are exact across engines. The generated
+columns are correlated synthetic data, not a production dataset.
+
+Eight SQL workloads cover `COUNT(*)`, multi-column full-scan aggregation, a
+100-row contiguous ID range, interleaved filtered aggregation, regional grouping,
+filtered daily grouping, top-20 products by revenue and `COUNT(DISTINCT product_id)`.
+The identical SQL is executed through **native Python SQLite** and **DuckDB 2.0.0**
+for both `read_parquet` and the VPF storage extension. VPF is scanned directly:
+there is no timed export or materialization into a DuckDB table. This compares
+engine-plus-storage combinations, not storage formats in isolation.
+
+Each query has two warm-ups and seven measured executions. Tables report median
+elapsed milliseconds, including SQL planning, execution and fetching the complete
+result, with persistent connections and warm OS caches. Query/engine order is
+shuffled reproducibly each repetition. Setup, import, attachment, full-table
+verification, query-plan collection and cleanup are excluded. Every row is checked
+for equality across the three fixtures before timing, and every measured result
+is compared with SQLite's result. Raw samples are retained; these are medians,
+not confidence intervals.
+
+DuckDB uses **one thread** and a 512 MiB memory limit because VPF's scan currently
+supports one thread. SQLite has a 64 MiB page-cache budget, mmap disabled, and
+**no indexes, including no primary-key index**; this is an unindexed analytical
+baseline, not an indexed point-lookup comparison. Snappy Parquet row groups target
+65,536 rows, and VPF reuses the imported pages. Interleaved region/day predicates
+cannot prune whole groups; the sorted ID range can. The recorded `EXPLAIN` plans
+show the actual pushed filters. File sizes include any SQLite WAL/SHM sidecars
+present while the read connections are open, but exclude temporary query spill
+files. Each VPF fixture has only its imported snapshot, with no mutation history.
+
+The size summary sums the seven non-`COUNT(*)` query medians with equal weights;
+it is not a single timed transaction or a universal throughput score. `COUNT(*)`
+is shown separately because metadata/rowid fast paths are not full column scans.
+This shared-environment, warm-cache run does not measure cold-I/O, concurrent
+readers, peak memory, joins, indexed SQLite, multithreaded DuckDB or mutations.
+
+### Reproduction
+
+```bash
+# Use an isolated Python environment; the DuckDB version must match the extension.
+python3 -m venv /tmp/vpf-analytics-venv
+/tmp/vpf-analytics-venv/bin/python -m pip install duckdb==2.0.0
+DUCKDB_VERSION=v2.0.0 crates/vpf-duckdb/build.sh
+cargo build --release --bin vpf
+
+/tmp/vpf-analytics-venv/bin/python benches/analytical.py \
+  --output benches/results/analytical.json
+
+# Smaller correctness/reporting smoke run:
+/tmp/vpf-analytics-venv/bin/python benches/analytical.py \
+  --sizes 1000 10000 --repeats 2 --warmups 1 --output /tmp/analytical-smoke.json
+```
+
+`--sizes`, `--repeats`, `--warmups`, `--extension` and `--vpf-bin` allow explicit
+overrides. Fixtures are built and removed one size at a time. Results are saved
+after each completed size, with Markdown tables beside the JSON output.
+
+## Earlier: 1 GiB multi-row-group mutations
 
 Recorded on **2026-11-07**, with the `large_mutations` benchmark added on top of
 `b132172`. The Snappy input is **1,074,285,061 bytes** on disk, with **3,932,160 rows
