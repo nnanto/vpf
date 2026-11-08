@@ -4,6 +4,8 @@ Run: python crates/vpf-duckdb/test/test_duckdb.py [path/to/vpf.duckdb_extension]
 Needs duckdb matching the extension's DuckDB version (see build.sh).
 """
 
+import json
+import math
 import os
 import shutil
 import subprocess
@@ -162,6 +164,96 @@ def test_concurrent_writers(tmp):
         t.join()
     assert not errors, errors[0]
     assert rows(con, "SELECT count(*), count(DISTINCT id) FROM db.t") == [(80, 80)]
+
+
+def scanned_rows(con, tmp, sql, params=None):
+    """Rows the VPF scan produced for `sql` (before DuckDB's filter)."""
+    path = os.path.join(tmp, "profile.json")
+    con.execute(f"SET enable_profiling='json'; SET profiling_output='{path}'")
+    con.execute(sql, params or []).fetchall()
+    con.execute("RESET enable_profiling")
+
+    def find(node):
+        if "Table" in node.get("extra_info", {}):
+            return node["intermediate_rows"]
+        for child in node.get("children", []) + node.get("operator", []):
+            n = find(child)
+            if n is not None:
+                return n
+        return None
+
+    with open(path) as f:
+        return find(json.load(f))
+
+
+def same(a, b):
+    def key(row):
+        return tuple("nan" if isinstance(v, float) and math.isnan(v) else v for v in row)
+
+    return sorted(map(key, a), key=repr) == sorted(map(key, b), key=repr)
+
+
+def test_filter_pushdown(tmp):
+    con = connect()
+    con.execute(f"ATTACH '{tmp}/f.vpf' AS db (TYPE vpf)")
+    con.execute("CREATE SCHEMA mem")
+    data = """SELECT range AS id,
+        CASE WHEN range % 1000 = 7 THEN NULL WHEN range % 1000 = 8 THEN 'nan'::DOUBLE
+             WHEN range % 1000 = 9 THEN -0.0 ELSE (range / 10)::DOUBLE END AS x,
+        CASE WHEN range % 3 = 0 THEN NULL ELSE 'name' || lpad(range::VARCHAR, 7, '0') END AS s,
+        DATE '2020-01-01' + (range // 1000)::INT AS d,
+        (range / 100)::DECIMAL(12, 2) AS m,
+        range % 2 = 0 AS b
+        FROM range(300000)"""
+    con.execute(f"CREATE TABLE db.t AS {data}")
+    con.execute(f"CREATE TABLE mem.t AS {data}")
+    con.execute("INSERT INTO db.t VALUES (-1, 'nan', NULL, NULL, NULL, NULL), (1000000, -0.0, 'zz', DATE '1999-01-01', 0, true)")
+    con.execute("INSERT INTO mem.t VALUES (-1, 'nan', NULL, NULL, NULL, NULL), (1000000, -0.0, 'zz', DATE '1999-01-01', 0, true)")
+
+    def check(where, params=None):
+        sql = f"SELECT * FROM {{}}.t WHERE {where}"
+        got = rows(con, sql.format("db")) if params is None else con.execute(sql.format("db"), params).fetchall()
+        want = rows(con, sql.format("mem")) if params is None else con.execute(sql.format("mem"), params).fetchall()
+        assert same(got, want), f"{where}: {len(got)} rows vs {len(want)}"
+
+    predicates = [
+        "id = 123456", "id <> 5", "id < 10", "id <= 0", "id > 299990", "id >= 1000000", "id = -1",
+        "id BETWEEN 1000 AND 1010", "id IN (5, 250000)", "id = 5 OR id = 250000", "id + 1 = 7",
+        "id % 7 = 3", "id = 400000", "id IS NULL", "id IS NOT NULL",
+        "x = 0", "x = -0.0", "x > 29999", "x >= 'nan'::DOUBLE", "x = 'nan'::DOUBLE", "x < 0", "x <> 0",
+        "x <= -0.0", "x IS NULL", "x IS NOT NULL", "isnan(x)",
+        "s = 'name0123457'", "s > 'name0299990'", "s < 'name0000003'", "s >= 'zz'", "s IS NULL", "s LIKE 'name00001%'",
+        "d = DATE '2020-03-01'", "d < DATE '2000-01-01'", "d > DATE '2020-10-25'", "d IS NULL",
+        "m = 1234.56", "m > 2999.98", "m BETWEEN 1.00 AND 1.02",
+        "b = true AND id < 4", "NOT b AND id > 299996",
+        "id > 100 AND id < 105 AND s IS NOT NULL",
+    ]
+    for p in predicates:
+        check(p)
+    check("id = ?", [77777])
+    check("s = ? AND id > ?", ["name0000005", 1])
+
+    # Point and range lookups read about a page, not the table.
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 123456") <= 25000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id BETWEEN 1000 AND 1010") <= 25000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE s = 'name0123457'") <= 25000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = ?", [42]) <= 25000
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id = 400000") <= 2
+    assert scanned_rows(con, tmp, "SELECT * FROM db.t WHERE id % 7 = 3") == 300002
+    plan = rows(con, "EXPLAIN SELECT * FROM db.t WHERE id = 5")[0][1]
+    assert "VPF Pruning" in plan and "id = 5" in plan, plan
+
+    # Writes through pruned scans touch exactly the matching rows.
+    for sql in [
+        "UPDATE {}.t SET s = 'upd' WHERE id BETWEEN 200000 AND 200004",
+        "DELETE FROM {}.t WHERE id = 150000 OR id = 299999",
+        "DELETE FROM {}.t WHERE x = 'nan'::DOUBLE AND id > 250000",
+        "UPDATE {}.t SET x = 1e9 WHERE s = 'name0000010'",
+    ]:
+        assert rows(con, sql.format("db")) == rows(con, sql.format("mem")), sql
+    for p in predicates + ["s = 'upd'", "x = 1e9"]:
+        check(p)
+    assert same(rows(con, "SELECT * FROM db.t"), rows(con, "SELECT * FROM mem.t"))
 
 
 def test_cli_interop(tmp):

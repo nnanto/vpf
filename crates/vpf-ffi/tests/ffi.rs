@@ -5,10 +5,14 @@ use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
+};
+use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
+use arrow::record_batch::RecordBatchReader;
 use vpf_ffi::*;
 
 fn ok(rc: i32) {
@@ -68,7 +72,18 @@ fn snapshot(f: *mut VpfFile) -> (i64, i64) {
 
 fn scan(f: *mut VpfFile, snapshot: i64, columns: &[i64]) -> Vec<RecordBatch> {
     let mut stream = FFI_ArrowArrayStream::empty();
-    ok(unsafe { vpf_scan(f, snapshot, columns.as_ptr(), columns.len(), 2, &mut stream) });
+    ok(unsafe {
+        vpf_scan(
+            f,
+            snapshot,
+            columns.as_ptr(),
+            columns.len(),
+            ptr::null(),
+            0,
+            2,
+            &mut stream,
+        )
+    });
     RecordBatchStreamReader::try_new(stream)
         .unwrap()
         .map(|b| b.unwrap())
@@ -201,4 +216,325 @@ fn transactions_and_errors() {
         vpf_close(g);
         vpf_close(f);
     }
+}
+
+const OPS: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+/// Scans `columns` with filters `(column, op, value)`.
+fn scan_filtered(
+    f: *mut VpfFile,
+    columns: &[i64],
+    filters: &[(i64, i32, Option<ArrayRef>)],
+) -> RecordBatch {
+    let mut owned: Vec<(FFI_ArrowSchema, FFI_ArrowArray)> = filters
+        .iter()
+        .map(|(_, _, v)| match v {
+            Some(v) => {
+                let field = Field::new("v", v.data_type().clone(), true);
+                arrays(Schema::new(vec![field]), vec![v.clone()])
+            }
+            None => (FFI_ArrowSchema::empty(), FFI_ArrowArray::empty()),
+        })
+        .collect();
+    let c: Vec<VpfFilter> = filters
+        .iter()
+        .zip(owned.iter_mut())
+        .map(|((col, op, v), (s, a))| VpfFilter {
+            column: *col,
+            op: *op,
+            schema: if v.is_some() {
+                s as *const _
+            } else {
+                ptr::null()
+            },
+            value: if v.is_some() {
+                a as *mut _
+            } else {
+                ptr::null_mut()
+            },
+        })
+        .collect();
+    let mut stream = FFI_ArrowArrayStream::empty();
+    ok(unsafe {
+        vpf_scan(
+            f,
+            -1,
+            columns.as_ptr(),
+            columns.len(),
+            c.as_ptr(),
+            c.len(),
+            0,
+            &mut stream,
+        )
+    });
+    assert!(owned.iter().all(|(_, a)| a.is_released()), "values moved");
+    let reader = RecordBatchStreamReader::try_new(stream).unwrap();
+    let schema = reader.schema();
+    let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    concat_batches(&schema, &batches).unwrap()
+}
+
+/// SQL-style comparison (NaN largest and equal to itself, -0 = 0); `None` for NULL.
+fn sql_match<T: PartialOrd>(x: Option<T>, op: i32, v: &T, nan: impl Fn(&T) -> bool) -> bool {
+    use std::cmp::Ordering::*;
+    let Some(x) = x else { return op == 7 };
+    let ord = match (nan(&x), nan(v)) {
+        (true, true) => Equal,
+        (true, false) => Greater,
+        (false, true) => Less,
+        _ => x.partial_cmp(v).unwrap(),
+    };
+    match op {
+        1 => ord == Equal,
+        2 => ord != Equal,
+        3 => ord == Less,
+        4 => ord != Greater,
+        5 => ord == Greater,
+        6 => ord != Less,
+        7 => false,
+        _ => true,
+    }
+}
+
+/// Checks that a filtered scan returns every matching row, with correct row ids and values.
+fn check_superset(
+    f: *mut VpfFile,
+    all: &RecordBatch,
+    filters: &[(i64, i32, Option<ArrayRef>)],
+    matches: impl Fn(usize) -> bool,
+) -> usize {
+    let got = scan_filtered(f, &[VPF_ROWID, 0, 1], filters);
+    let ids = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let returned: Vec<usize> = ids.values().iter().map(|&r| r as usize).collect();
+    assert!(returned.windows(2).all(|w| w[0] < w[1]), "row ids sorted");
+    for (i, &r) in returned.iter().enumerate() {
+        for c in 1..3 {
+            assert_eq!(
+                got.column(c).slice(i, 1).to_data(),
+                all.column(c - 1).slice(r, 1).to_data(),
+                "value of row {r}"
+            );
+        }
+    }
+    for r in 0..all.num_rows() {
+        if matches(r) {
+            assert!(
+                returned.binary_search(&r).is_ok(),
+                "row {r} missing for {filters:?}"
+            );
+        }
+    }
+    returned.len()
+}
+
+#[test]
+fn filtered_scans_prune_and_keep_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = open(&dir.path().join("t.vpf"));
+    create(f, "t");
+    // Three large sorted row groups, then small buffered appends.
+    for g in 0..3 {
+        let ids: Vec<i64> = (g * 70_000..(g + 1) * 70_000).collect();
+        let names = ids
+            .iter()
+            .map(|i| (i % 7 != 0).then(|| format!("n{i:07}")))
+            .collect::<Vec<_>>();
+        ok(append(f, ids, names.iter().map(|n| n.as_deref()).collect()));
+    }
+    ok(append(
+        f,
+        vec![5, 300_000, -1],
+        vec![None, Some("zz"), Some("a")],
+    ));
+    // Mutations keep statistics exact.
+    let (snap, _) = snapshot(f);
+    ok(unsafe { vpf_delete_rows(f, snap, [10i64, 150_000].as_ptr(), 2, ptr::null_mut()) });
+
+    let all = {
+        let b = scan(f, -1, &[0, 1]);
+        concat_batches(&b[0].schema(), &b).unwrap()
+    };
+    let id = all
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .clone();
+    let name = all
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    let total = all.num_rows();
+
+    // Point lookups read about one page.
+    let n = check_superset(
+        f,
+        &all,
+        &[(0, 1, Some(Arc::new(Int64Array::from(vec![100_005]))))],
+        |r| id.value(r) == 100_005,
+    );
+    assert!(n <= 25_000, "point lookup scanned {n} rows");
+    let n = check_superset(
+        f,
+        &all,
+        &[(1, 1, Some(Arc::new(StringArray::from(vec!["n0200001"]))))],
+        |r| name.is_valid(r) && name.value(r) == "n0200001",
+    );
+    assert!(n <= 25_000, "string lookup scanned {n} rows");
+    // No match anywhere.
+    assert_eq!(
+        check_superset(
+            f,
+            &all,
+            &[(0, 5, Some(Arc::new(Int64Array::from(vec![1_000_000]))))],
+            |_| false
+        ),
+        0
+    );
+    // Projections without data columns still produce the right row ids.
+    let filter = [(
+        0,
+        6,
+        Some(Arc::new(Int64Array::from(vec![209_990])) as ArrayRef),
+    )];
+    let got = scan_filtered(f, &[VPF_ROWID], &filter);
+    let with_data = scan_filtered(f, &[VPF_ROWID, 0], &filter);
+    assert_eq!(got.column(0), with_data.column(0));
+    assert!(got.num_rows() < 25_000, "scanned {}", got.num_rows());
+    let r = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    for row in 0..total {
+        if id.value(row) >= 209_990 {
+            assert!(r.values().contains(&(row as i64)));
+        }
+    }
+
+    for op in OPS {
+        for v in [
+            -5i64, 0, 5, 69_999, 70_000, 139_999, 150_000, 209_999, 300_000, 400_000,
+        ] {
+            let value = (op < 7).then(|| Arc::new(Int64Array::from(vec![v])) as ArrayRef);
+            check_superset(f, &all, &[(0, op, value)], |r| {
+                sql_match(id.is_valid(r).then(|| id.value(r)), op, &v, |_| false)
+            });
+        }
+        for v in ["", "a", "n0000000", "n0100000", "n0209999", "zz", "zzz"] {
+            let value = (op < 7).then(|| Arc::new(StringArray::from(vec![v])) as ArrayRef);
+            check_superset(f, &all, &[(1, op, value)], |r| {
+                sql_match(name.is_valid(r).then(|| name.value(r)), op, &v, |_| false)
+            });
+        }
+    }
+    // ANDed filters intersect.
+    let lo: ArrayRef = Arc::new(Int64Array::from(vec![60_000]));
+    let hi: ArrayRef = Arc::new(Int64Array::from(vec![80_000]));
+    let n = check_superset(f, &all, &[(0, 6, Some(lo)), (0, 3, Some(hi))], |r| {
+        (60_000..80_000).contains(&id.value(r))
+    });
+    assert!(n < 70_000, "range scanned {n} rows");
+    // Values of another type are cast to the column type.
+    let v: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![5]));
+    check_superset(f, &all, &[(0, 1, Some(v))], |r| id.value(r) == 5);
+
+    // Bad filters are errors (and values are still released).
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let bad = [VpfFilter {
+        column: 9,
+        op: 7,
+        schema: ptr::null(),
+        value: ptr::null_mut(),
+    }];
+    let cols = [0i64];
+    assert_eq!(
+        unsafe { vpf_scan(f, -1, cols.as_ptr(), 1, bad.as_ptr(), 1, 0, &mut stream) },
+        VPF_ERROR
+    );
+    let (s, mut a) = arrays(
+        Schema::new(vec![Field::new("v", DataType::Int64, true)]),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    );
+    let bad = [VpfFilter {
+        column: 0,
+        op: 42,
+        schema: &s,
+        value: &mut a,
+    }];
+    assert_eq!(
+        unsafe { vpf_scan(f, -1, cols.as_ptr(), 1, bad.as_ptr(), 1, 0, &mut stream) },
+        VPF_ERROR
+    );
+    assert!(a.is_released());
+    unsafe { vpf_close(f) };
+}
+
+#[test]
+fn float_filters_follow_sql_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = open(&dir.path().join("f.vpf"));
+    let schema = Schema::new(vec![
+        Field::new("x", DataType::Float64, true),
+        Field::new("tag", DataType::Utf8, true),
+    ]);
+    let name = CString::new("f").unwrap();
+    ok(unsafe { vpf_create(f, name.as_ptr(), &struct_schema(&schema), ptr::null()) });
+    let groups: Vec<Vec<Option<f64>>> = vec![
+        (0..70_000).map(|i| Some(i as f64 - 100.0)).collect(),
+        (0..70_000)
+            .map(|i| Some(if i == 5 { f64::NAN } else { 1e6 + i as f64 }))
+            .collect(),
+        (0..70_000)
+            .map(|i| Some(if i % 2 == 0 { -0.0 } else { 0.0 }))
+            .collect(),
+        vec![None, Some(f64::NAN), Some(-1.0)],
+    ];
+    for g in groups {
+        let tags: Vec<Option<String>> = g.iter().map(|x| x.map(|x| format!("{x}"))).collect();
+        let (s, mut a) = arrays(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(g)),
+                Arc::new(StringArray::from(tags)),
+            ],
+        );
+        let mut n = 0;
+        ok(unsafe { vpf_append(f, &s, &mut a, 1, &mut n) });
+    }
+    let all = {
+        let b = scan(f, -1, &[0, 1]);
+        concat_batches(&b[0].schema(), &b).unwrap()
+    };
+    let x = all
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .clone();
+    for op in OPS {
+        for v in [
+            -0.0,
+            0.0,
+            -100.0,
+            -101.0,
+            1e6,
+            2e6,
+            69_899.0,
+            f64::NAN,
+            f64::INFINITY,
+        ] {
+            let value = (op < 7).then(|| Arc::new(Float64Array::from(vec![v])) as ArrayRef);
+            check_superset(f, &all, &[(0, op, value)], |r| {
+                sql_match(x.is_valid(r).then(|| x.value(r)), op, &v, |x| x.is_nan())
+            });
+        }
+    }
+    // Zeros of either sign match each other; only the zero group is read.
+    let n = check_superset(
+        f,
+        &all,
+        &[(0, 1, Some(Arc::new(Float64Array::from(vec![-0.0]))))],
+        |r| x.is_valid(r) && x.value(r) == 0.0,
+    );
+    assert!(n <= 70_000 + 25_000, "zero lookup scanned {n} rows");
+    unsafe { vpf_close(f) };
 }

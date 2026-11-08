@@ -2,7 +2,9 @@
 //! data and stream interfaces, so any Arrow-speaking engine can read and write VPF files.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int};
+use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -16,7 +18,7 @@ use arrow::record_batch::RecordBatchReader;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-    ParquetRecordBatchReaderBuilder,
+    ParquetRecordBatchReaderBuilder, RowSelection,
 };
 use vpf::layout::VirtualFile;
 use vpf::ops::append::AppendMode;
@@ -27,6 +29,17 @@ pub const VPF_OK: c_int = 0;
 pub const VPF_ERROR: c_int = 1;
 pub const VPF_CONFLICT: c_int = 2;
 pub const VPF_ROWID: i64 = -1;
+
+mod prune;
+
+/// A pushed-down filter (`vpf_filter` in `vpf.h`).
+#[repr(C)]
+pub struct VpfFilter {
+    pub column: i64,
+    pub op: i32,
+    pub schema: *const FFI_ArrowSchema,
+    pub value: *mut FFI_ArrowArray,
+}
 
 /// An open `.vpf` file.
 pub struct VpfFile {
@@ -199,8 +212,8 @@ struct Scan {
     inner: Option<ParquetRecordBatchReader>,
     /// Output column -> column of `inner`'s batches (`None` = row id).
     map: Vec<Option<usize>>,
-    next_row: i64,
-    total: i64,
+    /// Snapshot rows still to produce, in order.
+    ranges: VecDeque<Range<u64>>,
     batch_rows: usize,
     _file: VirtualFile,
 }
@@ -215,17 +228,15 @@ impl Iterator for Scan {
                 Err(e) => return Some(Err(e)),
             },
             None => {
-                if self.next_row >= self.total {
+                let left: u64 = self.ranges.iter().map(|r| r.end - r.start).sum();
+                if left == 0 {
                     return None;
                 }
-                (
-                    (self.total - self.next_row).min(self.batch_rows as i64) as usize,
-                    None,
-                )
+                (left.min(self.batch_rows as u64) as usize, None)
             }
         };
-        let start = self.next_row;
-        self.next_row += n as i64;
+        let want = self.map.iter().any(Option::is_none);
+        let ids = self.take_ids(n, want);
         let mut rowid: Option<ArrayRef> = None;
         let columns = self
             .map
@@ -233,9 +244,7 @@ impl Iterator for Scan {
             .map(|m| match m {
                 Some(i) => batch.as_ref().unwrap().column(*i).clone(),
                 None => rowid
-                    .get_or_insert_with(|| {
-                        Arc::new(Int64Array::from_iter_values(start..start + n as i64))
-                    })
+                    .get_or_insert_with(|| Arc::new(Int64Array::from(ids.clone())))
                     .clone(),
             })
             .collect();
@@ -244,6 +253,28 @@ impl Iterator for Scan {
             columns,
             &RecordBatchOptions::new().with_row_count(Some(n)),
         ))
+    }
+}
+
+impl Scan {
+    /// Advances past the next `n` scanned rows, returning their row ids if `want`.
+    fn take_ids(&mut self, mut n: usize, want: bool) -> Vec<i64> {
+        let mut ids = Vec::with_capacity(if want { n } else { 0 });
+        while n > 0 {
+            let Some(r) = self.ranges.front_mut() else {
+                break;
+            };
+            let k = ((r.end - r.start) as usize).min(n);
+            if want {
+                ids.extend(r.start as i64..(r.start + k as u64) as i64);
+            }
+            r.start += k as u64;
+            n -= k;
+            if r.start == r.end {
+                self.ranges.pop_front();
+            }
+        }
+        ids
     }
 }
 
@@ -368,7 +399,8 @@ pub unsafe extern "C" fn vpf_create(
 }
 
 /// # Safety
-/// `f` must be a valid handle, `columns` hold `n_columns` entries (or be null), and
+/// `f` must be a valid handle, `columns` hold `n_columns` entries (or be null), `filters`
+/// hold `n_filters` valid filters (or be null; their values move to this function), and
 /// `out_stream` point to writable memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vpf_scan(
@@ -376,9 +408,28 @@ pub unsafe extern "C" fn vpf_scan(
     snapshot_id: i64,
     columns: *const i64,
     n_columns: usize,
+    filters: *const VpfFilter,
+    n_filters: usize,
     batch_rows: usize,
     out_stream: *mut FFI_ArrowArrayStream,
 ) -> c_int {
+    // Take the filter values first so they are released on every path.
+    let raw: Vec<(i64, i32, *const FFI_ArrowSchema, FFI_ArrowArray)> = if filters.is_null() {
+        Vec::new()
+    } else {
+        (0..n_filters)
+            .map(|i| unsafe {
+                let p = filters.add(i);
+                let value = (*p).value;
+                let owned = if value.is_null() {
+                    FFI_ArrowArray::empty()
+                } else {
+                    std::ptr::replace(value, FFI_ArrowArray::empty())
+                };
+                ((*p).column, (*p).op, (*p).schema, owned)
+            })
+            .collect()
+    };
     guard(|| {
         let f = unsafe { file(f) }?;
         if out_stream.is_null() {
@@ -419,12 +470,25 @@ pub unsafe extern "C" fn vpf_scan(
             .map(|&c| (c != VPF_ROWID).then(|| wanted.binary_search(&(c as usize)).unwrap()))
             .collect();
         let batch_rows = if batch_rows == 0 { 2048 } else { batch_rows };
-        let total = vf.metadata().file_metadata().num_rows();
+        let filters = raw
+            .into_iter()
+            .map(|(c, op, schema, value)| unsafe { filter(&table, c, op, schema, value) })
+            .collect::<Result<Vec<_>>>()?;
+        let total = vf.metadata().file_metadata().num_rows() as u64;
+        let ranges = if filters.is_empty() {
+            vec![0..total]
+        } else {
+            prune::ranges(vf.metadata(), &table, &filters)
+        };
         let inner = if wanted.is_empty() {
             None
         } else {
-            let b = ParquetRecordBatchReaderBuilder::new_with_metadata(vf.clone(), md);
+            let mut b = ParquetRecordBatchReaderBuilder::new_with_metadata(vf.clone(), md);
             let mask = ProjectionMask::roots(b.parquet_schema(), wanted.iter().copied());
+            if !filters.is_empty() {
+                let (groups, selection) = select(vf.metadata(), &ranges);
+                b = b.with_row_groups(groups).with_row_selection(selection);
+            }
             Some(
                 b.with_projection(mask)
                     .with_batch_size(batch_rows)
@@ -435,14 +499,79 @@ pub unsafe extern "C" fn vpf_scan(
             schema: Arc::new(Schema::new(fields)),
             inner,
             map,
-            next_row: 0,
-            total,
+            ranges: ranges.into_iter().filter(|r| !r.is_empty()).collect(),
             batch_rows,
             _file: vf,
         };
         out(out_stream, FFI_ArrowArrayStream::new(Box::new(scan)));
         Ok(())
     })
+}
+
+/// Imports a C filter; `value` must have been taken from a `vpf_filter`.
+unsafe fn filter(
+    table: &Schema,
+    column: i64,
+    op: i32,
+    schema: *const FFI_ArrowSchema,
+    value: FFI_ArrowArray,
+) -> Result<prune::Filter> {
+    let column = usize::try_from(column)
+        .ok()
+        .filter(|&c| c < table.fields().len())
+        .ok_or_else(|| invalid(&format!("filter column {column} out of range")))?;
+    let op = match op {
+        1 => prune::Op::Eq,
+        2 => prune::Op::Ne,
+        3 => prune::Op::Lt,
+        4 => prune::Op::Le,
+        5 => prune::Op::Gt,
+        6 => prune::Op::Ge,
+        7 => prune::Op::IsNull,
+        8 => prune::Op::IsNotNull,
+        _ => return Err(invalid(&format!("unknown filter op {op}"))),
+    };
+    let value = if matches!(op, prune::Op::IsNull | prune::Op::IsNotNull) {
+        None
+    } else {
+        if value.is_released() {
+            return Err(invalid("comparison filter without a value"));
+        }
+        let batch = unsafe { import(schema, vec![value]) }?.remove(0);
+        if batch.num_columns() != 1 || batch.num_rows() != 1 {
+            return Err(invalid("a filter value must be one row with one column"));
+        }
+        Some(batch.column(0).clone())
+    };
+    Ok(prune::Filter { column, op, value })
+}
+
+/// Row groups intersecting `ranges` and the row selection within them.
+fn select(
+    md: &parquet::file::metadata::ParquetMetaData,
+    ranges: &[Range<u64>],
+) -> (Vec<usize>, RowSelection) {
+    let (mut groups, mut local, mut start, mut base) = (Vec::new(), Vec::new(), 0u64, 0u64);
+    let mut i = 0;
+    for (g, rg) in md.row_groups().iter().enumerate() {
+        let end = start + rg.num_rows() as u64;
+        let first = local.len();
+        while i < ranges.len() && ranges[i].start < end {
+            let (s, e) = (ranges[i].start.max(start), ranges[i].end.min(end));
+            local.push((s - start + base) as usize..(e - start + base) as usize);
+            if ranges[i].end > end {
+                break;
+            }
+            i += 1;
+        }
+        if local.len() > first {
+            groups.push(g);
+            base += end - start;
+        }
+        start = end;
+    }
+    let selection = RowSelection::from_consecutive_ranges(local.into_iter(), base as usize);
+    (groups, selection)
 }
 
 /// # Safety

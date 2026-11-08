@@ -199,11 +199,12 @@ store.commit()?;                             // or rollback(); others see nothin
 ## DuckDB, C API and other engines
 
 * [`vpf-ffi`](crates/vpf-ffi/include/vpf.h) is a small C API over the Arrow C data and
-  stream interfaces: open, create, scan (with row ids), append, update/delete by row id,
-  and transactions. Any engine or language with Arrow support can bind to it.
+  stream interfaces: open, create, scan (with row ids and statistics-based filter
+  pruning), append, update/delete by row id, and transactions. Any engine or language
+  with Arrow support can bind to it.
 * [`vpf-duckdb`](crates/vpf-duckdb/README.md) is a DuckDB storage extension built on it:
   `ATTACH 't.vpf' (TYPE vpf)`, then plain SQL `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
-  `CREATE TABLE [AS]` and transactions.
+  `CREATE TABLE [AS]` and transactions. Simple `WHERE` filters skip row groups and pages.
 
 ## HTTP and FUSE adapters
 

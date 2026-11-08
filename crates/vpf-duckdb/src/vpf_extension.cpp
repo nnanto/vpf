@@ -23,7 +23,15 @@
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -295,6 +303,14 @@ optional_ptr<VpfTableEntry> VpfTransaction::GetTable() {
 //===--------------------------------------------------------------------===//
 // Scan
 //===--------------------------------------------------------------------===//
+//! `column <op> value`, used by VPF to skip row groups and pages (see vpf_scan).
+struct VpfFilter {
+	idx_t column;
+	int32_t op;
+	Value value;
+	string name;
+};
+
 struct VpfScanData : public TableFunctionData {
 	VpfScanData(TableCatalogEntry &table, shared_ptr<ArrowTableSchema> arrow_table)
 	    : table(table), catalog(table.ParentCatalog()), arrow_table(std::move(arrow_table)) {
@@ -302,6 +318,7 @@ struct VpfScanData : public TableFunctionData {
 	TableCatalogEntry &table;
 	Catalog &catalog;
 	shared_ptr<ArrowTableSchema> arrow_table;
+	vector<VpfFilter> filters;
 };
 
 struct VpfScanGlobal : public GlobalTableFunctionState {
@@ -316,6 +333,169 @@ static bool IsTableColumn(const VpfScanData &data, column_t id) {
 	return !IsVirtualColumn(id) && id < data.arrow_table->GetTypes().size();
 }
 
+// Filter pushdown: VPF prunes with Parquet statistics, DuckDB still applies every filter.
+static int32_t VpfOp(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:
+		return VPF_EQ;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return VPF_NE;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return VPF_LT;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return VPF_LE;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return VPF_GT;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return VPF_GE;
+	case ExpressionType::OPERATOR_IS_NULL:
+		return VPF_IS_NULL;
+	case ExpressionType::OPERATOR_IS_NOT_NULL:
+		return VPF_IS_NOT_NULL;
+	default:
+		return 0;
+	}
+}
+
+static const char *VpfOpName(int32_t op) {
+	static const char *names[] = {"", "=", "<>", "<", "<=", ">", ">=", "IS NULL", "IS NOT NULL"};
+	return op >= 1 && op <= 8 ? names[op] : "?";
+}
+
+//! Types whose DuckDB ordering matches Parquet statistics ordering.
+static bool Prunable(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::BLOB:
+		return true;
+	default:
+		return false;
+	}
+}
+
+//! The table column `expr` reads in `get`, if it is a plain prunable column reference.
+static optional_idx FilterColumn(const LogicalGet &get, const VpfScanData &data, const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return optional_idx();
+	}
+	auto &ref = expr.Cast<BoundColumnRefExpression>();
+	if (ref.Depth() != 0 || ref.Binding().table_index != get.table_index || !Prunable(expr.GetReturnType())) {
+		return optional_idx();
+	}
+	auto &index = get.GetColumnIndex(ref.Binding());
+	if (index.IsVirtualColumn() || !IsTableColumn(data, index.GetPrimaryIndex())) {
+		return optional_idx();
+	}
+	return index.GetPrimaryIndex();
+}
+
+static void AddComparison(const LogicalGet &get, VpfScanData &data, const Expression &column, ExpressionType type,
+                          const Expression &constant) {
+	auto col = FilterColumn(get, data, column);
+	auto op = VpfOp(type);
+	if (!col.IsValid() || op == 0 || constant.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
+	    constant.GetReturnType() != column.GetReturnType()) {
+		return;
+	}
+	auto &value = constant.Cast<BoundConstantExpression>().GetValue();
+	if (value.IsNull()) {
+		return;
+	}
+	data.filters.push_back({col.GetIndex(), op, value, get.names[col.GetIndex()].GetIdentifierName()});
+}
+
+static void CollectFilter(const LogicalGet &get, VpfScanData &data, const Expression &expr) {
+	auto type = expr.GetExpressionType();
+	if (type == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			CollectFilter(get, data, *child);
+		}
+		return;
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION &&
+	    expr.GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
+		return;
+	}
+	if (type == ExpressionType::OPERATOR_IS_NULL || type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		auto &children = expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION
+		                     ? expr.Cast<BoundFunctionExpression>().GetChildren()
+		                     : expr.Cast<BoundOperatorExpression>().GetChildren();
+		if (children.size() != 1) {
+			return;
+		}
+		auto col = FilterColumn(get, data, *children[0]);
+		if (col.IsValid()) {
+			data.filters.push_back({col.GetIndex(), VpfOp(type), Value(), get.names[col.GetIndex()].GetIdentifierName()});
+		}
+		return;
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return;
+	}
+	auto &func = expr.Cast<BoundFunctionExpression>();
+	if (type == ExpressionType::COMPARE_BETWEEN) {
+		auto &input = BoundBetweenExpression::Input(func);
+		AddComparison(get, data, input, BoundBetweenExpression::LowerComparisonType(func),
+		              BoundBetweenExpression::LowerBound(func));
+		AddComparison(get, data, input, BoundBetweenExpression::UpperComparisonType(func),
+		              BoundBetweenExpression::UpperBound(func));
+		return;
+	}
+	if (VpfOp(type) == 0 || func.GetChildren().size() != 2) {
+		return;
+	}
+	ExpressionType comparison;
+	auto constant = ExpressionFilter::TryGetColumnConstantComparison(func, comparison);
+	if (!constant) {
+		return;
+	}
+	auto &children = func.GetChildren();
+	auto &column = children[0].get() == static_cast<const Expression *>(constant.get()) ? *children[1] : *children[0];
+	AddComparison(get, data, column, comparison, *constant);
+}
+
+static void VpfPushdownFilters(ClientContext &, LogicalGet &get, FunctionData *bind_data,
+                               vector<unique_ptr<Expression>> &filters) {
+	// Filters stay in `filters`, so DuckDB keeps evaluating them on the pruned rows.
+	auto &data = bind_data->Cast<VpfScanData>();
+	for (auto &filter : filters) {
+		CollectFilter(get, data, *filter);
+	}
+}
+
+static InsertionOrderPreservingMap<string> VpfScanToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &data = input.bind_data->Cast<VpfScanData>();
+	result["Table"] = data.table.name.GetIdentifierName();
+	if (!data.filters.empty()) {
+		string text;
+		for (auto &f : data.filters) {
+			text += (text.empty() ? "" : "\n") + f.name + " " + VpfOpName(f.op) +
+			        (f.value.IsNull() ? "" : " " + f.value.ToSQLString());
+		}
+		result["VPF Pruning"] = text;
+	}
+	return result;
+}
+
 static unique_ptr<GlobalTableFunctionState> VpfScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &data = input.bind_data->Cast<VpfScanData>();
 	auto &transaction = VpfTransaction::Get(context, data.catalog);
@@ -323,10 +503,32 @@ static unique_ptr<GlobalTableFunctionState> VpfScanInitGlobal(ClientContext &con
 	for (auto id : input.column_ids) {
 		columns.push_back(IsTableColumn(data, id) ? int64_t(id) : VPF_ROWID);
 	}
+	// Each comparison value is exported as a one-row, one-column struct array.
+	auto props = context.GetClientProperties();
+	vector<ArrowSchemaWrapper> schemas(data.filters.size());
+	vector<ArrowArrayWrapper> values(data.filters.size());
+	vector<vpf_filter> filters;
+	for (idx_t i = 0; i < data.filters.size(); i++) {
+		auto &f = data.filters[i];
+		vpf_filter filter {int64_t(f.column), f.op, nullptr, nullptr};
+		if (!f.value.IsNull()) {
+			vector<LogicalType> types {f.value.type()};
+			vector<string> names {"v"};
+			DataChunk chunk;
+			chunk.Initialize(Allocator::DefaultAllocator(), types, 1);
+			chunk.SetValue(0, 0, f.value);
+			chunk.SetCardinality(1);
+			ArrowConverter::ToArrowSchema(&schemas[i].arrow_schema, types, names, props);
+			ArrowConverter::ToArrowArray(chunk, &values[i].arrow_array, props, {});
+			filter.schema = &schemas[i].arrow_schema;
+			filter.value = &values[i].arrow_array;
+		}
+		filters.push_back(filter);
+	}
 	auto result = make_uniq<VpfScanGlobal>();
 	auto snapshot = transaction.Snapshot();
-	Check(vpf_scan(transaction.File(), snapshot, columns.data(), columns.size(), STANDARD_VECTOR_SIZE,
-	               &result->stream.arrow_array_stream),
+	Check(vpf_scan(transaction.File(), snapshot, columns.data(), columns.size(), filters.data(), filters.size(),
+	               STANDARD_VECTOR_SIZE, &result->stream.arrow_array_stream),
 	      "scan");
 	return std::move(result);
 }
@@ -370,10 +572,11 @@ static void VpfScan(ClientContext &context, TableFunctionInput &input, DataChunk
 			continue;
 		}
 		if (output.data[i].GetType().id() == LogicalTypeId::BIGINT) {
-			// Row ids are consecutive within a batch.
+			// Pruned scans skip rows, so row ids are copied rather than assumed consecutive.
 			auto &child = *array.children[i];
 			auto ids = static_cast<const int64_t *>(child.buffers[1]) + child.offset + array.offset;
-			output.data[i].Sequence(ids[local.chunk_offset], 1, count);
+			output.data[i].SetVectorType(VectorType::FLAT_VECTOR);
+			memcpy(FlatVector::GetDataMutable<int64_t>(output.data[i]), ids + local.chunk_offset, count * sizeof(int64_t));
 		} else {
 			output.data[i].SetVectorType(VectorType::CONSTANT_VECTOR);
 			ConstantVector::SetNull(output.data[i], true);
@@ -386,6 +589,8 @@ TableFunction VpfTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	bind_data = make_uniq<VpfScanData>(*this, arrow_table);
 	TableFunction function("vpf_scan", {}, VpfScan, nullptr, VpfScanInitGlobal, VpfScanInitLocal);
 	function.projection_pushdown = true;
+	function.pushdown_complex_filter = VpfPushdownFilters;
+	function.to_string = VpfScanToString;
 	function.get_table_entry = [](optional_ptr<const FunctionData> bind_data) -> optional_ptr<TableCatalogEntry> {
 		return &bind_data->Cast<VpfScanData>().table;
 	};

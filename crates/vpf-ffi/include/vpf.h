@@ -71,6 +71,26 @@ struct ArrowArrayStream {
 /* Column index that selects the row id (int64) in vpf_scan. */
 #define VPF_ROWID (-1)
 
+/* Filter operators (vpf_filter.op). Comparisons follow SQL: NULLs never match. */
+#define VPF_EQ 1
+#define VPF_NE 2
+#define VPF_LT 3
+#define VPF_LE 4
+#define VPF_GT 5
+#define VPF_GE 6
+#define VPF_IS_NULL 7
+#define VPF_IS_NOT_NULL 8
+
+/* `column <op> value` on a table column. For comparisons, `value` is a one-row struct
+ * array with one field (e.g. an exported one-column batch) described by `schema`; both
+ * are NULL for VPF_IS_NULL / VPF_IS_NOT_NULL. vpf_scan takes ownership of `value`. */
+typedef struct vpf_filter {
+	int64_t column;
+	int32_t op;
+	const struct ArrowSchema *schema;
+	struct ArrowArray *value;
+} vpf_filter;
+
 typedef struct vpf_file vpf_file;
 
 /* Last error message of this thread (never NULL). */
@@ -98,9 +118,13 @@ int vpf_create(vpf_file *file, const char *name, const struct ArrowSchema *schem
 
 /* Streams a snapshot (-1 = current). `columns` lists table column indexes in output
  * order (VPF_ROWID for the row id); NULL selects all columns. Batches have at most
- * `batch_rows` rows (0 = 2048). The caller releases `out`. */
-int vpf_scan(vpf_file *file, int64_t snapshot_id, const int64_t *columns, size_t n_columns, size_t batch_rows,
-             struct ArrowArrayStream *out);
+ * `batch_rows` rows (0 = 2048). The caller releases `out`.
+ *
+ * `filters` (ANDed, may be NULL) let the scan skip row groups and pages whose statistics
+ * show that no row can match. This is pruning, not filtering: returned rows may still
+ * fail the filters, so apply them to the result. Row ids remain snapshot positions. */
+int vpf_scan(vpf_file *file, int64_t snapshot_id, const int64_t *columns, size_t n_columns,
+             const vpf_filter *filters, size_t n_filters, size_t batch_rows, struct ArrowArrayStream *out);
 
 /* Appends rows. `arrays` are struct arrays (one per batch) matching `schema`, whose
  * columns map to the table's columns by position and are cast to the table's types.

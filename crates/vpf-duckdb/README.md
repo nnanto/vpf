@@ -33,6 +33,12 @@ DuckDB plans and executes the query; VPF stores the rows.
 
 * **Scans** stream the snapshot with projection pushdown. DuckDB's `rowid` is the row's
   position in the snapshot.
+* **Filter pushdown**: `col = | <> | < | <= | > | >= constant` (also prepared parameters,
+  `BETWEEN`, `AND` and `IS [NOT] NULL`) on numeric, decimal, boolean, date, timestamp,
+  string and blob columns are sent to `vpf_scan`, which skips row groups and pages whose
+  statistics rule them out. DuckDB still applies every filter, so results are always exact;
+  other predicates (`OR`, `LIKE`, functions of columns) just scan everything. `EXPLAIN`
+  shows the pushed filters as `VPF Pruning`. A point lookup reads about one page (~20k rows).
 * **INSERT** buffers up to 1M rows per call to `vpf_append`.
 * **UPDATE / DELETE** collect the row ids DuckDB selects and apply them in one
   `vpf_update_rows` / `vpf_delete_rows` against the snapshot they were read from.
