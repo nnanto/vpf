@@ -40,6 +40,9 @@ h1 span, .takeaway h2 span { color: var(--purple); background: linear-gradient(1
 .overview h1 { font-size: clamp(48px, 6.5vw, 92px); letter-spacing: -.06em; line-height: 1.1; margin-bottom: 26px; }
 .overview h1 span { color: #b8e769; background: none; -webkit-text-fill-color: currentColor; }
 .overview .hero-intro { font-size: 17px; line-height: 1.8; margin-bottom: 40px; }
+.crud-line { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; font-size: 20px; letter-spacing: -.3px; margin-bottom: 18px; }
+.crud-ops { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.crud-ops code { font: 11px var(--mono); color: #b8e769; border: 1px solid #b8e76955; background: #b8e7690d; border-radius: 6px; padding: 4px 8px; }
 .bridge { display: grid; grid-template-columns: 1fr 30px 1.2fr 30px 1fr; gap: 14px; align-items: stretch; }
 .bridge-card { border: 1px solid var(--line); border-radius: 17px; background: #111720; padding: 25px; }
 .bridge-card .micro-label { font-size: 9px; margin-bottom: 21px; letter-spacing: 1.3px; }
@@ -255,6 +258,7 @@ p code { font: .85em var(--mono); color: var(--purple); }
 .or-panel .eyebrow { font-size: 9px; margin-bottom: 14px; }
 .or-panel pre { margin-block: 0 30px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .benchmark-method { margin-top: 35px; }
+.benchmark-next { margin-top: 50px; }
 .benchmark-values { overflow-x: auto; }
 .benchmark-values table { width: 100%; border-collapse: collapse; font: 11px/1.6 var(--mono); margin-bottom: 24px; }
 .benchmark-values caption { text-align: left; padding-block: 18px; color: var(--purple); }
@@ -315,6 +319,8 @@ footer { border-top: 1px solid var(--line); display: flex; align-items: center; 
   .hero.overview { padding-top: 50px; }
   .overview h1 { font-size: clamp(41px, 8.7vw, 63px); letter-spacing: -.055em; }
   .overview .hero-intro { font-size: 14px; }
+  .crud-line { font-size: 16px; gap: 10px; }
+  .crud-ops code { font-size: 10px; padding: 3px 6px; }
   .overview .hero-intro br { display: none; }
   .bridge { grid-template-columns: 1fr; gap: 10px; }
   .bridge-card { padding: 20px; }

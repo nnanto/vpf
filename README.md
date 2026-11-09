@@ -14,14 +14,15 @@ or after `vpf export`. The test suite checks the output with arrow-rs, PyArrow a
 ### Interactive architecture guide
 
 The dependency-free [VPF explorer](docs/index.html) opens with the SQLite → VPF →
-Parquet bridge, then follows a scroll-driven explanation: start with a table,
+Parquet bridge (a Parquet file that supports INSERT, SELECT, UPDATE and DELETE),
+then interactive benchmark charts, then a scroll-driven explanation: start with a table,
 expand its row group into column chunks and pages, follow one
 updated value into a new snapshot, then read it back through a virtual Parquet file.
 Interactive page inspection and snapshot switching connect the values to their
 references. A before/after comparison explains the same update in a conventional
 SQLite row table (WAL mode), a single-file Parquet replacement, and VPF.
 
-The benchmark section charts recorded read scores and durable fresh/append/update/
+The benchmark charts show recorded read scores and durable fresh/append/update/
 delete times, with table-size and metadata-policy controls. A separate chart shows
 the newer OR-pruning before/after experiment. Values are checked against the
 archived JSON reports; methods, exact values, and limitations are available inline.

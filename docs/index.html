@@ -14,14 +14,15 @@
   <a class="skip-link" href="#table">Skip to the explanation</a>
   <header class="site-header">
     <a class="wordmark" href="#top" aria-label="VPF home">vpf<span> / explained</span></a>
-    <nav aria-label="Main navigation"><a href="#table">The story</a><a href="#compare">Compare</a><a href="#benchmarks">Benchmarks</a><a href="#details">Details</a></nav>
+    <nav aria-label="Main navigation"><a href="#benchmarks">Benchmarks</a><a href="#table">The story</a><a href="#compare">Compare</a><a href="#details">Details</a></nav>
     <div class="scroll-progress" aria-hidden="true"></div>
   </header>
   <main id="top">
     <section class="hero overview section-width">
       <p class="eyebrow">VPF / MUTABLE VIRTUAL PARQUET FILES</p>
       <h1>Transactional edits.<br><span>Columnar analytics.</span></h1>
-      <p class="hero-intro">SQLite’s transactional container. Parquet’s columnar pages.<br>VPF brings them together: change affected pages, keep earlier snapshots,<br>and expose each version as standard Parquet.</p>
+      <p class="crud-line"><strong>It’s a Parquet file—that you can change.</strong> <span class="crud-ops" role="img" aria-label="Supports create, read, update, and delete"><code>INSERT</code><code>SELECT</code><code>UPDATE</code><code>DELETE</code></span></p>
+      <p class="hero-intro">SQLite’s transactional container. Parquet’s columnar pages. <br>VPF brings them together: change affected pages, keep earlier snapshots, <br>and expose each version as standard Parquet.</p>
       <div class="bridge" aria-label="VPF combines SQLite transactions with Parquet pages">
         <article class="bridge-card sqlite-bridge"><p class="micro-label">THE DATABASE</p><h2>SQLite</h2><strong>Mutable and transactional.</strong><p>A portable database file, atomic commits, and a reliable home for page bytes and metadata.</p></article>
         <span class="bridge-arrow" aria-hidden="true">→</span>
@@ -30,8 +31,51 @@
         <article class="bridge-card parquet-bridge"><p class="micro-label">THE OPEN FORMAT</p><h2>Parquet</h2><strong>Columnar and widely readable.</strong><p>Standard snapshots for existing readers. VPF is the storage layer, not a new query engine.</p></article>
       </div>
       <div class="overview-benefits"><p><strong>Change less.</strong><span>Rewrite affected pages, not the whole table.</span></p><p><strong>Keep history.</strong><span>Every committed snapshot stays readable.</span></p><p><strong>Use familiar tools.</strong><span>DuckDB, Arrow, or another Parquet reader.</span></p></div>
-      <a class="scroll-cue" href="#table">Now follow one table, all the way down.<span aria-hidden="true">↓</span></a>
+      <a class="scroll-cue" href="#benchmarks">First, the numbers.<span aria-hidden="true">↓</span></a>
     </section>
+    <section class="benchmarks section-width" id="benchmarks" aria-labelledby="benchmarks-title">
+      <div class="section-intro">
+        <p class="eyebrow">FIRST, THE MEASUREMENTS.</p>
+        <h2 id="benchmarks-title">Less rewriting.<br>How much less waiting?</h2>
+        <p>Real measurements from this repository.<br>Explore where VPF helps—and where it doesn’t.</p>
+      </div>
+      <div class="benchmark-panel">
+        <div class="benchmark-toolbar">
+          <div><label for="benchmark-size">Table size</label><select id="benchmark-size"><option value="10000">10,000 rows</option><option value="100000">100,000 rows</option><option value="1000000">1 million rows</option><option value="10000000" selected>10 million rows</option></select></div>
+          <div><label for="benchmark-mode">VPF metadata policy</label><select id="benchmark-mode"><option value="lazy">Lazy · layout on read</option><option value="eager" selected>Eager · layout on write</option></select></div>
+          <span class="benchmark-date">Recorded Nov 8, 2026<br>Lower time is better</span>
+        </div>
+        <div class="workload-controls" role="group" aria-label="Benchmark workload">
+          <button type="button" data-workload="update" aria-pressed="true">Update</button>
+          <button type="button" data-workload="append" aria-pressed="false">Append</button>
+          <button type="button" data-workload="delete" aria-pressed="false">Delete</button>
+          <button type="button" data-workload="fresh" aria-pressed="false">Fresh write</button>
+          <button type="button" data-workload="read" aria-pressed="false">Read score</button>
+        </div>
+        <div id="benchmark-chart"></div>
+        <p id="benchmark-announcement" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+        <p class="benchmark-source">Baseline suite, before OR-aware pruning. Each mode shows SQLite, Parquet, and VPF from its own same-run report; changing mode switches the whole recorded run, not just one engine. The two modes ran sequentially.</p>
+      </div>
+      <div class="benchmark-panel or-panel">
+        <div class="benchmark-heading"><div><p class="eyebrow">THE NEWER FOLLOW-UP / OR-AWARE PRUNING</p><h3>Skip more. Read less.</h3></div><span class="benchmark-pill" id="or-selection"></span></div>
+        <p class="benchmark-description">A different experiment: the same two-ID OR query, before and after the pruning change. Uses the table size and metadata policy selected above.</p>
+        <pre><code id="or-query"></code></pre>
+        <div id="or-chart"></div>
+        <p class="benchmark-source">Separate primary before/after runs, not a recalculation of the baseline read score. Parquet is from the after run. Small tables may show no gain; shared-environment noise is retained in the source reports.</p>
+      </div>
+      <details class="benchmark-method">
+        <summary>What was measured? Methods, limits, and exact values.</summary>
+        <p>Identical deterministic synthetic orders, one DuckDB thread, warm OS caches. Reads include planning, execution, and complete result fetching: two warm-ups and seven samples. The read score sums 13 query medians and excludes COUNT(*).</p>
+        <p>Writes use one warm-up and five samples. Times include SQL/commit, WAL checkpoint where applicable, file fsync, and directory fsync. Input generation, copying the checkpointed seed, connection setup, verification, and cleanup are excluded. Results were verified outside timing.</p>
+        <p>SQLite is a conventional <strong>unindexed</strong> row table, including for ID lookups. Parquet uses a <strong>single-file full-replacement</strong> workflow for mutations—not partitioned append or a versioned table format. Parquet and VPF use Snappy; their fresh-write row-group and buffer layouts can differ. VPF mutations also retain the previous snapshot.</p>
+        <p>These are engine-plus-storage workflows, not isolated format or encoder benchmarks. The shared-environment medians are not confidence intervals or guarantees. They do not measure cold I/O, concurrent writers, indexed SQLite, joins, peak memory, or production distributions. The OR follow-up includes noisy write rechecks; see the full report rather than inferring a universal speedup.</p>
+        <div id="benchmark-values" class="benchmark-values"></div>
+        <p>Read the <a href="https://github.com/nnanto/vpf/blob/main/BENCHMARKS.md">full benchmark report</a>, <a id="baseline-data-link" href="https://github.com/nnanto/vpf/blob/main/benches/results/read-write-eager.json">selected baseline raw samples</a>, and <a href="https://github.com/nnanto/vpf/blob/main/benches/results/or-pruning.json">OR before/after samples and rechecks</a>.</p>
+      </details>
+      <noscript><p class="no-script">Enable JavaScript for the benchmark charts, or read the linked benchmark report for all values.</p></noscript>
+      <a class="scroll-cue benchmark-next" href="#table">Now see why. Follow one table, all the way down.<span aria-hidden="true">↓</span></a>
+    </section>
+
     <section class="story-lead section-width" aria-label="The example we will follow">
       <p class="eyebrow">ONE TABLE. ONE CHANGE.</p>
       <h2>Let’s make it concrete.</h2>
@@ -136,48 +180,6 @@ FROM orders WHERE id = 8;</code></pre>
       <div class="comparison-control"><span>Order 8 · revenue_cents</span><div class="segmented" role="group" aria-label="Compare storage before and after the update"><button data-compare="before" aria-pressed="false">Before</button><button data-compare="after" aria-pressed="true">After the update</button></div></div>
       <div id="comparison-cards" class="comparison-cards"></div>
       <p class="comparison-footnote">These are conceptual layouts, not equal-size pages or timed operations. SQLite database pages and Parquet data pages are different units. The Parquet example is a single-file replacement workflow—not a table format with delta files or a claim that every byte must be re-encoded.</p>
-    </section>
-
-    <section class="benchmarks section-width" id="benchmarks" aria-labelledby="benchmarks-title">
-      <div class="section-intro">
-        <p class="eyebrow">THE DESIGN. MEET THE MEASUREMENTS.</p>
-        <h2 id="benchmarks-title">Less rewriting.<br>How much less waiting?</h2>
-        <p>Real measurements from this repository.<br>Explore where VPF helps—and where it doesn’t.</p>
-      </div>
-      <div class="benchmark-panel">
-        <div class="benchmark-toolbar">
-          <div><label for="benchmark-size">Table size</label><select id="benchmark-size"><option value="10000">10,000 rows</option><option value="100000">100,000 rows</option><option value="1000000">1 million rows</option><option value="10000000" selected>10 million rows</option></select></div>
-          <div><label for="benchmark-mode">VPF metadata policy</label><select id="benchmark-mode"><option value="lazy">Lazy · layout on read</option><option value="eager" selected>Eager · layout on write</option></select></div>
-          <span class="benchmark-date">Recorded Nov 8, 2026<br>Lower time is better</span>
-        </div>
-        <div class="workload-controls" role="group" aria-label="Benchmark workload">
-          <button type="button" data-workload="update" aria-pressed="true">Update</button>
-          <button type="button" data-workload="append" aria-pressed="false">Append</button>
-          <button type="button" data-workload="delete" aria-pressed="false">Delete</button>
-          <button type="button" data-workload="fresh" aria-pressed="false">Fresh write</button>
-          <button type="button" data-workload="read" aria-pressed="false">Read score</button>
-        </div>
-        <div id="benchmark-chart"></div>
-        <p id="benchmark-announcement" class="sr-only" aria-live="polite" aria-atomic="true"></p>
-        <p class="benchmark-source">Baseline suite, before OR-aware pruning. Each mode shows SQLite, Parquet, and VPF from its own same-run report; changing mode switches the whole recorded run, not just one engine. The two modes ran sequentially.</p>
-      </div>
-      <div class="benchmark-panel or-panel">
-        <div class="benchmark-heading"><div><p class="eyebrow">THE NEWER FOLLOW-UP / OR-AWARE PRUNING</p><h3>Skip more. Read less.</h3></div><span class="benchmark-pill" id="or-selection"></span></div>
-        <p class="benchmark-description">A different experiment: the same two-ID OR query, before and after the pruning change. Uses the table size and metadata policy selected above.</p>
-        <pre><code id="or-query"></code></pre>
-        <div id="or-chart"></div>
-        <p class="benchmark-source">Separate primary before/after runs, not a recalculation of the baseline read score. Parquet is from the after run. Small tables may show no gain; shared-environment noise is retained in the source reports.</p>
-      </div>
-      <details class="benchmark-method">
-        <summary>What was measured? Methods, limits, and exact values.</summary>
-        <p>Identical deterministic synthetic orders, one DuckDB thread, warm OS caches. Reads include planning, execution, and complete result fetching: two warm-ups and seven samples. The read score sums 13 query medians and excludes COUNT(*).</p>
-        <p>Writes use one warm-up and five samples. Times include SQL/commit, WAL checkpoint where applicable, file fsync, and directory fsync. Input generation, copying the checkpointed seed, connection setup, verification, and cleanup are excluded. Results were verified outside timing.</p>
-        <p>SQLite is a conventional <strong>unindexed</strong> row table, including for ID lookups. Parquet uses a <strong>single-file full-replacement</strong> workflow for mutations—not partitioned append or a versioned table format. Parquet and VPF use Snappy; their fresh-write row-group and buffer layouts can differ. VPF mutations also retain the previous snapshot.</p>
-        <p>These are engine-plus-storage workflows, not isolated format or encoder benchmarks. The shared-environment medians are not confidence intervals or guarantees. They do not measure cold I/O, concurrent writers, indexed SQLite, joins, peak memory, or production distributions. The OR follow-up includes noisy write rechecks; see the full report rather than inferring a universal speedup.</p>
-        <div id="benchmark-values" class="benchmark-values"></div>
-        <p>Read the <a href="https://github.com/nnanto/vpf/blob/main/BENCHMARKS.md">full benchmark report</a>, <a id="baseline-data-link" href="https://github.com/nnanto/vpf/blob/main/benches/results/read-write-eager.json">selected baseline raw samples</a>, and <a href="https://github.com/nnanto/vpf/blob/main/benches/results/or-pruning.json">OR before/after samples and rechecks</a>.</p>
-      </details>
-      <noscript><p class="no-script">Enable JavaScript for the benchmark charts, or read the linked benchmark report for all values.</p></noscript>
     </section>
 
     <section class="takeaway section-width">
