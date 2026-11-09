@@ -19,7 +19,7 @@
     <section class="hero">
       <div><p class="eyebrow"><span class="live-dot"></span> THE VIRTUAL PARQUET FILE, EXPLAINED</p>
         <h1>Change the table.<br><span>Not the whole file.</span></h1>
-        <p class="intro">Immutable Parquet pages. Mutable metadata. One SQLite file.<br>Explore how VPF changes data without losing its history, then serves it as ordinary Parquet.</p>
+        <p class="intro">Immutable Parquet pages. Mutable metadata. One SQLite file.<br>Explore real rows from the repo’s orders benchmark, then see how VPF stores, prunes, and reads them.</p>
       </div>
       <aside class="hero-note"><span class="small-label">THE BIG IDEA</span><p>Store once.<br>Reference many times.</p><div class="mini-pages"><i></i><i></i><i></i><span>→</span><b>S1</b><b>S2</b><b>S3</b></div><small>Snapshots share unchanged pages.</small></aside>
     </section>
@@ -31,9 +31,9 @@
     <section id="storage" class="view">
       <div class="workspace">
         <aside class="control-panel panel">
-          <div class="panel-heading"><span class="small-label">YOUR SANDBOX</span><span class="pill">sales.vpf</span></div>
+          <div class="panel-heading"><span class="small-label">YOUR SANDBOX</span><span class="pill">orders.vpf</span></div>
           <h2>Make a change</h2>
-          <p class="muted">A tiny table. Real storage concepts.<br>Run the guided sequence below.</p>
+          <p class="muted">Real generated orders. Real cents.<br>Run the guided sequence below.</p>
           <div id="operations" class="operations"></div>
           <button id="reset" class="text-button">↺ Reset sandbox</button>
           <div class="divider"></div>
@@ -48,7 +48,7 @@
           <div id="storage-diagram"></div>
           <div class="blob-heading"><span class="small-label">blobs <span class="muted">/ immutable page bytes</span></span><span id="blob-count" class="muted"></span></div>
           <div id="blob-ledger" class="blob-ledger"></div>
-          <p class="diagram-caption">Click any page to inspect its values, statistics, and snapshot references.<br>Parquet data pages are not the same thing as SQLite’s internal database pages.</p>
+          <p class="diagram-caption">Values follow <code>benches/analytical.py</code>; this is its first 12 rows. Four-row page splits and byte offsets are illustrative, not the benchmark’s actual Parquet layout. Click a page to inspect values and statistics.</p>
         </div>
       </div>
       <div class="bottom-grid">
@@ -58,27 +58,29 @@
       </div>
     </section>
     <section id="retrieval" class="view" hidden>
-      <div class="read-intro"><div><p class="eyebrow">NO EXPORT REQUIRED</p><h2>A real Parquet file.<br>Without a second file on disk.</h2><p class="muted">A snapshot becomes a frozen VirtualFile: an offset map over stored pages, synthesized batches, and a fresh footer.</p></div><div class="reader-controls panel"><label for="read-snapshot">Pinned snapshot</label><select id="read-snapshot"></select><label for="read-column">Projected column</label><select id="read-column"></select><button id="read-next" class="primary-button">Start read →</button><button id="read-reset" class="text-button">Reset reader</button></div></div>
+      <div class="read-intro"><div><p class="eyebrow">NO EXPORT REQUIRED</p><h2>A real Parquet file.<br>Without a second file on disk.</h2><p class="muted">A snapshot becomes a frozen VirtualFile: an offset map over stored pages, synthesized batches, and a fresh footer.</p><div class="query-example"><span class="small-label">REAL QUERY FROM THE BENCHMARK · 10M-ROW ORDERS TABLE</span><code>SELECT COUNT(*), SUM(revenue_cents) FROM orders WHERE id = 5000000 OR id = 5000002;</code><p><strong>Result: 2 rows · 15,838 cents.</strong> VPF can union the two candidate ranges from page statistics; DuckDB still evaluates the exact OR filter.</p></div></div><div class="reader-controls panel"><label for="read-snapshot">Pinned snapshot</label><select id="read-snapshot"></select><label for="read-column">Projected column</label><select id="read-column"></select><button id="read-next" class="primary-button">Start read →</button><button id="read-reset" class="text-button">Reset reader</button></div></div>
       <section class="panel read-panel"><div class="panel-heading"><span class="small-label">VIRTUAL BYTE ADDRESS SPACE</span><span class="pill">Illustrative offsets · not encoded Parquet</span></div><div id="byte-strip" class="byte-strip"></div><div id="read-steps" class="read-steps"></div><div id="read-detail" class="read-detail" aria-live="polite"></div><div id="range-map"></div></section>
       <div class="feature-grid">
-        <article class="panel"><span class="feature-number">A</span><h3>Resolve & pin</h3><p>Resolve <code>/files/sales/latest</code> once. Keep the snapshot ID for the whole query: its Parquet URL never changes.</p></article>
+        <article class="panel"><span class="feature-number">A</span><h3>Resolve & pin</h3><p>Resolve <code>/files/orders/latest</code> once. Keep the snapshot ID for the whole query: its Parquet URL never changes.</p></article>
         <article class="panel"><span class="feature-number">B</span><h3>Seek, don’t export</h3><p><code>read_range(offset, len)</code> finds overlapping extents and reads just those bytes from SQLite blobs or memory. The full file is not materialized.</p></article>
-        <article class="panel"><span class="feature-number">C</span><h3>Let the reader choose</h3><p>DuckDB, Arrow, and PyArrow see standard Parquet. Column projection and page-index pruning depend on the reader; VPF doesn’t execute arbitrary SQL queries.</p></article>
+        <article class="panel"><span class="feature-number">C</span><h3>Let the reader choose</h3><p>DuckDB plans and executes SQL; VPF supplies data and conservative statistics-based candidate ranges. AND intersects ranges; OR unions them. DuckDB always rechecks the exact predicate.</p></article>
       </div>
     </section>
     <section id="special" class="view" hidden>
       <div class="special-header"><p class="eyebrow">THE DESIGN TRADE-OFF</p><h2>Parquet compatibility.<br>Page-level mutability.</h2><p class="muted">Not a new query engine. A different way to store and expose a table.</p></div>
       <div class="feature-grid">
-        <article class="panel"><span class="feature-number">01</span><h3>Copy-on-write, below the file</h3><p>Updating one value rewrites its affected column page, not every column or the entire file. Deletes rewrite affected pages across columns. Unchanged page IDs are reused.</p></article>
+        <article class="panel"><span class="feature-number">01</span><h3>Copy-on-write, below the file</h3><p>Updating <code>revenue_cents</code> for order 8 rewrites just its revenue page. Deleting order 2 rewrites its seven column pages. Unchanged page IDs are reused.</p></article>
         <article class="panel"><span class="feature-number">02</span><h3>History is a reference graph</h3><p>Snapshots use segment visibility bounds <code>[added_in, removed_in)</code>. Old page bytes remain readable. Rename, reorder, and drop use stable column IDs: metadata-only changes.</p></article>
         <article class="panel"><span class="feature-number">03</span><h3>One portable storage unit</h3><p>One table per SQLite file. Page blobs and metadata commit atomically in a transaction. WAL supports several readers and one writer. Copy with no active writer, or use SQLite backup.</p></article>
-        <article class="panel"><span class="feature-number">04</span><h3>Small appends, buffered</h3><p>Compact columnar batches are immediately visible through cached, synthesized Parquet row groups. Auto mode uses direct pages at 65,536 rows or more. Flush persists buffered runs.</p></article>
-        <article class="panel"><span class="feature-number">05</span><h3>Statistics you can trust</h3><p>VPF computes page bounds from decoded values, rather than trusting imported indexes. Supported mutation predicates can skip impossible ranges; missing or unsupported statistics fall back to evaluation.</p></article>
+        <article class="panel"><span class="feature-number">04</span><h3>Small appends, buffered</h3><p>Orders 12 and 13 are immediately visible as a compact columnar batch. Reads synthesize and cache Parquet pages; flush stores them. Auto mode directly encodes batches of 65,536 rows or more.</p></article>
+        <article class="panel"><span class="feature-number">05</span><h3>Statistics can prune safely</h3><p>VPF recomputes page bounds from decoded values. DuckDB can push supported comparisons, NULL checks, BETWEEN, AND, and OR into candidate-range pruning. It still applies exact filters; unsupported OR branches stay unpruned.</p></article>
         <article class="panel"><span class="feature-number">06</span><h3>Ordinary readers, three paths</h3><p>Use Rust’s <code>ChunkReader</code>, HTTP byte ranges, or a read-only FUSE mount. Export a standalone Parquet file when needed. Nested columns map to one chunk per leaf.</p></article>
       </div>
+      <section class="panel mode-panel"><span class="small-label">LATEST: CHOOSE WHEN SNAPSHOT LAYOUTS ARE PREPARED</span><h3>Lazy is the default. Eager shifts work to writes.</h3><div class="mode-grid"><article><h4>Lazy</h4><p>Resolve virtual layout on demand. Appends avoid loading existing row groups, page metadata, and buffered payloads. The C API caches one resolved snapshot per handle.</p></article><article><h4>Eager</h4><p>Persist the footer and offset map atomically with each write. Faster repeated read setup, at the cost of more write CPU and stored metadata. Buffered snapshots also persist synthesized Parquet pages.</p></article></div><p class="muted">Both modes can read persisted layouts, including after reopen. Changing modes applies to later writes; it does not backfill older snapshots.</p></section>
+      <section class="panel benchmark-panel"><span class="small-label">MEASURED IN THE CURRENT REPO · OR-AWARE PRUNING</span><h3>10 million generated orders. The two-ID OR filter.</h3><p class="benchmark-query"><code>WHERE id = 5000000 OR id = 5000002</code></p><div class="benchmark-grid"><div><span>VPF lazy · before → after</span><strong>198.780 → 26.176 ms</strong><small>7.6× faster</small></div><div><span>VPF eager · before → after</span><strong>188.768 → 5.231 ms</strong><small>36.1× faster</small></div><div><span>DuckDB on Parquet · same-run median</span><strong>5.399 ms</strong><small>eager VPF is comparable in this run</small></div></div><p class="muted">Warm-cache medians, one DuckDB thread, two warm-ups and seven samples. The benchmark fixture is deterministic synthetic data, not production orders; timings are not guarantees. Results and methodology: <a href="https://github.com/nnanto/vpf/blob/main/BENCHMARKS.md">BENCHMARKS.md ↗</a></p></section>
       <section class="panel tradeoffs"><span class="small-label">WHAT YOU PAY FOR THIS</span><h3>History takes space. Compatibility sets the boundaries.</h3><p>No garbage collection or compaction: old pages remain stored. Rewritten pages use PLAIN encoding. No emitted bloom filters. UPDATE assignments take literals only; nested assignments are limited to NULL on optional columns. Predicate pruning is conservative, not a guarantee that a page contains a match.</p></section>
     </section>
-    <footer><span>VPF / An interactive architecture guide</span><span>Browser simulation, not the Rust engine. No data leaves your browser.</span><a href="https://github.com/nnanto/vpf/blob/main/README.md">Implementation & limitations ↗</a></footer>
+    <footer><span>VPF / An interactive architecture guide</span><span>Browser simulation; sample rows match the deterministic synthetic benchmark fixture. Page layout is illustrative. No data leaves your browser.</span><a href="https://github.com/nnanto/vpf/blob/main/README.md">Implementation & limitations ↗</a></footer>
   </main>
 </body>
 </html>

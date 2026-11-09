@@ -13,12 +13,12 @@ or after `vpf export`. The test suite checks the output with arrow-rs, PyArrow a
 
 ### Interactive architecture guide
 
-The dependency-free [VPF explorer](docs/index.html) walks through page-level updates,
-deletes, buffered appends, flushes, schema renames, time travel, and a projected
-byte-range read. It is an illustrative browser simulation, not a Parquet encoder or
-the Rust engine. Run `python3 -m http.server 8000 --directory docs` and open
-`http://localhost:8000` locally. Its reference model is checked with
-`node --test tests/explainer.test.mjs`.
+The dependency-free [VPF explorer](docs/index.html) uses the exact first rows generated
+by `benches/analytical.py` for its orders table, and includes the current measured
+10-million-row OR-pruning results from `BENCHMARKS.md`. Its page boundaries and byte
+offsets are illustrative; it is not a Parquet encoder or the Rust engine. Run
+`python3 -m http.server 8000 --directory docs` and open `http://localhost:8000`
+locally. Its reference model is checked with `node --test tests/explainer.test.mjs`.
 
 To publish at `https://nnanto.github.io/vpf/`, enable **Settings → Pages → Build and
 deployment → Source: GitHub Actions**. The Pages workflow deploys `docs/` on changes

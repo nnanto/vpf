@@ -2,11 +2,12 @@ import { createLab, operations, visiblePages, virtualExtents } from "./model.mjs
 
 const $ = selector => document.querySelector(selector);
 const escape = value => String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const display = value => value == null ? "NULL" : String(value);
 let lab = createLab();
 let selectedSnapshot = 1;
-let selectedPage = "P01";
+let selectedPage = "P18";
 let readSnapshot = 1;
-let readColumn = 2;
+let readColumn = 6;
 let readStep = -1;
 
 function pageButton(page, snapshot, ledger = false) {
@@ -29,12 +30,12 @@ function renderStorage() {
   $("#blob-ledger").innerHTML = lab.pages.map(p => pageButton(p, snapshot, true)).join("");
   $("#blob-count").textContent = `${lab.pages.length} stored · ${visiblePages(snapshot).length} visible`;
   const op = operations.find(o => o.key === snapshot.operation);
-  $("#event-title").textContent = op?.title ?? "Six pages. One starting snapshot.";
-  $("#event-description").textContent = op?.description ?? "Import stores compressed page bytes (header + body) and computes page statistics. Our example has three flat columns, each with two pages of six rows, in one row group. Metadata links the first snapshot to those chunks.";
+  $("#event-title").textContent = op?.title ?? "Twenty-one pages. One starting snapshot.";
+  $("#event-description").textContent = op?.description ?? "Import stores compressed page bytes (header + body) and computes page statistics. This seven-column orders sample has three illustrative four-row pages per column in one row group. Metadata links the snapshot to those chunks.";
   $("#metrics").innerHTML = [[snapshot.written, "pages written"], [snapshot.reused, "pages reused"], [lab.snapshots.length, "snapshots kept"]].map(([number, label]) => `<div class="metric"><strong>${number}</strong><span>${label}</span></div>`).join("");
-  $("#command").textContent = `vpf sales.vpf ${op?.command ?? "import sales.parquet"}`;
+  $("#command").textContent = `vpf orders.vpf ${op?.command ?? "import orders.parquet --name orders"}`;
   $("#row-count").textContent = `${snapshot.rows.length} rows`;
-  $("#rows").innerHTML = `<thead><tr>${snapshot.columns.map(c => `<th>${c.name}</th>`).join("")}</tr></thead><tbody>${snapshot.rows.map(row => `<tr>${snapshot.columns.map(c => `<td class="${c.id === 2 && row[c.key] === 99 ? "changed" : ""}">${escape(row[c.key])}</td>`).join("")}</tr>`).join("")}</tbody>`;
+  $("#rows").innerHTML = `<thead><tr>${snapshot.columns.map(c => `<th>${c.name}</th>`).join("")}</tr></thead><tbody>${snapshot.rows.map(row => `<tr>${snapshot.columns.map(c => `<td class="${c.id === 6 && row.id === 8 && row.revenue_cents === 12345 ? "changed" : ""}">${escape(display(row[c.key]))}</td>`).join("")}</tr>`).join("")}</tbody>`;
   renderInspector();
 }
 
@@ -43,8 +44,9 @@ function renderInspector() {
   const snapshot = lab.snapshots[selectedSnapshot - 1];
   const column = snapshot.columns.find(c => c.id === page.column);
   const refs = lab.snapshots.filter(s => visiblePages(s).some(p => p.id === page.id)).map(s => `S${s.id}`);
-  const sorted = [...page.values].sort((a, b) => typeof a === "number" ? a - b : a < b ? -1 : a > b ? 1 : 0);
-  $("#inspector").innerHTML = `<h3>${page.id} <span class="pill">${column.name} · stable id ${page.column}</span></h3><div class="inspector-values">${page.values.map(escape).join(" · ")}</div><dl><dt>Row count</dt><dd>${page.values.length}</dd><dt>Min / max</dt><dd>${escape(sorted[0])} / ${escape(sorted.at(-1))}</dd><dt>Null count</dt><dd>0</dd><dt>Storage</dt><dd>SQLite blobs</dd></dl><p>Referenced by ${refs.join(", ")}.<br>${visiblePages(snapshot).some(p => p.id === page.id) ? "Visible in this snapshot." : "Not visible here; preserved for time travel."}</p>`;
+  const nonNull = page.values.filter(v => v != null);
+  const sorted = [...nonNull].sort((a, b) => typeof a === "number" ? a - b : a < b ? -1 : a > b ? 1 : 0);
+  $("#inspector").innerHTML = `<h3>${page.id} <span class="pill">${column.name} · stable id ${page.column}</span></h3><div class="inspector-values">${page.values.map(v => escape(display(v))).join(" · ")}</div><dl><dt>Row count</dt><dd>${page.values.length}</dd><dt>Min / max</dt><dd>${sorted.length ? `${escape(sorted[0])} / ${escape(sorted.at(-1))}` : "—"}</dd><dt>Null count</dt><dd>${page.values.length - nonNull.length}</dd><dt>Storage</dt><dd>SQLite blobs</dd></dl><p>Referenced by ${refs.join(", ")}.<br>${visiblePages(snapshot).some(p => p.id === page.id) ? "Visible in this snapshot." : "Not visible here; preserved for time travel."}</p>`;
 }
 
 function renderReader() {
@@ -64,10 +66,10 @@ function renderReader() {
     `A common reader first fetches bytes ${size - 8}–${size - 1}: the metadata length and PAR1 magic. These bytes are generated in memory, not read from page blobs.`,
     "The fresh footer describes the snapshot’s schema, row groups, relocated column offsets, and page indexes. The offset map creates a contiguous file from physically separate sources.",
     `This example projects ${column.name} without a predicate. Only its ${projected.length} page extents are requested; other columns stay unread. With dictionary encoding, a reader also needs the relevant dictionary page.`,
-    `The reader decodes the selected column: ${snapshot.rows.map(r => r[column.key]).join(", ")}. Stored pages are read from SQLite; buffered pages are synthesized in memory. Nothing was exported to disk.`,
+    `The reader decodes the selected column: ${snapshot.rows.map(r => display(r[column.key])).join(", ")}. Stored pages are read from SQLite; buffered pages are synthesized in memory. Nothing was exported to disk.`,
   ];
   $("#read-detail").innerHTML = `<h3>${readStep < 0 ? "A frozen view, ready for a reader." : titles[readStep]}</h3><p>${readStep < 0 ? `Start the read to follow byte-range requests for snapshot ${snapshot.id}. All sizes in this diagram are illustrative; the browser does not encode or serve real Parquet.` : escape(descriptions[readStep])}</p>`;
-  $("#range-map").innerHTML = active.map(e => `<div class="range-line"><span>bytes=${e.offset}–${e.offset + e.length - 1} → ${escape(e.label)}</span><span>${e.source === "blobs" ? `VirtualFile extent → blobs row for ${e.id}` : "VirtualFile extent → in-memory bytes"}</span></div>`).join("") + (readStep >= 0 ? `<div class="range-line"><span>GET /files/sales/snapshots/${snapshot.id}.parquet</span><span>Pinned URL · same version on every request</span></div>` : "");
+  $("#range-map").innerHTML = active.map(e => `<div class="range-line"><span>bytes=${e.offset}–${e.offset + e.length - 1} → ${escape(e.label)}</span><span>${e.source === "blobs" ? `VirtualFile extent → blobs row for ${e.id}` : "VirtualFile extent → in-memory bytes"}</span></div>`).join("") + (readStep >= 0 ? `<div class="range-line"><span>GET /files/orders/snapshots/${snapshot.id}.parquet</span><span>Pinned URL · same version on every request</span></div>` : "");
   $("#read-next").textContent = readStep < 0 ? "Start read →" : readStep === 3 ? "Read complete" : "Next request →";
   $("#read-next").disabled = readStep === 3;
 }
@@ -87,8 +89,8 @@ $("#operations").addEventListener("click", event => {
 $("#reset").addEventListener("click", () => {
   lab = createLab();
   selectedSnapshot = readSnapshot = 1;
-  selectedPage = "P01";
-  readColumn = 2;
+  selectedPage = "P18";
+  readColumn = 6;
   readStep = -1;
   renderStorage();
   renderReader();
