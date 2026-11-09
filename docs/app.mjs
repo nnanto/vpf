@@ -1,112 +1,233 @@
-import { createLab, operations, visiblePages, virtualExtents } from "./model.mjs";
+import { createLab, pageSummary, planPointRead, virtualExtents, visiblePages } from "./model.mjs";
 
 const $ = selector => document.querySelector(selector);
-const escape = value => String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const display = value => value == null ? "NULL" : String(value);
-let lab = createLab();
-let selectedSnapshot = 1;
-let selectedPage = "P18";
-let readSnapshot = 1;
-let readColumn = 6;
-let readStep = -1;
+const escape = value => String(value).replace(/[&<>"']/g, character => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+})[character]);
+const number = value => value == null ? "NULL" : typeof value === "number" ? value.toLocaleString("en-US") : value;
+const lab = createLab();
+const before = lab.snapshots[0];
+const after = lab.apply("update");
+const originalRevenue = before.groups[0].chunks.find(chunk => chunk.column === 6).pages;
+const newRevenue = after.groups[0].chunks.find(chunk => chunk.column === 6).pages.at(-1);
+const steps = [...document.querySelectorAll(".story-step")];
+const scenes = [
+  { title: "THE TABLE", badge: "12 rows · 7 columns", caption: "Same logical table. Three columns shown; four more stored." },
+  { title: "THE ROW GROUP", badge: "1 group · 7 chunks", caption: "Rows 0–11 stay aligned, even though their values are stored column by column." },
+  { title: "THE COLUMN PAGES", badge: "Decoded view", caption: "P18 holds order 8’s revenue. Select a page to see its statistics." },
+  { title: "THE REFERENCE MAP", badge: "Inside orders.vpf", caption: "Snapshot → visible segment → row group → column chunk → page IDs." },
+  { title: "THE VISIBLE CHANGE", badge: "Snapshot 2", caption: "63,352 → 12,345. All other cells keep their values." },
+  { title: "THE INTERNAL CHANGE", badge: "Copy-on-write", caption: "One new data page plus metadata. The other 20 pages are reused, not copied." },
+  { title: "THE TWO SNAPSHOTS", badge: "Choose a version", caption: "The row value and its backing page reference change together." },
+  { title: "THE VIRTUAL FILE", badge: "Pinned to snapshot 2", caption: "The offsets look like one file. The bytes come from different sources." },
+  { title: "THE READ", badge: "id = 8", caption: "Candidate pages first. Exact row filtering second. One answer." },
+];
+let current = -1;
+let inspectedPage = "P18";
+let historySnapshot = 2;
+let comparisonAfter = true;
 
-function pageButton(page, snapshot, ledger = false) {
-  const visible = visiblePages(snapshot).some(p => p.id === page.id);
-  const previous = lab.snapshots[snapshot.id - 2];
-  const fresh = visible && (!previous || !visiblePages(previous).some(p => p.id === page.id));
-  return `<button class="page ${!visible ? "old" : fresh ? "fresh" : ""} ${page.id === selectedPage ? "selected" : ""}" data-page="${page.id}" aria-pressed="${page.id === selectedPage}" aria-label="Inspect ${page.id}, ${visible ? fresh ? "new" : "reused" : "historical only"}">${page.id}${ledger ? "" : `<small>${page.values.length} rows · ${fresh ? "new" : "reused"}</small>`}</button>`;
+function table(snapshot, { compact = false, change = false } = {}) {
+  const rows = compact ? snapshot.rows.filter(row => row.id >= 7 && row.id <= 9) : snapshot.rows;
+  return `<div class="table-label"><span>${compact ? "orders / rows 7–9" : '<span class="full-row-label">orders / 12 rows</span><span class="short-row-label">orders / rows 6–11 of 12</span>'}</span><span>${snapshot === before ? "snapshot 1" : "snapshot 2"}</span></div>
+    <div class="table-frame"><table class="data-table ${compact ? "" : "full-table"}"><caption class="sr-only">Orders in snapshot ${snapshot.id}; three of seven columns shown</caption>
+      <thead><tr><th scope="col">id</th><th scope="col">region</th><th scope="col">revenue_cents</th></tr></thead>
+      <tbody>${rows.map(row => `<tr class="${row.id === 8 ? "target-row" : ""}"><td>${row.id}</td><td>${escape(row.region)}</td><td class="${snapshot === after && row.id === 8 ? "updated-cell" : ""}">${change && row.id === 8 ? '<span class="old-inline">63,352</span>' : ""}${number(row.revenue_cents)}</td></tr>`).join("")}</tbody>
+    </table></div>`;
 }
 
-function renderStorage() {
-  const snapshot = lab.snapshots[selectedSnapshot - 1];
-  $("#operations").innerHTML = operations.map((op, index) => `<button class="operation ${index < lab.snapshots.length - 1 ? "done" : ""}" data-operation="${op.key}" ${index !== lab.snapshots.length - 1 ? "disabled" : ""}><span>${index < lab.snapshots.length - 1 ? "✓" : `0${index + 1}`}</span>${op.label}</button>`).join("");
-  $("#snapshot").innerHTML = lab.snapshots.map(s => `<option value="${s.id}" ${s.id === selectedSnapshot ? "selected" : ""}>Snapshot ${s.id} · ${s.operation}</option>`).join("");
-  $("#snapshot-note").textContent = selectedSnapshot === lab.snapshots.length ? "Viewing the latest snapshot. Writes always apply to the latest version." : "Historical view, frozen in time. New writes still apply to the latest version.";
-  $("#snapshot-badge").textContent = `S${snapshot.id} · ${snapshot.rows.length} rows`;
-  $("#storage-diagram").innerHTML = snapshot.groups.map(g => `<div class="segment"><div class="segment-card"><strong>${g.id}</strong><small>visible segment<br>${g.chunks[0].pages.reduce((n, p) => n + p.values.length, 0)} rows</small></div><div class="chunks">${g.chunks.map(c => {
-    const column = snapshot.columns.find(col => col.id === c.column);
-    return `<div class="chunk"><div class="column-name">${column.name}<small>column id ${column.id} · ${column.type}</small></div><div class="page-list">${c.pages.map(p => pageButton(p, snapshot)).join("")}</div></div>`;
-  }).join("")}</div></div>`).join("") + (snapshot.batch ? `<div class="segment"><div class="segment-card batch-card"><strong>B1</strong><small>buffered segment<br>2 rows</small></div><div class="batch-payload">Compact columnar payload<small>On read → cached, synthesized Parquet pages in memory</small></div></div>` : "");
-  $("#blob-ledger").innerHTML = lab.pages.map(p => pageButton(p, snapshot, true)).join("");
-  $("#blob-count").textContent = `${lab.pages.length} stored · ${visiblePages(snapshot).length} visible`;
-  const op = operations.find(o => o.key === snapshot.operation);
-  $("#event-title").textContent = op?.title ?? "Twenty-one pages. One starting snapshot.";
-  $("#event-description").textContent = op?.description ?? "Import stores compressed page bytes (header + body) and computes page statistics. This seven-column orders sample has three illustrative four-row pages per column in one row group. Metadata links the snapshot to those chunks.";
-  $("#metrics").innerHTML = [[snapshot.written, "pages written"], [snapshot.reused, "pages reused"], [lab.snapshots.length, "snapshots kept"]].map(([number, label]) => `<div class="metric"><strong>${number}</strong><span>${label}</span></div>`).join("");
-  $("#command").textContent = `vpf orders.vpf ${op?.command ?? "import orders.parquet --name orders"}`;
-  $("#row-count").textContent = `${snapshot.rows.length} rows`;
-  $("#rows").innerHTML = `<thead><tr>${snapshot.columns.map(c => `<th>${c.name}</th>`).join("")}</tr></thead><tbody>${snapshot.rows.map(row => `<tr>${snapshot.columns.map(c => `<td class="${c.id === 6 && row.id === 8 && row.revenue_cents === 12345 ? "changed" : ""}">${escape(display(row[c.key]))}</td>`).join("")}</tr>`).join("")}</tbody>`;
-  renderInspector();
+function pageTile(page, { interactive = false, old = false, fresh = false } = {}) {
+  const stats = pageSummary(page);
+  const tag = interactive ? "button" : "div";
+  const selected = page.id === inspectedPage;
+  return `<${tag} class="page-tile ${old ? "historical" : ""} ${fresh ? "new-page" : ""} ${interactive && selected ? "selected" : ""}"
+    ${interactive ? `type="button" data-page="${page.id}" aria-pressed="${selected}" aria-label="Inspect page ${page.id}"` : ""}>
+    <span class="page-title">${page.id}<span>${fresh ? "new" : old ? "kept" : ""}</span></span>
+    <span class="page-values">${page.values.map((value, index) => `<span class="${page.rowIds[index] === 8 ? "value-target" : ""}">${number(value)}</span>`).join("")}</span>
+    <span class="page-meta">orders ${page.rowIds[0]}–${page.rowIds.at(-1)}<br>${stats.rows} values${old ? " · unchanged" : fresh ? " · rewritten" : ""}</span>
+  </${tag}>`;
 }
 
-function renderInspector() {
-  const page = lab.pages.find(p => p.id === selectedPage);
-  const snapshot = lab.snapshots[selectedSnapshot - 1];
-  const column = snapshot.columns.find(c => c.id === page.column);
-  const refs = lab.snapshots.filter(s => visiblePages(s).some(p => p.id === page.id)).map(s => `S${s.id}`);
-  const nonNull = page.values.filter(v => v != null);
-  const sorted = [...nonNull].sort((a, b) => typeof a === "number" ? a - b : a < b ? -1 : a > b ? 1 : 0);
-  $("#inspector").innerHTML = `<h3>${page.id} <span class="pill">${column.name} · stable id ${page.column}</span></h3><div class="inspector-values">${page.values.map(v => escape(display(v))).join(" · ")}</div><dl><dt>Row count</dt><dd>${page.values.length}</dd><dt>Min / max</dt><dd>${sorted.length ? `${escape(sorted[0])} / ${escape(sorted.at(-1))}` : "—"}</dd><dt>Null count</dt><dd>${page.values.length - nonNull.length}</dd><dt>Storage</dt><dd>SQLite blobs</dd></dl><p>Referenced by ${refs.join(", ")}.<br>${visiblePages(snapshot).some(p => p.id === page.id) ? "Visible in this snapshot." : "Not visible here; preserved for time travel."}</p>`;
+function columnsScene() {
+  const columns = before.columns.filter(column => [1, 2, 6].includes(column.id));
+  return `<div class="group-bracket"><div class="group-title"><span>ROW GROUP 1</span><span class="full-row-label">12 rows</span><span class="short-row-label">rows 6–11 of 12</span></div>
+    <div class="column-grid">${columns.map(column => `<div class="column-tower ${column.id === 6 ? "focus-column" : ""}"><strong>${column.name}</strong>${before.rows.map(row => `<span class="${row.id === 8 ? "focus-value" : ""}">${number(row[column.key])}</span>`).join("")}</div>`).join("")}</div>
+    </div><p class="diagram-footnote">Each vertical stack is one column chunk. Four other chunks are not shown.</p>`;
 }
 
-function renderReader() {
-  const snapshot = lab.snapshots[readSnapshot - 1];
-  const extents = virtualExtents(snapshot);
-  const size = extents.at(-1).offset + extents.at(-1).length;
-  const projected = extents.filter(e => e.column === readColumn);
-  const active = readStep === 0 ? extents.filter(e => e.id === "trailer") : readStep === 1 ? extents.filter(e => e.id === "footer") : readStep >= 2 ? projected : [];
-  $("#read-snapshot").innerHTML = lab.snapshots.map(s => `<option value="${s.id}" ${s.id === readSnapshot ? "selected" : ""}>Snapshot ${s.id} · ${s.operation}</option>`).join("");
-  $("#read-column").innerHTML = snapshot.columns.map(c => `<option value="${c.id}" ${c.id === readColumn ? "selected" : ""}>${c.name} · stable id ${c.id}</option>`).join("");
-  $("#byte-strip").innerHTML = extents.map(e => `<div class="extent ${e.source === "memory" ? "memory" : ""} ${active.includes(e) ? "active" : ""}">${escape(e.label)}<small>${e.offset}–${e.offset + e.length - 1}</small><small>${e.source === "blobs" ? "SQLite blob" : "memory"}</small></div>`).join("");
-  const steps = ["Read last 8 bytes", "Read generated footer", "Fetch projected pages", "Decode column values"];
-  $("#read-steps").innerHTML = steps.map((step, i) => `<div class="read-step ${readStep === i ? "active" : ""}">0${i + 1} / ${step}</div>`).join("");
-  const column = snapshot.columns.find(c => c.id === readColumn);
-  const titles = ["Seek to the trailer.", "Discover the frozen file layout.", `Request only ${column.name}.`, "Ordinary Parquet decoding."];
-  const descriptions = [
-    `A common reader first fetches bytes ${size - 8}–${size - 1}: the metadata length and PAR1 magic. These bytes are generated in memory, not read from page blobs.`,
-    "The fresh footer describes the snapshot’s schema, row groups, relocated column offsets, and page indexes. The offset map creates a contiguous file from physically separate sources.",
-    `This example projects ${column.name} without a predicate. Only its ${projected.length} page extents are requested; other columns stay unread. With dictionary encoding, a reader also needs the relevant dictionary page.`,
-    `The reader decodes the selected column: ${snapshot.rows.map(r => display(r[column.key])).join(", ")}. Stored pages are read from SQLite; buffered pages are synthesized in memory. Nothing was exported to disk.`,
+function pagesScene() {
+  const page = originalRevenue.find(item => item.id === inspectedPage);
+  const stats = pageSummary(page);
+  return `<div class="chunk-label">ROW GROUP 1 / revenue_cents CHUNK</div>
+    <div class="page-grid">${originalRevenue.map(item => pageTile(item, { interactive: true })).join("")}</div>
+    <div class="page-inspect"><strong>${page.id}</strong> · min ${number(stats.min)} · max ${number(stats.max)} · ${stats.nulls} nulls<br>
+    ${page.rowIds.includes(8) ? "The first value belongs to order 8. This is the page the update will replace." : `Orders ${page.rowIds.join(", ")} are on this page. Their revenue values will not change.`}</div>
+    <p class="diagram-footnote">Parquet page = header + encoded body. The values above are the decoded body; min/max statistics are stored by VPF as metadata.</p>`;
+}
+
+function referencesScene() {
+  return `<div class="storage-container"><div class="container-title"><span>orders.vpf</span><span>SQLite container</span></div>
+    <span class="micro-label">METADATA / THE MAP</span>
+    <div class="reference-line"><span class="node">Snapshot 1<small>schema + visibility</small></span><span class="connector">→</span><span class="node">Segment<small>row group RG1</small></span></div>
+    <div class="reference-sub">RG1 → 7 column chunks<br>revenue chunk → P16 · P17 · P18</div>
+    <span class="micro-label">BLOBS / IMMUTABLE PARQUET PAGE BYTES</span>
+    <div class="blob-grid">${visiblePages(before).map(page => `<span class="blob ${page.column === 6 ? "revenue" : ""}">${page.id}</span>`).join("")}</div>
+    </div><p class="diagram-footnote">21 data pages in this example. These are Parquet pages inside SQLite blobs—not 21 SQLite database pages.</p>`;
+}
+
+function rewriteScene() {
+  return `<div class="write-grid">${pageTile(originalRevenue.at(-1), { old: true })}<span aria-hidden="true">→</span>${pageTile(newRevenue, { fresh: true })}</div>
+    <div class="reuse-banner"><strong>20 other pages</strong> keep their original IDs and bytes.</div>
+    <div class="snapshot-routing"><div class="snapshot-route"><span>Snapshot 1 → RG1 → old chunk</span><strong>P18</strong></div><div class="snapshot-route active"><span>Snapshot 2 → RG2 → new chunk</span><strong>P22</strong></div></div>
+    <p class="diagram-footnote">New row-group/chunk metadata reuses the unchanged pages. New page bytes and metadata commit atomically.</p>`;
+}
+
+function historyScene() {
+  const snapshot = historySnapshot === 1 ? before : after;
+  return `<div class="segmented history-controls" role="group" aria-label="Choose a snapshot">
+      <button type="button" data-snapshot="1" aria-pressed="${historySnapshot === 1}">Snapshot 1 · before</button>
+      <button type="button" data-snapshot="2" aria-pressed="${historySnapshot === 2}">Snapshot 2 · after</button></div>
+    ${table(snapshot, { compact: true })}
+    <div class="history-result"><span>Order 8’s revenue</span><strong>${number(snapshot.rows.find(row => row.id === 8).revenue_cents)}</strong></div>
+    <div class="history-chain"><span>S${snapshot.id}</span>→<span>RG${snapshot.id}</span>→<span>revenue chunk</span>→<span>${snapshot.id === 1 ? "P18" : "P22"}</span></div>
+    <p class="diagram-footnote">Different reference, different value. The other 20 data pages are shared by both snapshots.</p>`;
+}
+
+function virtualScene() {
+  const extents = virtualExtents(after);
+  const revenue = extents.filter(extent => extent.column === 6);
+  const target = revenue.at(-1);
+  return `<div class="virtual-file"><span class="micro-label">WHAT A PARQUET READER SEES / ONE BYTE STREAM</span>
+    <div class="extent-strip"><div class="extent-block memory">PAR1<small>magic</small></div><div class="extent-block omitted">15 pages<small>collapsed</small></div>${revenue.map(extent => `<div class="extent-block">${extent.id}<small>${extent.offset}–${extent.offset + extent.length - 1}</small></div>`).join("")}<div class="extent-block omitted">3 pages<small>collapsed</small></div><div class="extent-block memory">Footer<small>+ trailer</small></div></div></div>
+    <div class="mapping-lines"><div><strong>In memory</strong>Magic + generated indexes, metadata, length, and PAR1 trailer.</div><div><strong>In SQLite blobs</strong>The selected snapshot’s original stored Parquet page bytes.</div></div>
+    <div class="byte-range">Example: bytes ${target.offset}–${target.offset + target.length - 1}<br>→ virtual extent P22 → SQLite blob bytes</div>
+    <p class="diagram-footnote">Illustrative 128-byte page extents, not measured file sizes. Other columns before and after revenue are collapsed; page order is preserved.</p>`;
+}
+
+function readScene() {
+  const plan = planPointRead(after, 8, 6);
+  return `<span class="micro-label">ID PAGE STATISTICS / WHERE id = 8</span>
+    <div class="prune-grid">${plan.candidates.map(candidate => `<div class="prune-page ${candidate.read ? "read" : "skipped"}"><small>${candidate.pageId} · id column</small><strong>${candidate.min}–${candidate.max}</strong><small>${candidate.read ? "CANDIDATE" : "SKIP"}</small></div>`).join("")}</div>
+    <div class="read-path"><strong>${plan.pages.map(page => `${page.id} (${page.column === 1 ? "id" : "revenue"})`).join(" + ")}</strong>
+    Decode candidate values → test id = 8<br>
+    Discard orders 9, 10, 11 → keep order 8</div>
+    <div class="answer"><span>revenue_cents<br>snapshot 2 / order 8</span><strong>${number(plan.rows[0].revenue_cents)}</strong></div>
+    <p class="diagram-footnote">The two data-page candidates are shown; footer/index reads and metadata setup are additional work. Other projected columns would need their corresponding pages too.</p>`;
+}
+
+function renderScene(index, animate = true) {
+  const scene = scenes[index];
+  $("#scene-label").textContent = `${String(index + 1).padStart(2, "0")} / ${scene.title}`;
+  $("#scene-badge").textContent = scene.badge;
+  $("#scene-caption").textContent = scene.caption;
+  $("#step-count").textContent = `${index + 1} / ${scenes.length}`;
+  $("#previous").disabled = index === 0;
+  $("#next").disabled = index === scenes.length - 1;
+  $("#stage").dataset.scene = steps[index].dataset.scene;
+  const renders = [
+    () => table(before),
+    columnsScene,
+    pagesScene,
+    referencesScene,
+    () => `<div class="cell-change"><span>ORDER 8</span><del>63,352</del><span>→</span><strong>12,345</strong></div>${table(after, { change: true })}`,
+    rewriteScene,
+    historyScene,
+    virtualScene,
+    readScene,
   ];
-  $("#read-detail").innerHTML = `<h3>${readStep < 0 ? "A frozen view, ready for a reader." : titles[readStep]}</h3><p>${readStep < 0 ? `Start the read to follow byte-range requests for snapshot ${snapshot.id}. All sizes in this diagram are illustrative; the browser does not encode or serve real Parquet.` : escape(descriptions[readStep])}</p>`;
-  $("#range-map").innerHTML = active.map(e => `<div class="range-line"><span>bytes=${e.offset}–${e.offset + e.length - 1} → ${escape(e.label)}</span><span>${e.source === "blobs" ? `VirtualFile extent → blobs row for ${e.id}` : "VirtualFile extent → in-memory bytes"}</span></div>`).join("") + (readStep >= 0 ? `<div class="range-line"><span>GET /files/orders/snapshots/${snapshot.id}.parquet</span><span>Pinned URL · same version on every request</span></div>` : "");
-  $("#read-next").textContent = readStep < 0 ? "Start read →" : readStep === 3 ? "Read complete" : "Next request →";
-  $("#read-next").disabled = readStep === 3;
+  $("#scene").innerHTML = renders[index]();
+  if (animate) {
+    $("#scene").classList.remove("entering");
+    // Restart only on a chapter change, not on every scroll frame.
+    void $("#scene").offsetWidth;
+    $("#scene").classList.add("entering");
+  }
 }
 
-$("#operations").addEventListener("click", event => {
-  const button = event.target.closest("[data-operation]");
-  if (!button || button.disabled) return;
-  const snapshot = lab.apply(button.dataset.operation);
-  selectedSnapshot = snapshot.id;
-  readSnapshot = snapshot.id;
-  readStep = -1;
-  const previous = lab.snapshots.at(-2);
-  selectedPage = visiblePages(snapshot).find(p => !visiblePages(previous).some(old => old.id === p.id))?.id ?? selectedPage;
-  renderStorage();
-  renderReader();
+function compareCard({ name, type, sketch, title, copy, history, vpf = false }) {
+  return `<article class="compare-card ${vpf ? "vpf-card" : ""}"><h3>${name}</h3><p class="storage-type">${type}</p>
+    <div class="comparison-result"><span>Order 8 / revenue</span><strong>${comparisonAfter ? "12,345" : "63,352"}</strong></div>
+    <div class="storage-sketch">${sketch}</div><h4>${title}</h4><p>${copy}</p><p class="history-note">${history}</p></article>`;
+}
+
+function renderComparison() {
+  const a = comparisonAfter;
+  $("#comparison-cards").innerHTML = [
+    compareCard({
+      name: "SQLite", type: "A conventional row table · WAL mode",
+      sketch: `<div class="sqlite-tree"><div class="sqlite-root">table B-tree</div><div class="sqlite-branches" aria-hidden="true">↙ &nbsp; ↓ &nbsp; ↘</div><div class="sqlite-leaves"><div class="sqlite-leaf">row records</div><div class="sqlite-leaf ${a ? "changed" : ""}">order 8<br>${a ? "12,345" : "63,352"}</div><div class="sqlite-leaf">row records</div></div></div><div class="wal ${a ? "" : "inactive"}">${a ? "changed database-page image(s) → WAL" : "WAL / no update yet"}</div>`,
+      title: a ? "Update the row. Log changed pages." : "Whole records live together.",
+      copy: a ? "SQLite changes the row record in its table B-tree. In WAL mode, changed database-page images are appended to the WAL; a later checkpoint updates the main file. It does not rewrite the whole table." : "A leaf database page holds row records, including values from different columns. A B-tree organizes those pages. Indexes, if present, add their own structures.",
+      history: "<strong>History:</strong> WAL supports transaction snapshots for readers, not VPF-style durable named versions after checkpointing. Retaining those needs an additional mechanism.",
+    }),
+    compareCard({
+      name: "Parquet", type: "One ordinary file · replacement workflow",
+      sketch: `<div class="file-label"><span>${a ? "replacement" : "orders"}.parquet</span><span>PAR1</span></div><div class="file-pages ${a ? "replacement" : ""}">${Array.from({ length: 21 }, (_, index) => `<span class="${index === 17 && a ? "changed" : ""}"></span>`).join("")}</div><div class="file-arrow">${a ? "changed value + fresh footer → replace file" : "21 column data pages + one footer"}</div>`,
+      title: a ? "Write a replacement file." : "Column pages make up a file.",
+      copy: a ? "Parquet has no native row-level UPDATE transaction. In this single-file workflow, produce a new valid file and replace the old one. Unchanged page bytes may be copied; they do not all have to be decoded and re-encoded." : "The file holds column chunks, pages, and a footer describing their locations. It is an excellent read format, not a row-update transaction manager.",
+      history: "<strong>History:</strong> replacing the file loses access to the prior version unless you retain it separately or use an external versioned table layer.",
+    }),
+    compareCard({
+      name: "VPF", type: "Parquet pages + snapshot metadata in SQLite", vpf: true,
+      sketch: `<div class="vpf-mini-history"><div><span>Snapshot 1</span><span>→</span><span>P18 · 63,352</span></div>${a ? '<div><span>Snapshot 2</span><span>→</span><span>P22 · 12,345</span></div>' : ""}</div><div class="shared-pages">${a ? "20 data pages shared by both snapshots" : "21 immutable Parquet data pages"}</div>`,
+      title: a ? "Add one data page. Add a new map." : "The file holds pieces and references.",
+      copy: a ? "Write P22 and new metadata that points to it. Reuse 20 data pages by reference. Commit bytes and metadata together. SQLite’s underlying database/WAL work is additional; “one page” is the logical Parquet-page change." : "A snapshot points through visible segments, row groups, and column chunks to stored Parquet pages. The SQLite container commits these references and bytes atomically.",
+      history: "<strong>History:</strong> P18 and snapshot 1 stay reachable. Snapshot 2 shares the unchanged pages. This deliberate history retention also consumes storage.",
+    }),
+  ].join("");
+  document.querySelectorAll("[data-compare]").forEach(button => button.setAttribute("aria-pressed", String((button.dataset.compare === "after") === a)));
+}
+
+function goToStep(index) {
+  const clamped = Math.max(0, Math.min(steps.length - 1, index));
+  // Align a chapter below the pinned visual on small screens; never hijack scrolling.
+  const mobile = matchMedia("(max-width: 760px)").matches;
+  const target = steps[clamped].getBoundingClientRect().top + scrollY;
+  const offset = mobile ? $(".visual-pin").getBoundingClientRect().height + 70 : innerHeight * .24;
+  scrollTo({ top: target - offset, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+}
+
+$("#previous").addEventListener("click", () => goToStep(current - 1));
+$("#next").addEventListener("click", () => goToStep(current + 1));
+$("#scene").addEventListener("click", event => {
+  const pageButton = event.target.closest("[data-page]");
+  const snapshotButton = event.target.closest("[data-snapshot]");
+  if (!pageButton && !snapshotButton) return;
+  const attribute = pageButton ? "data-page" : "data-snapshot";
+  const value = (pageButton ?? snapshotButton).getAttribute(attribute);
+  if (pageButton) inspectedPage = value;
+  else historySnapshot = Number(value);
+  renderScene(current, false);
+  $(`#scene [${attribute}="${value}"]`).focus({ preventScroll: true });
 });
-$("#reset").addEventListener("click", () => {
-  lab = createLab();
-  selectedSnapshot = readSnapshot = 1;
-  selectedPage = "P18";
-  readColumn = 6;
-  readStep = -1;
-  renderStorage();
-  renderReader();
-});
-$("#snapshot").addEventListener("change", event => { selectedSnapshot = Number(event.target.value); renderStorage(); });
-$("#storage").addEventListener("click", event => {
-  const button = event.target.closest("[data-page]");
-  if (button) { selectedPage = button.dataset.page; renderStorage(); }
-});
-document.querySelectorAll("[data-tab]").forEach(button => button.addEventListener("click", () => {
-  document.querySelectorAll("[data-tab]").forEach(tab => { tab.classList.toggle("active", tab === button); tab.setAttribute("aria-pressed", String(tab === button)); });
-  document.querySelectorAll(".view").forEach(view => { view.hidden = view.id !== button.dataset.tab; });
+document.querySelectorAll("[data-compare]").forEach(button => button.addEventListener("click", () => {
+  comparisonAfter = button.dataset.compare === "after";
+  renderComparison();
 }));
-$("#read-snapshot").addEventListener("change", event => { readSnapshot = Number(event.target.value); readStep = -1; renderReader(); });
-$("#read-column").addEventListener("change", event => { readColumn = Number(event.target.value); readStep = -1; renderReader(); });
-$("#read-next").addEventListener("click", () => { readStep = Math.min(3, readStep + 1); renderReader(); });
-$("#read-reset").addEventListener("click", () => { readStep = -1; renderReader(); });
-renderStorage();
-renderReader();
+
+let scheduled = false;
+function updateScroll() {
+  scheduled = false;
+  const mobile = matchMedia("(max-width: 760px)").matches;
+  const threshold = mobile ? $(".visual-pin").getBoundingClientRect().bottom + 85 : innerHeight * .5;
+  let index = 0;
+  for (let i = 0; i < steps.length; i++) {
+    if (steps[i].getBoundingClientRect().top <= threshold) index = i;
+  }
+  if (index !== current) {
+    current = index;
+    renderScene(index);
+  }
+  const length = document.documentElement.scrollHeight - innerHeight;
+  document.documentElement.style.setProperty("--scroll", length > 0 ? Math.max(0, Math.min(1, scrollY / length)) : 0);
+}
+function scheduleScroll() {
+  if (!scheduled) {
+    scheduled = true;
+    requestAnimationFrame(updateScroll);
+  }
+}
+addEventListener("scroll", scheduleScroll, { passive: true });
+addEventListener("resize", scheduleScroll);
+renderComparison();
+updateScroll();

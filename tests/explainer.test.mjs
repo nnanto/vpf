@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createLab, operations, orderFor, visiblePages, virtualExtents } from "../docs/model.mjs";
+import { createLab, operations, orderFor, pageSummary, planPointRead, visiblePages, virtualExtents } from "../docs/model.mjs";
 
 test("sample orders match the benchmark fixture generator", () => {
   assert.deepEqual(orderFor(0), {
@@ -77,4 +77,45 @@ test("out-of-order or repeated operations report errors without modifying storag
   assert.equal(lab.pages.length, 21);
   lab.apply("update");
   assert.throws(() => lab.apply("update"), /in order/);
+});
+
+test("page inspector excludes nulls from bounds and counts them accurately", () => {
+  const lab = createLab();
+  const discountPage = lab.snapshots[0].groups[0].chunks.find(chunk => chunk.column === 7).pages[0];
+  assert.deepEqual(pageSummary(discountPage), { rows: 4, nulls: 1, min: 1, max: 3 });
+  assert.deepEqual(pageSummary({ values: [null, null] }), { rows: 2, nulls: 2, min: null, max: null });
+  assert.deepEqual(pageSummary({ values: ["r2", "r11", "r8"] }), { rows: 3, nulls: 0, min: "r11", max: "r8" });
+});
+
+test("scroll story's point-read example shows candidates and exact answers for each version", () => {
+  const lab = createLab();
+  const original = lab.snapshots[0];
+  const oldPlan = planPointRead(original, 8, 6);
+  assert.deepEqual(oldPlan.candidates.map(page => [page.min, page.max, page.read]), [[0, 3, false], [4, 7, false], [8, 11, true]]);
+  assert.deepEqual(oldPlan.pages.map(page => page.id), ["P03", "P18"]);
+  assert.equal(oldPlan.rows[0].revenue_cents, 63352);
+  const updated = lab.apply("update");
+  const newPlan = planPointRead(updated, 8, 6);
+  assert.deepEqual(newPlan.pages.map(page => page.id), ["P03", "P22"]);
+  assert.equal(newPlan.rows[0].revenue_cents, 12345);
+  assert.equal(planPointRead(original, 8, 6).rows[0].revenue_cents, 63352);
+  assert.deepEqual(planPointRead(updated, 100, 6).pages, []);
+  assert.deepEqual(planPointRead(updated, 100, 6).rows, []);
+  assert.throws(() => planPointRead(updated, 8.5, 6), /integer/);
+  assert.throws(() => planPointRead(updated, 8, 123), /Unknown/);
+});
+
+test("candidate bounds are not exact matches and survive deletes and buffered rows", () => {
+  const lab = createLab();
+  lab.apply("update");
+  const deletion = lab.apply("delete");
+  const removed = planPointRead(deletion, 2, 6);
+  assert.equal(removed.pages.length, 2);
+  assert.deepEqual(removed.rows, []);
+  const buffered = lab.apply("append");
+  assert.deepEqual(planPointRead(buffered, 12, 6).pages.map(page => page.id), ["mem-1", "mem-6"]);
+  assert.equal(planPointRead(buffered, 12, 6).rows[0].revenue_cents, 95028);
+  const flushed = lab.apply("flush");
+  assert.equal(planPointRead(flushed, 12, 6).pages.length, 2);
+  assert.equal(planPointRead(flushed, 12, 6).pages.every(page => page.source === "blobs"), true);
 });

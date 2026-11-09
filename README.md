@@ -13,12 +13,20 @@ or after `vpf export`. The test suite checks the output with arrow-rs, PyArrow a
 
 ### Interactive architecture guide
 
-The dependency-free [VPF explorer](docs/index.html) uses the exact first rows generated
-by `benches/analytical.py` for its orders table, and includes the current measured
-10-million-row OR-pruning results from `BENCHMARKS.md`. Its page boundaries and byte
-offsets are illustrative; it is not a Parquet encoder or the Rust engine. Run
-`python3 -m http.server 8000 --directory docs` and open `http://localhost:8000`
-locally. Its reference model is checked with `node --test tests/explainer.test.mjs`.
+The dependency-free [VPF explorer](docs/index.html) opens with the SQLite → VPF →
+Parquet bridge, then follows a scroll-driven explanation: start with a table,
+expand its row group into column chunks and pages, follow one
+updated value into a new snapshot, then read it back through a virtual Parquet file.
+Interactive page inspection and snapshot switching connect the values to their
+references. A before/after comparison explains the same update in a conventional
+SQLite row table (WAL mode), a single-file Parquet replacement, and VPF.
+
+The sample values match `benches/analytical.py`; page boundaries, B-tree blocks, and
+byte offsets are illustrative, not measured I/O or a live database. The site supports
+reverse scrolling, keyboard-accessible chapter controls, mobile layouts, and reduced
+motion. Run `python3 -m http.server 8000 --directory docs` and open
+`http://localhost:8000` locally. Test the reference model, bounds, and point-read
+examples with `node --test tests/explainer.test.mjs`.
 
 To publish at `https://nnanto.github.io/vpf/`, enable **Settings → Pages → Build and
 deployment → Source: GitHub Actions**. The Pages workflow deploys `docs/` on changes

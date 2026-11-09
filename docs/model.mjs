@@ -129,3 +129,58 @@ export function virtualExtents(snapshot) {
   extents.push({ id: "trailer", label: "len · PAR1", offset: offset + 192, length: 8, source: "memory" });
   return extents;
 }
+
+export function pageSummary(page) {
+  const nonNull = page.values.filter(value => value != null);
+  const sorted = [...nonNull].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+  return {
+    rows: page.values.length,
+    nulls: page.values.length - nonNull.length,
+    min: sorted[0] ?? null,
+    max: sorted.at(-1) ?? null,
+  };
+}
+
+// An educational flat-column point scan: min/max selects candidate row ranges;
+// an exact filter is still needed. This is not the engine's pruning implementation.
+export function planPointRead(snapshot, id, columnId) {
+  if (!Number.isSafeInteger(id)) throw new Error("The example requires an integer order ID.");
+  if (!snapshot.columns.some(column => column.id === columnId)) throw new Error("Unknown projected column.");
+  const candidates = [];
+  const needed = new Set();
+  for (const group of snapshot.groups) {
+    const ids = group.chunks.find(chunk => chunk.column === 1);
+    let start = 0;
+    const ranges = ids.pages.map(page => {
+      const { min, max, rows } = pageSummary(page);
+      const candidate = { pageId: page.id, min, max, read: min <= id && id <= max, start, end: start + rows };
+      start += rows;
+      candidates.push(candidate);
+      return candidate;
+    }).filter(range => range.read);
+    for (const chunk of group.chunks.filter(chunk => chunk.column === 1 || chunk.column === columnId)) {
+      let offset = 0;
+      for (const page of chunk.pages) {
+        const end = offset + page.values.length;
+        if (ranges.some(range => offset < range.end && end > range.start)) needed.add(page.id);
+        offset = end;
+      }
+    }
+  }
+  if (snapshot.batch) {
+    const ids = snapshot.batch.rows.map(row => row.id);
+    const min = Math.min(...ids);
+    const max = Math.max(...ids);
+    const read = min <= id && id <= max;
+    candidates.push({ pageId: "mem-1", min, max, read });
+    if (read) {
+      needed.add("mem-1");
+      needed.add(`mem-${columnId}`);
+    }
+  }
+  return {
+    candidates,
+    pages: virtualExtents(snapshot).filter(extent => needed.has(extent.id)),
+    rows: snapshot.rows.filter(row => row.id === id),
+  };
+}
