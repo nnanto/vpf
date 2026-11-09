@@ -21,18 +21,24 @@ Interactive page inspection and snapshot switching connect the values to their
 references. A before/after comparison explains the same update in a conventional
 SQLite row table (WAL mode), a single-file Parquet replacement, and VPF.
 
+The benchmark section charts recorded read scores and durable fresh/append/update/
+delete times, with table-size and metadata-policy controls. A separate chart shows
+the newer OR-pruning before/after experiment. Values are checked against the
+archived JSON reports; methods, exact values, and limitations are available inline.
+
 The sample values match `benches/analytical.py`; page boundaries, B-tree blocks, and
 byte offsets are illustrative, not measured I/O or a live database. The site supports
 reverse scrolling, keyboard-accessible chapter controls, mobile layouts, and reduced
 motion. Run `python3 -m http.server 8000 --directory docs` and open
-`http://localhost:8000` locally. Test the reference model, bounds, and point-read
-examples with `node --test tests/explainer.test.mjs`.
+`http://localhost:8000` locally. Test the reference model, bounds, point-read
+examples, and benchmark data with `node --test tests/explainer.test.mjs`.
 
 To publish at `https://nnanto.github.io/vpf/`, enable **Settings → Pages → Build and
 deployment → Source: GitHub Actions**. The Pages workflow deploys `docs/` on changes
 to `main` or a manual run; pull requests only check the model. The repository can
 remain private if the account's GitHub plan supports Pages for private repositories.
-The published guide contains only static documentation and illustrative data.
+The published guide contains only static documentation, illustrative diagrams,
+and archived benchmark measurements.
 
 ```
 sales.vpf    one SQLite database (WAL) holding one table:

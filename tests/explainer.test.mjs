@@ -1,6 +1,54 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { benchmarkData, benchmarkWorkloads, chartMaximum } from "../docs/benchmarks.mjs";
 import { createLab, operations, orderFor, pageSummary, planPointRead, visiblePages, virtualExtents } from "../docs/model.mjs";
+
+test("chart values match each same-run baseline and the separate OR experiment", () => {
+  const load = name => JSON.parse(readFileSync(new URL(`../benches/results/${name}.json`, import.meta.url), "utf8"));
+  const or = load("or-pruning");
+  const engines = ["sqlite", "parquet", "vpf"];
+  for (const mode of ["lazy", "eager"]) {
+    const report = load(`read-write-${mode}`);
+    assert.deepEqual(benchmarkData[mode].map(entry => entry.rows), [10000, 100000, 1000000, 10000000]);
+    for (const entry of benchmarkData[mode]) {
+      const source = report.sizes.find(size => size.rows === entry.rows);
+      for (const key of Object.keys(benchmarkWorkloads)) {
+        const values = entry[key];
+        assert.equal(values.length, engines.length);
+        for (const [index, engine] of engines.entries()) {
+          const expected = key === "read"
+            ? Object.entries(source.median_ms).filter(([query]) => query !== "count").reduce((sum, [, timings]) => sum + timings[engine], 0)
+            : source.writes.median_ms[key][engine];
+          assert.ok(Math.abs(values[index] - expected) < 0.000001, `${mode}/${entry.rows}/${key}/${engine}`);
+        }
+      }
+      const before = or.reports[`before-${mode}`].sizes.find(size => size.rows === entry.rows);
+      const after = or.reports[`after-${mode}`].sizes.find(size => size.rows === entry.rows);
+      assert.deepEqual(entry.or, [before.median_ms.or_filter.vpf, after.median_ms.or_filter.vpf, after.median_ms.or_filter.parquet]);
+      assert.equal(source.writes.workloads.update.logical_rows, 100);
+      assert.equal(source.writes.workloads.append.logical_rows, entry.rows / 100);
+      assert.match(after.sql.or_filter, new RegExp(`id = ${entry.rows / 2} OR id = ${entry.rows / 2 + 2}`));
+    }
+  }
+});
+
+test("chart scale contains every timing and preserves zero-based proportional lengths", () => {
+  for (const entries of Object.values(benchmarkData)) {
+    for (const entry of entries) {
+      for (const key of [...Object.keys(benchmarkWorkloads), "or"]) {
+        const values = entry[key];
+        const max = chartMaximum(values);
+        assert.ok(Number.isFinite(max) && max > 0);
+        for (const value of values) assert.ok(value >= 0 && value <= max);
+        assert.ok(Math.abs((values[0] / max) / (values[2] / max) - values[0] / values[2]) < 1e-10);
+      }
+    }
+  }
+  assert.equal(chartMaximum([0, 0, 0]), 1);
+  assert.equal(chartMaximum([398.744907, 1354.598927, 63.731483]), 2000);
+  for (const values of [[], [-1], [NaN], [Infinity]]) assert.throws(() => chartMaximum(values), /finite, non-negative/);
+});
 
 test("sample orders match the benchmark fixture generator", () => {
   assert.deepEqual(orderFor(0), {

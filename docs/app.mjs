@@ -1,4 +1,5 @@
 import { createLab, pageSummary, planPointRead, virtualExtents, visiblePages } from "./model.mjs";
+import { benchmarkData, benchmarkWorkloads, chartMaximum } from "./benchmarks.mjs";
 
 const $ = selector => document.querySelector(selector);
 const escape = value => String(value).replace(/[&<>"']/g, character => ({
@@ -26,6 +27,46 @@ let current = -1;
 let inspectedPage = "P18";
 let historySnapshot = 2;
 let comparisonAfter = true;
+let benchmarkWorkload = "update";
+
+const milliseconds = value => value.toLocaleString("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+
+function timingChart(labels, values, colors, label) {
+  const max = chartMaximum(values);
+  return `<div class="timing-chart" role="img" aria-label="${escape(label)}. ${labels.map((name, i) => `${escape(name)}: ${milliseconds(values[i])} milliseconds`).join(". ")}. Lower is better.">
+    <div class="chart-axis" aria-hidden="true"><span>0</span><span>${number(max / 2)}</span><span>${number(max)} ms</span></div>
+    ${labels.map((name, i) => `<div class="timing-row"><span class="timing-label">${escape(name)}</span><div class="timing-track"><span class="timing-bar ${colors[i]}" style="width:${values[i] / max * 100}%"></span></div><strong class="timing-value">${milliseconds(values[i])}<small>ms</small></strong></div>`).join("")}
+    <p class="chart-scale">Linear scale from zero · scale adjusts to the selected workload</p>
+  </div>`;
+}
+
+function renderBenchmarks(announce = false) {
+  const mode = $("#benchmark-mode").value;
+  const rows = Number($("#benchmark-size").value);
+  const entry = benchmarkData[mode].find(item => item.rows === rows);
+  const workload = benchmarkWorkloads[benchmarkWorkload];
+  const values = entry[benchmarkWorkload];
+  const labels = ["SQLite · unindexed", "Parquet · DuckDB", `VPF · ${mode} · DuckDB`];
+  const writes = benchmarkWorkload !== "read";
+  const title = benchmarkWorkload === "append" ? `Append ${number(rows / 100)} rows` : workload.title;
+  const faster = values[2] <= values[1];
+  const ratio = faster ? values[1] / values[2] : values[2] / values[1];
+  $("#benchmark-chart").innerHTML = `<div class="benchmark-heading"><div><h3>${title}</h3><p class="benchmark-description">${workload.description}</p></div><span class="benchmark-pill">${writes ? "Median durable time" : "Sum of query medians"} · ms</span></div>
+    ${timingChart(labels, values, ["sqlite-bar", "parquet-bar", "vpf-bar"], `${title}, ${number(rows)} rows, ${mode} run`)}
+    <div class="benchmark-insight"><strong>${ratio.toFixed(1)}× ${faster ? "faster" : "slower"} than Parquet</strong><span>VPF in this recorded ${writes ? "write workload" : "read score"}. ${benchmarkWorkload === "read" ? "Native Parquet remains faster overall here." : "Not a general performance guarantee."}</span></div>`;
+  const orLabels = [`VPF ${mode} · before`, `VPF ${mode} · after`, "Parquet · after run"];
+  const orFaster = entry.or[1] <= entry.or[0];
+  const orRatio = orFaster ? entry.or[0] / entry.or[1] : entry.or[1] / entry.or[0];
+  $("#or-selection").textContent = `${number(rows)} rows · ${mode}`;
+  $("#or-query").textContent = `SELECT COUNT(*), SUM(revenue_cents) FROM orders\nWHERE id = ${rows / 2} OR id = ${rows / 2 + 2};`;
+  $("#or-chart").innerHTML = timingChart(orLabels, entry.or, ["before-bar", "vpf-bar", "parquet-bar"], `OR pruning, ${number(rows)} rows, ${mode}`) +
+    `<div class="benchmark-insight"><strong>${orRatio.toFixed(1)}× ${orFaster ? "faster" : "slower"} after pruning</strong><span>Before/after VPF medians for this query only. Not a SQLite comparison.</span></div>`;
+  $("#benchmark-values").innerHTML = `<table><caption>${number(rows)} rows · ${mode} baseline · milliseconds</caption><thead><tr><th scope="col">Workload</th>${labels.map(name => `<th scope="col">${name}</th>`).join("")}</tr></thead><tbody>${Object.entries(benchmarkWorkloads).map(([key, item]) => `<tr><th scope="row">${key === "append" ? `Append ${number(rows / 100)} rows` : item.title}</th>${entry[key].map(value => `<td>${value.toFixed(6)}</td>`).join("")}</tr>`).join("")}</tbody></table>
+    <table><caption>Separate OR follow-up · milliseconds</caption><thead><tr>${orLabels.map(name => `<th scope="col">${name}</th>`).join("")}</tr></thead><tbody><tr>${entry.or.map(value => `<td>${value.toFixed(6)}</td>`).join("")}</tr></tbody></table>`;
+  $("#baseline-data-link").href = `https://github.com/nnanto/vpf/blob/main/benches/results/read-write-${mode}.json`;
+  document.querySelectorAll("[data-workload]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.workload === benchmarkWorkload)));
+  if (announce) $("#benchmark-announcement").textContent = `${title}. ${number(rows)} rows, ${mode} mode. ${labels.map((name, i) => `${name}: ${milliseconds(values[i])} milliseconds`).join(". ")}.`;
+}
 
 function table(snapshot, { compact = false, change = false } = {}) {
   const rows = compact ? snapshot.rows.filter(row => row.id >= 7 && row.id <= 9) : snapshot.rows;
@@ -204,6 +245,12 @@ document.querySelectorAll("[data-compare]").forEach(button => button.addEventLis
   comparisonAfter = button.dataset.compare === "after";
   renderComparison();
 }));
+$("#benchmark-size").addEventListener("change", () => renderBenchmarks(true));
+$("#benchmark-mode").addEventListener("change", () => renderBenchmarks(true));
+document.querySelectorAll("[data-workload]").forEach(button => button.addEventListener("click", () => {
+  benchmarkWorkload = button.dataset.workload;
+  renderBenchmarks(true);
+}));
 
 let scheduled = false;
 function updateScroll() {
@@ -230,4 +277,5 @@ function scheduleScroll() {
 addEventListener("scroll", scheduleScroll, { passive: true });
 addEventListener("resize", scheduleScroll);
 renderComparison();
+renderBenchmarks();
 updateScroll();
